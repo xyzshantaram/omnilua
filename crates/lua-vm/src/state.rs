@@ -623,6 +623,13 @@ pub type FileOpenHook =
 /// reaches the filesystem via this hook. Returns `Ok(())` on success.
 pub type FileRemoveHook = fn(filename: &[u8]) -> Result<(), LuaError>;
 
+/// Function-pointer signature for renaming a file, installed on
+/// [`GlobalState::file_rename_hook`] by the embedder.
+///
+/// `std::fs` is banned outside `lua-cli`, so `lua-stdlib`'s `os.rename`
+/// reaches the filesystem via this hook. Returns `Ok(())` on success.
+pub type FileRenameHook = fn(from: &[u8], to: &[u8]) -> Result<(), LuaError>;
+
 /// Opaque handle to a dynamically loaded library, allocated by a
 /// [`DynLibLoadHook`] backend and stored in `package._CLIBS`.
 ///
@@ -715,6 +722,10 @@ pub struct GlobalState {
     /// Phase-B hook for removing a file. Set by `lua-cli` since `std::fs` is
     /// banned in `lua-stdlib`. `None` causes `os.remove` to return an error.
     pub file_remove_hook: Option<FileRemoveHook>,
+
+    /// Phase-B hook for renaming a file. Set by `lua-cli` since `std::fs` is
+    /// banned in `lua-stdlib`. `None` causes `os.rename` to return an error.
+    pub file_rename_hook: Option<FileRenameHook>,
 
     /// Phase-D-3.5 hook for loading a dynamic library (`dlopen` /
     /// `LoadLibraryEx`). Set by `lua-cli` since `libloading` is FFI and
@@ -3441,6 +3452,7 @@ pub fn new_state() -> Option<LuaState> {
         file_loader_hook: None,
         file_open_hook: None,
         file_remove_hook: None,
+        file_rename_hook: None,
         dynlib_load_hook: None,
         dynlib_symbol_hook: None,
         dynlib_unload_hook: None,
