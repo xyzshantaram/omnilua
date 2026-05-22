@@ -1,4 +1,12 @@
 [1/4] Creating LuaState...
 [2/4] Opening standard library...
 [3/4] Loading source (parse + compile)...
-[err] Syntax: internal: cg_discharge_to_reg cannot discharge K (load_string status=1)
+
+thread 'main' (9814827) panicked at crates/lua-parse/src/lib.rs:629:9:
+assertion `left == right` failed
+  left: 21
+ right: 22
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+[panic] assertion `left == right` failed
+  left: 21
+ right: 22

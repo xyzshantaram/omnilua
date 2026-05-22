@@ -1638,6 +1638,14 @@ fn cg_discharge_to_reg(
             );
             emit_inst(fs, line, inst);
         }
+        ExprKind::K => {
+            let inst = lua_code::opcodes::Instruction::abx(
+                lua_code::opcodes::OpCode::LoadK,
+                reg as u32,
+                e.u.info as u32,
+            );
+            emit_inst(fs, line, inst);
+        }
         _ => {
             return Err(LuaError::syntax(format_args!(
                 "internal: cg_discharge_to_reg cannot discharge {:?}", e.k
