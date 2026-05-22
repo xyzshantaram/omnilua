@@ -1,3 +1,7 @@
+[1/4] Creating LuaState...
+[2/4] Opening standard library...
+[3/4] Loading source (parse + compile)...
+[4/4] Executing chunk...
 testing numbers and math lib
 64-bit integers, 53-bit (mantissa) floats
 testing order (floats cannot represent all integers)
@@ -22,7 +26,8 @@ DBG: after mod operator tests (line 557)
 DBG: after math fn tests (line 666)
 testing -0 and NaN
 testing 'math.random'
-random seeds: 1779192485, 0
-float random range in 53000 calls: [0.000014, 0.999939]
-integer random range in 57600 calls: [minint + 27ppm, maxint - 0ppm]
+random seeds: 1779193797, 0
+float random range in 26500 calls: [0.000018, 0.999999]
+integer random range in 38400 calls: [minint + 46ppm, maxint - 27ppm]
 OK
+[ok] execution completed, status=Ok

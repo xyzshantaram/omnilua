@@ -1,44 +1,44 @@
 all	FAIL	lua: pcall_k failed: Runtime: stdin:157: cannot open main.lua: No such file or directory (os error 2
-api	FAIL	
-attrib	FAIL	
-big	FAIL	
-bitwise	FAIL	
-bwcoercion	FAIL	
-calls	FAIL	
-calls_head313	FAIL	
-calls_isolated_tmp	FAIL	BISECT: after C-stack overflow
-closure	FAIL	
-code	FAIL	
-constructs	FAIL	
+api	PASS	-
+attrib	PASS	-
+big	PASS	-
+bitwise	PASS	-
+bwcoercion	PASS	-
+calls	PASS	-
+calls_head313	PASS	-
+calls_isolated_tmp	PASS	-
+closure	PASS	-
+code	PASS	-
+constructs	PASS	-
 coroutine	FAIL	lua: pcall_k failed: Runtime: stdin:165: assertion failed!
 cstack	FAIL	testing stack overflow detection
 db	FAIL	lua: pcall_k failed: Runtime: stdin:50: assertion failed!
-errors	FAIL	fatal runtime error: stack overflow, aborting
-events	FAIL	
-files-debug	FAIL	
-files	FAIL	lua: pcall_k failed: Runtime: attempt to yield across a C-call boundary
+errors	FAIL	lua: pcall_k failed: Runtime: stdin:38: assertion failed!
+events	PASS	-
+files-debug	PASS	-
+files	FAIL	thread 'main' (15857989) panicked at crates/lua-vm/src/do_.rs:1109:9:
 gc	FAIL	lua: pcall_k failed: Runtime: stdin:552: assertion failed!
-gc_part	FAIL	
-gctmp	FAIL	
+gc_part	PASS	-
+gctmp	PASS	-
 gengc	FAIL	lua: pcall_k failed: Runtime: stdin:99: attempt to index a nil value (upvalue 'x')
-goto	FAIL	
-heavy	FAIL	
+goto	PASS	-
+heavy	PASS	-
 literals	FAIL	lua: pcall_k failed: Runtime: attempt to concatenate a table value
 locals	FAIL	lua: pcall_k failed: Runtime: stdin:861: assertion failed!
-main	FAIL	
-math	FAIL	
+main	PASS	-
+math	PASS	-
 nextvar	FAIL	lua: pcall_k failed: Runtime: stdin:611: bad 'for' limit (number expected, got number)
-pm	FAIL	
-repro_closure	FAIL	
-sort	FAIL	
-sort_repro	FAIL	
-strings	FAIL	
-strings_part1	FAIL	
-test1	FAIL	
-test_bitor2	FAIL	
-test_weak	FAIL	
-tpack	FAIL	
-tracegc	FAIL	
-utf8	FAIL	
-vararg	FAIL	
-verybig	FAIL	
+pm	PASS	-
+repro_closure	PASS	-
+sort	PASS	-
+sort_repro	PASS	-
+strings	PASS	-
+strings_part1	PASS	-
+test1	PASS	-
+test_bitor2	PASS	-
+test_weak	PASS	-
+tpack	PASS	-
+tracegc	PASS	-
+utf8	PASS	-
+vararg	PASS	-
+verybig	PASS	-
