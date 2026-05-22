@@ -1449,7 +1449,13 @@ impl LuaState {
             }
         }
     }
-    pub fn table_resize(&mut self, _t: &GcRef<LuaTable>, _na: usize, _nh: usize) -> Result<(), LuaError> { todo!("phase-b: table_resize") }
+    pub fn table_resize(&mut self, _t: &GcRef<LuaTable>, _na: usize, _nh: usize) -> Result<(), LuaError> {
+        // PORT NOTE: Phase B's LuaTable (lua-types/src/value.rs) is a single
+        // Vec<(K,V)> placeholder with no separate array/hash parts, so the
+        // OP_NEWTABLE pre-sizing hint has nothing to act on. The rich
+        // array+hash impl in crates/lua-vm/src/table.rs lights up in Phase D.
+        Ok(())
+    }
     pub fn table_getn(&self, _t: &GcRef<LuaTable>) -> i64 { todo!("phase-b: table_getn") }
 
     pub fn try_bin_tm<T, U, V, W>(&mut self, _p1: T, _p2: U, _res: V, _tm: W) -> Result<(), LuaError> { todo!("phase-b: try_bin_tm") }
