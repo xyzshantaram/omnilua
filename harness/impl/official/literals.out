@@ -8,4 +8,4 @@ testing scanner
 +
 +
 +
-lua: pcall_k failed: Runtime: attempt to yield from outside a coroutine
+lua: pcall_k failed: Runtime: stdin:300: attempt to call a nil value (upvalue 'gen')

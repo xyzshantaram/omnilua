@@ -1,0 +1,79 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "api_error_status": null,
+  "duration_ms": 498362,
+  "duration_api_ms": 491142,
+  "ttft_ms": 4942,
+  "num_turns": 60,
+  "result": "Build is green. Report:\n\n**Root cause:** `lua_resume` at `crates/lua-vm/src/do_.rs:1329` converted `Err(e)` from `raw_run_protected` into a `LuaStatus` but did NOT push the carried error value onto the stack. C-Lua's longjmp-based error path always leaves the error message at `L->top - 1`, which is where `set_error_obj` (line 165) reads it. Without the push, `set_error_obj` for `ErrRun` picked up whatever happened to be on top — in this case `Int(10)`, the leftover yield argument from the failed `coroutine.yield(10)` call inside `dofile`'s non-yieldable `state.call`.\n\n**Fix:** In `lua_resume`'s `Err(e) => ...` arm, push `e.into_value()` onto the stack before returning the status (skipping the push when status is `Yield`, since yield args are already on top). This mirrors the same pattern already present in `pcall` (`do_.rs:1540`).\n\n**New state after fix:** The test now correctly fails with `Runtime: attempt to yield across a C-call boundary` — the genuine error message the test was trying to produce. The deeper underlying issue (the `dofile` test on line 193-205 of files.lua wants the `lua_callk` continuation machinery, which is Phase E coroutine work) is now visible and unmasked. Goalpost moved past `Int(10)` confusion.",
+  "stop_reason": "end_turn",
+  "session_id": "b3db7543-92bc-4316-a576-66141c6caeab",
+  "total_cost_usd": 4.632475500000001,
+  "usage": {
+    "input_tokens": 63,
+    "cache_creation_input_tokens": 123672,
+    "cache_read_input_tokens": 6242599,
+    "output_tokens": 29427,
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 123672,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "",
+    "iterations": [
+      {
+        "input_tokens": 1,
+        "output_tokens": 482,
+        "cache_read_input_tokens": 141195,
+        "cache_creation_input_tokens": 186,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 186
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 2161,
+      "outputTokens": 15,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.002236,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000
+    },
+    "claude-opus-4-7": {
+      "inputTokens": 63,
+      "outputTokens": 29427,
+      "cacheReadInputTokens": 6242599,
+      "cacheCreationInputTokens": 123672,
+      "webSearchRequests": 0,
+      "costUSD": 4.630239500000001,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000
+    }
+  },
+  "permission_denials": [
+    {
+      "tool_name": "Bash",
+      "tool_use_id": "toolu_0127V62e4PwTiw3uqFxkArV1",
+      "tool_input": {
+        "command": "cargo build -q -p lua-cli 2>&1 | grep -cE \"^error\" ; echo build-exit=$?",
+        "description": "Check build for actual errors"
+      }
+    }
+  ],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "uuid": "0871dc9d-c487-4324-844d-be0966cf65d2"
+}

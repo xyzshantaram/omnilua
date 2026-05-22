@@ -344,7 +344,9 @@ pub(crate) fn error_fn(state: &mut LuaState) -> Result<usize, LuaError> {
         state.concat(2)?;
     }
     // C: return lua_error(L);
-    Err(LuaError::from_value(state.pop()))
+    let v = state.pop();
+    eprintln!("[DBG error_fn] val={:?}", v);
+    Err(LuaError::from_value(v))
 }
 
 // ── getmetatable ──────────────────────────────────────────────────────────────
