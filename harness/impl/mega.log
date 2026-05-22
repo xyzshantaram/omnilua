@@ -1343,3 +1343,4 @@ warning: unused import: `UpVal`
 [2026-05-19T03:05:15Z mega]   [O1.D3] DEBUG dispatch on file: reference/lua-c/testes/files.lua [model=opus] [parallel]
 [2026-05-19T03:10:24Z mega]   → committed 6bfdf41 (debug/reference/lua-c/testes/locals.lua )
 [2026-05-19T03:11:56Z mega]   → committed fdabc96 (debug/reference/lua-c/testes/errors.lua )
+[2026-05-19T03:14:09Z mega]   [O1.D4] DEBUG dispatch on file: reference/lua-c/testes/errors.lua [model=sonnet] [parallel]
