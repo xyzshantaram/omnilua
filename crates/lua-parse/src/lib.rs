@@ -1100,6 +1100,7 @@ fn cg_exp_to_next_reg(
     e: &mut ExprDesc,
 ) -> Result<(), LuaError> {
     cg_discharge_vars(fs, line, e)?;
+    cg_free_exp(fs, e);
     let reg = reserve_reg(fs);
     match e.k {
         ExprKind::Reloc => {
