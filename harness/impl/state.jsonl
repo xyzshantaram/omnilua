@@ -200,3 +200,6 @@
 {"ts":"2026-05-16T18:54:50Z","action":"dispatch_done","detail":"type=implement func=push_value_at cost=0.35119600000000006","total_cost":0.00}
 {"ts":"2026-05-16T18:54:50Z","action":"panic_detected","detail":"func=registry_set iter=14","total_cost":0.00}
 {"ts":"2026-05-16T18:54:50Z","action":"dispatch_start","detail":"type=implement func=registry_set iter=14","total_cost":0.00}
+{"ts":"2026-05-16T18:56:23Z","action":"dispatch_done","detail":"type=implement func=registry_set cost=0.8443775000000001","total_cost":0.00}
+{"ts":"2026-05-16T18:56:23Z","action":"panic_detected","detail":"func=register_lib iter=15","total_cost":0.00}
+{"ts":"2026-05-16T18:56:23Z","action":"dispatch_start","detail":"type=implement func=register_lib iter=15","total_cost":0.00}

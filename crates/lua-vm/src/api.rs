@@ -410,6 +410,20 @@ impl LuaState {
         Ok(())
     }
 
+    /// Create and populate a library table for `funcs`, leaving it on top of
+    /// the stack. The `_name` argument is informational and matches the
+    /// `luaL_register`-style call sites in the Phase-A stdlib; the actual
+    /// global binding for the library happens later via `luaL_requiref`.
+    ///
+    /// C: `luaL_newlib(L, l)`.
+    pub fn register_lib(
+        &mut self,
+        _name: &[u8],
+        funcs: &[(&[u8], LuaCFunction)],
+    ) -> Result<(), LuaError> {
+        self.new_lib(funcs)
+    }
+
     /// Create a new empty table presized to hold every entry in `funcs`, and
     /// leave it on top of the stack. No registration is performed — callers
     /// typically follow up with `set_funcs` / `set_funcs_with_upvalues` to
