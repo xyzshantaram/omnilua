@@ -830,7 +830,7 @@ fn g_read(
     first: i32,
 ) -> Result<usize, LuaError> {
     // C: int nargs = lua_gettop(L) - 1;
-    let nargs = state.top_idx() as i32 - 1;
+    let nargs = state.top_idx().get() as i32 - 1;
     let mut n = first;
     let mut success = true;
 
@@ -938,7 +938,7 @@ fn g_write(
     arg: i32,
 ) -> Result<usize, LuaError> {
     // C: int nargs = lua_gettop(L) - arg;
-    let nargs = state.top_idx() as i32 - arg;
+    let nargs = state.top_idx().get() as i32 - arg;
     let mut overall_ok = true;
 
     for i in 0..nargs {
@@ -1096,7 +1096,7 @@ pub fn f_flush(state: &mut LuaState) -> Result<usize, LuaError> {
 ///   4..n+3) format arguments
 fn aux_lines(state: &mut LuaState, toclose: bool) -> Result<(), LuaError> {
     // C: int n = lua_gettop(L) - 1;
-    let n = state.top_idx() as i32 - 1;
+    let n = state.top_idx().get() as i32 - 1;
     // C: luaL_argcheck(L, n <= MAXARGLINE, MAXARGLINE+2, "too many arguments");
     if n > MAX_ARG_LINE as i32 {
         return Err(LuaError::arg_error(
@@ -1203,7 +1203,7 @@ fn io_readline(state: &mut LuaState) -> Result<usize, LuaError> {
     debug_assert!(result_n > 0, "g_read should return at least one value");
 
     // C: if (lua_toboolean(L, -n)) return n;  /* read at least one value */
-    let top = state.top_idx() as i32;
+    let top = state.top_idx().get() as i32;
     let first_result_idx = top - result_n as i32;
     let first_truthy = !matches!(
         state.stack_at(first_result_idx),

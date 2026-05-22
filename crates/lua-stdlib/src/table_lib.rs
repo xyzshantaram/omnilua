@@ -91,7 +91,7 @@ fn check_tab(state: &mut LuaState, arg: i32, what: u32) -> Result<(), LuaError> 
     }
 
     if ok {
-        state.pop_n(n);
+        state.pop_n(n as usize);
         Ok(())
     } else {
         // C: luaL_checktype(L, arg, LUA_TTABLE) — forces a type error

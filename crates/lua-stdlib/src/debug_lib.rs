@@ -830,7 +830,7 @@ pub(crate) fn get_hook(state: &mut LuaState) -> Result<usize, LuaError> {
 
     if !hook_is_internal {
         // C: lua_pushliteral(L, "external hook");
-        let s = state.intern_str(b"external hook");
+        let s = state.intern_str(b"external hook")?;
         state.push(LuaValue::Str(s));
     } else {
         // C: else { /* hook table must exist */
@@ -851,7 +851,7 @@ pub(crate) fn get_hook(state: &mut LuaState) -> Result<usize, LuaError> {
 
     // C: lua_pushstring(L, unmakemask(mask, buff));  /* 2nd result = mask string */
     let smask = unmake_mask(mask);
-    let ls = state.intern_str(&smask);
+    let ls = state.intern_str(&smask)?;
     state.push(LuaValue::Str(ls));
 
     // C: lua_pushinteger(L, lua_gethookcount(L1));  /* 3rd result = count */

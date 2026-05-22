@@ -169,7 +169,7 @@ fn lsys_unloadlib(_lib: LibHandle) {
 /// lua-stdlib. Phase B: delegate to a DynLib capability or raise unsafe budget.
 fn lsys_load(state: &mut LuaState, _path: &[u8], _see_glb: bool) -> Option<LibHandle> {
     // C: lua_pushliteral(L, DLMSG);
-    let s = state.intern_str(DLMSG)?;
+    let s = state.intern_str(DLMSG).ok()?;
     state.push(LuaValue::Str(s));
     None
 }
@@ -189,7 +189,7 @@ fn lsys_sym(
     _sym: &[u8],
 ) -> Option<fn(&mut LuaState) -> Result<usize, LuaError>> {
     // C: lua_pushliteral(L, DLMSG);
-    let s = state.intern_str(DLMSG)?;
+    let s = state.intern_str(DLMSG).ok()?;
     state.push(LuaValue::Str(s));
     None
 }
@@ -289,7 +289,7 @@ fn setpath(
     // C: lua_setfield(L, -3, fieldname);
     // PORT NOTE: In C the index is -3 because the versioned-name string is still
     // on the stack. In Rust it is -2 because we did not push the versioned name.
-    let s = state.intern_str(&final_path);
+    let s = state.intern_str(&final_path)?;
     state.push(LuaValue::Str(s));
     state.set_field(-2, fieldname)?;
 
@@ -435,7 +435,7 @@ pub fn ll_loadlib(state: &mut LuaState) -> Result<usize, LuaError> {
     state.insert(-2);
     // C: lua_pushstring(L, (stat == ERRLIB) ? LIB_FAIL : "init");
     let where_bytes: &[u8] = if stat == ERRLIB { LIB_FAIL } else { b"init" };
-    let where_s = state.intern_str(where_bytes);
+    let where_s = state.intern_str(where_bytes)?;
     state.push(LuaValue::Str(where_s));
     // C: return 3;
     Ok(3)
@@ -507,7 +507,7 @@ impl<'a> Iterator for PathComponents<'a> {
 /// Example output: `"no file 'a.lua'\n\tno file 'b.lua'"`
 ///
 /// C: `static void pusherrornotfound(lua_State *L, const char *path)`
-fn pusherrornotfound(state: &mut LuaState, path: &[u8]) {
+fn pusherrornotfound(state: &mut LuaState, path: &[u8]) -> Result<(), LuaError> {
     // C: luaL_Buffer b; luaL_buffinit(L, &b);
     let mut buf: Vec<u8> = Vec::new();
     // C: luaL_addstring(&b, "no file '");
@@ -517,8 +517,9 @@ fn pusherrornotfound(state: &mut LuaState, path: &[u8]) {
     // C: luaL_addstring(&b, "'");
     buf.push(b'\'');
     // C: luaL_pushresult(&b);
-    let s = state.intern_str(&buf);
+    let s = state.intern_str(&buf)?;
     state.push(LuaValue::Str(s));
+    Ok(())
 }
 
 // ── Path search ───────────────────────────────────────────────────────────────
@@ -539,7 +540,7 @@ fn searchpath(
     path: &[u8],
     sep: &[u8],
     dirsep: &[u8],
-) -> Option<Vec<u8>> {
+) -> Result<Option<Vec<u8>>, LuaError> {
     // C: if (*sep != '\0' && strchr(name, *sep) != NULL)
     //        name = luaL_gsub(L, name, sep, dirsep);
     let name_buf: Vec<u8> = if !sep.is_empty() && name.contains(&sep[0]) {
@@ -557,9 +558,9 @@ fn searchpath(
     for filename in PathComponents::new(&pathname) {
         // C: if (readable(filename)) return lua_pushstring(L, filename);
         if readable(filename) {
-            let s = state.intern_str(filename);
+            let s = state.intern_str(filename)?;
             state.push(LuaValue::Str(s));
-            return Some(filename.to_vec());
+            return Ok(Some(filename.to_vec()));
         }
     }
 
@@ -568,8 +569,8 @@ fn searchpath(
     // PORT NOTE: C uses the Lua-stack string of the expanded pathname as the
     // argument to pusherrornotfound. In Rust we have `pathname` already as a
     // Vec<u8>; we pass it directly without the round-trip through the Lua stack.
-    pusherrornotfound(state, &pathname);
-    None
+    pusherrornotfound(state, &pathname)?;
+    Ok(None)
 }
 
 /// `package.searchpath(name, path [, sep [, rep]])`.
@@ -588,7 +589,7 @@ pub fn ll_searchpath(state: &mut LuaState) -> Result<usize, LuaError> {
     let dirsep_default = [LUA_DIRSEP];
     let dirsep = state.opt_arg_string(4, &dirsep_default)?;
 
-    let found = searchpath(state, &name, &path, &sep, &dirsep);
+    let found = searchpath(state, &name, &path, &sep, &dirsep)?;
     if found.is_some() {
         // C: if (f != NULL) return 1;
         return Ok(1);
@@ -607,7 +608,7 @@ pub fn ll_searchpath(state: &mut LuaState) -> Result<usize, LuaError> {
 /// TODO(port): Should return `Result<Option<Vec<u8>>, LuaError>` to properly
 /// propagate the `"'package.<pname>' must be a string"` error. Currently returns
 /// `None` and loses the error, which will cause a confusing failure downstream.
-fn findfile(state: &mut LuaState, name: &[u8], pname: &[u8], dirsep: u8) -> Option<Vec<u8>> {
+fn findfile(state: &mut LuaState, name: &[u8], pname: &[u8], dirsep: u8) -> Result<Option<Vec<u8>>, LuaError> {
     // C: lua_getfield(L, lua_upvalueindex(1), pname);
     // The package table is upvalue #1 for the searcher closures.
     let uv = state.upvalue_index(1);
@@ -619,7 +620,7 @@ fn findfile(state: &mut LuaState, name: &[u8], pname: &[u8], dirsep: u8) -> Opti
         // TODO(port): Cannot return Err here without changing the signature.
         //             For now pop the nil and return None (error is silently dropped).
         state.pop_n(1);
-        return None;
+        return Ok(None);
     };
     state.pop_n(1);
     searchpath(state, name, &path, b".", &[dirsep])
@@ -671,7 +672,7 @@ fn searcher_lua(state: &mut LuaState) -> Result<usize, LuaError> {
     // C: const char *name = luaL_checkstring(L, 1);
     let name = state.check_arg_string(1)?.to_vec();
     // C: filename = findfile(L, name, "path", LUA_LSUBSEP);
-    let filename = findfile(state, &name, b"path", LUA_LSUBSEP);
+    let filename = findfile(state, &name, b"path", LUA_LSUBSEP)?;
     if filename.is_none() {
         // C: if (filename == NULL) return 1;  -- error message on stack
         return Ok(1);
@@ -729,7 +730,7 @@ fn searcher_c(state: &mut LuaState) -> Result<usize, LuaError> {
     // C: const char *name = luaL_checkstring(L, 1);
     let name = state.check_arg_string(1)?.to_vec();
     // C: const char *filename = findfile(L, name, "cpath", LUA_CSUBSEP);
-    let filename = findfile(state, &name, b"cpath", LUA_CSUBSEP);
+    let filename = findfile(state, &name, b"cpath", LUA_CSUBSEP)?;
     if filename.is_none() {
         // C: if (filename == NULL) return 1;
         return Ok(1);
@@ -763,7 +764,7 @@ fn searcher_croot(state: &mut LuaState) -> Result<usize, LuaError> {
     // C: filename = findfile(L, lua_tostring(L, -1), "cpath", LUA_CSUBSEP);
     // PORT NOTE: C reads the root string back from the stack; in Rust we use
     // the slice directly and then pop the stack entry below.
-    let filename = findfile(state, root, b"cpath", LUA_CSUBSEP);
+    let filename = findfile(state, root, b"cpath", LUA_CSUBSEP)?;
     // Pop the root string we pushed above (findfile does not consume it).
     state.pop_n(1);
 
