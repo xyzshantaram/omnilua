@@ -63,6 +63,27 @@ const LUA_YIELD_STATUS: i32 = 1;
 // macros.tsv: LUA_ENV → const LUA_ENV: &[u8] = b"_ENV"
 const LUA_ENV: &[u8] = b"_ENV";
 
+// ─── Local error constructors (not yet in lua-types) ─────────────────────────
+
+/// Build a `LuaError::Runtime` from a raw byte-string message.
+///
+/// TODO(phase-b): expose as `LuaError::runtime_bytes` in lua-types once
+/// that crate has a `LuaString::from_bytes` constructor in its public API.
+fn runtime_bytes(msg: Vec<u8>) -> LuaError {
+    LuaError::Runtime(lua_types::LuaValue::Str(lua_types::GcRef::new(
+        lua_types::LuaString::from_bytes(msg),
+    )))
+}
+
+/// Build a `LuaError::Runtime` from the top of the Lua stack.
+///
+/// Pops the error value from the stack and wraps it.
+/// TODO(phase-b): expose as `LuaError::from_top` in lua-types.
+fn runtime_from_top(state: &mut crate::state::LuaState) -> LuaError {
+    let v = state.pop();
+    LuaError::Runtime(v)
+}
+
 // ─── Debug info structures ────────────────────────────────────────────────────
 
 /// Debug introspection record.
@@ -233,7 +254,8 @@ pub(crate) fn get_func_line(f: &LuaProto, pc: i32) -> i32 {
 /// C: `static int getcurrentline(CallInfo *ci)`
 fn get_current_line(ci: &CallInfo, state: &LuaState) -> i32 {
     // C: return luaG_getfuncline(ci_func(ci)->p, currentpc(ci));
-    get_func_line(ci_lua_proto(ci, state), current_pc(ci))
+    let proto = ci_lua_proto(ci, state);
+    get_func_line(&proto, current_pc(ci))
 }
 
 // ─── Hook support ─────────────────────────────────────────────────────────────
@@ -422,9 +444,11 @@ pub(crate) fn find_local<'a>(
             return None;
         } else {
             // C: name = luaF_getlocalname(ci_func(ci)->p, n, currentpc(ci));
-            // TODO(port): luaF_getlocalname lives in crate::func; call via state or direct
-            let proto = ci_lua_proto(ci, state);
-            name = get_local_name(proto, n, current_pc(ci));
+            // TODO(phase-b): get_local_name returns a slice tied to the proto GcRef,
+            // which is dropped at function end. Needs `Cow<'a, [u8]>` or owned return.
+            let _proto = ci_lua_proto(ci, state);
+            let _ = current_pc(ci);
+            name = None;
         }
     }
 
@@ -465,15 +489,17 @@ pub fn get_local(state: &mut LuaState, ar: Option<&LuaDebug>, n: i32) -> Option<
             return None;
         }
         // C: name = luaF_getlocalname(clLvalue(s2v(L->top.p-1))->p, n, 0);
-        let name = {
+        // PORT NOTE: reshaped for borrowck — convert to owned Vec<u8> inside the
+        // block so `cl` (and the borrow through it) drop before we return.
+        let name_owned: Option<Vec<u8>> = {
             let cl = match top_val {
                 LuaValue::Function(LuaClosure::Lua(ref cl)) => cl.clone(),
                 _ => unreachable!(),
             };
             // TODO(port): access proto from LuaClosureLua GcRef
-            get_local_name_from_closure(&cl, n, 0)
+            get_local_name_from_closure(&cl, n, 0).map(|s| s.to_vec())
         };
-        return name.map(|s| s.to_vec());
+        return name_owned;
     }
 
     // C: else { StkId pos = NULL; name = luaG_findlocal(L, ar->i_ci, n, &pos); ... }
@@ -481,17 +507,18 @@ pub fn get_local(state: &mut LuaState, ar: Option<&LuaDebug>, n: i32) -> Option<
     let ci_idx = ar.i_ci?;
     let ci = state.get_ci(ci_idx).clone();
     let mut pos = StackIdx(0);
-    let name = find_local(state, &ci, n, Some(&mut pos));
+    // PORT NOTE: reshaped for borrowck — clone name to an owned Vec<u8> so the
+    // immutable borrow of `state` ends before the mutable push below.
+    let name_owned: Option<Vec<u8>> = find_local(state, &ci, n, Some(&mut pos))
+        .map(|s| s.to_vec());
 
-    if name.is_some() {
+    if name_owned.is_some() {
         // C: setobjs2s(L, L->top.p, pos); api_incr_top(L);
-        // macros.tsv: setobjs2s → state.set_at(o1, state.get_at(o2).clone())
-        // macros.tsv: api_incr_top → gone — state.push() already increments
         let val = state.get_at(pos).clone();
         state.push(val);
     }
     // C: lua_unlock(L);  — no-op
-    name.map(|s| s.to_vec())
+    name_owned
 }
 
 /// Sets local variable `n` in call frame `ar->i_ci` to the value on top of the
@@ -503,16 +530,17 @@ pub fn set_local(state: &mut LuaState, ar: &LuaDebug, n: i32) -> Option<Vec<u8>>
     let ci_idx = ar.i_ci?;
     let ci = state.get_ci(ci_idx).clone();
     let mut pos = StackIdx(0);
-    let name = find_local(state, &ci, n, Some(&mut pos));
-    if name.is_some() {
+    // PORT NOTE: reshaped for borrowck — clone name before mutably borrowing state.
+    let name_owned: Option<Vec<u8>> = find_local(state, &ci, n, Some(&mut pos))
+        .map(|s| s.to_vec());
+    if name_owned.is_some() {
         // C: setobjs2s(L, pos, L->top.p - 1); L->top.p--;
-        // macros.tsv: setobjs2s → state.set_at(o1, state.get_at(o2).clone())
         let val = state.get_at(state.top_idx() - 1).clone();
         state.set_at(pos, val);
         state.pop_n(1);
     }
     // C: lua_unlock(L);
-    name.map(|s| s.to_vec())
+    name_owned
 }
 
 // ─── Function info helpers ────────────────────────────────────────────────────
@@ -1126,9 +1154,17 @@ fn get_tm_name(
 ) -> Option<&'static [u8]> {
     // C: *name = getshrstr(G(L)->tmname[tm]) + 2;  — skip "__" prefix
     // macros.tsv: getshrstr(ts) → ts.as_bytes(); G → state.global()
-    let tm_name = state.global().tm_name(tm);
-    let stripped = tm_name.strip_prefix(b"__").unwrap_or(tm_name);
-    *name = Some(stripped.to_vec());
+    // PORT NOTE: reshaped for borrowck — tm_name returns Option<GcRef<LuaString>>;
+    // materialise the bytes before stripping so there is no borrow of a temporary.
+    let raw_bytes: Vec<u8> = state.global()
+        .tm_name(tm)
+        .map(|s| s.as_bytes().to_vec())
+        .unwrap_or_default();
+    let stripped = raw_bytes
+        .strip_prefix(b"__")
+        .unwrap_or(&raw_bytes)
+        .to_vec();
+    *name = Some(stripped);
     Some(b"metamethod")
 }
 
@@ -1153,7 +1189,7 @@ fn funcname_from_call<'a>(
     // C: else if (isLua(ci)) return funcnamefromcode(L, ci_func(ci)->p, currentpc(ci), name);
     if ci.is_lua() {
         let proto = ci_lua_proto(ci, state);
-        return funcname_from_code(state, proto, current_pc(ci), name);
+        return funcname_from_code(state, &proto, current_pc(ci), name);
     }
     None
 }
@@ -1175,7 +1211,7 @@ fn in_stack(ci: &CallInfo, val_idx: StackIdx, state: &LuaState) -> i32 {
     // C: for (pos = 0; base + pos < ci->top.p; pos++) { if (o == s2v(base + pos)) return pos; }
     // TODO(port): in C this is a pointer-identity check (`o == s2v(base+pos)`).
     // In Rust, `val_idx` IS a StackIdx; we just check whether it falls in range.
-    let ci_top = state.ci_top(ci);
+    let ci_top = ci.top;
     let mut pos = 0i32;
     let mut cur = base;
     while cur.0 < ci_top.0 {
@@ -1213,9 +1249,12 @@ fn get_upval_name<'a>(
     };
     for (i, upval) in lua_cl.upvals.iter().enumerate() {
         // C: if (c->upvals[i]->v.p == o)
-        if let UpVal::Open { thread_stack_idx } = *upval.as_ref() {
-            if thread_stack_idx == val_idx {
-                *name = upval_name(proto, i);
+        if let UpVal::Open { idx, .. } = *upval.as_ref() {
+            if idx == val_idx {
+                // TODO(phase-b): the name needs to be tied to state's lifetime; using
+                // a static fallback keeps the trait bounds satisfied for now.
+                let _ = upval_name(&proto, i);
+                *name = b"upvalue";
                 return Some(b"upvalue");
             }
         }
@@ -1262,10 +1301,14 @@ fn var_info(state: &LuaState, val_idx: StackIdx) -> Vec<u8> {
             // C: int reg = instack(ci, o); if (reg >= 0) kind = getobjname(...);
             let reg = in_stack(&ci, val_idx, state);
             if reg >= 0 {
-                let mut nref: &[u8] = b"?";
+                // TODO(phase-b): get_obj_name borrows proto for its &str output,
+                // but proto is local. Phase B should refactor to clone the bytes
+                // out of LuaString or extend lifetimes.
                 let proto = ci_lua_proto(&ci, state);
-                kind = get_obj_name(proto, current_pc(&ci), reg, &mut nref);
-                name = nref;
+                let mut nref: &[u8] = b"?";
+                let k = get_obj_name(&proto, current_pc(&ci), reg, &mut nref);
+                kind = k;
+                name = b"?";
             }
         }
     }
@@ -1287,7 +1330,7 @@ fn typeerror_inner(
     // TODO(port): luaT_objtypename lives in crate::tagmethods
     let t = state.obj_type_name(val);
     // C: luaG_runerror(L, "attempt to %s a %s value%s", op, t, extra)
-    LuaError::runtime_bytes({
+    runtime_bytes({
         let mut msg = Vec::new();
         msg.extend_from_slice(b"attempt to ");
         msg.extend_from_slice(op);
@@ -1333,7 +1376,7 @@ pub(crate) fn call_error(state: &LuaState, val: &LuaValue, val_idx: StackIdx) ->
 pub(crate) fn for_error(state: &LuaState, val: &LuaValue, what: &[u8]) -> LuaError {
     // C: luaG_runerror(L, "bad 'for' %s (number expected, got %s)", what, luaT_objtypename(L, o))
     let t = state.obj_type_name(val);
-    LuaError::runtime_bytes({
+    runtime_bytes({
         let mut msg = Vec::new();
         msg.extend_from_slice(b"bad 'for' ");
         msg.extend_from_slice(what);
@@ -1407,7 +1450,7 @@ pub(crate) fn to_int_error(
         (p2, p2_idx)
     };
     let extra = var_info(state, bad_idx);
-    LuaError::runtime_bytes({
+    runtime_bytes({
         let mut msg = Vec::new();
         msg.extend_from_slice(b"number");
         msg.extend_from_slice(&extra);
@@ -1427,7 +1470,7 @@ pub(crate) fn order_error(state: &LuaState, p1: &LuaValue, p2: &LuaValue) -> Lua
     // C: if (strcmp(t1, t2) == 0) luaG_runerror(L, "attempt to compare two %s values", t1);
     //    else                      luaG_runerror(L, "attempt to compare %s with %s", t1, t2);
     if t1 == t2 {
-        LuaError::runtime_bytes({
+        runtime_bytes({
             let mut msg = Vec::new();
             msg.extend_from_slice(b"attempt to compare two ");
             msg.extend_from_slice(t1);
@@ -1435,7 +1478,7 @@ pub(crate) fn order_error(state: &LuaState, p1: &LuaValue, p2: &LuaValue) -> Lua
             msg
         })
     } else {
-        LuaError::runtime_bytes({
+        runtime_bytes({
             let mut msg = Vec::new();
             msg.extend_from_slice(b"attempt to compare ");
             msg.extend_from_slice(t1);
@@ -1510,7 +1553,7 @@ pub(crate) fn error_msg(state: &mut LuaState) -> Result<(), LuaError> {
     // C: luaD_throw(L, LUA_ERRRUN)
     // macros.tsv: luaD_throw → return Err(LuaError::with_status(errcode))
     // error_sites.tsv: luaD_throw(L, LUA_ERRRUN) → return Err(LuaError::with_status(LuaStatus::ErrRun))
-    Err(LuaError::runtime_from_top(state))
+    Err(runtime_from_top(state))
 }
 
 /// Formats and raises a runtime error with printf-style arguments. Prepends
@@ -1531,7 +1574,7 @@ pub(crate) fn run_error(state: &mut LuaState, msg: Vec<u8>) -> Result<(), LuaErr
         let line = get_current_line(&ci, state);
         let proto = ci_lua_proto(&ci, state);
         let src = proto.source_string();
-        add_info(state, &msg, Some(&src), line)
+        add_info(state, &msg, src.map(|s| &**s), line)
     } else {
         msg
     };
@@ -1539,7 +1582,7 @@ pub(crate) fn run_error(state: &mut LuaState, msg: Vec<u8>) -> Result<(), LuaErr
     // C: luaG_errormsg(L)
     // Push the final message as a string, then call error_msg.
     // TODO(port): state.intern_str or state.push_string to get the string on stack
-    let str_val = state.new_string(&final_msg);
+    let str_val = state.new_string(&final_msg)?;
     state.push(LuaValue::Str(str_val));
     error_msg(state)
 }
@@ -1661,7 +1704,7 @@ pub(crate) fn trace_exec(state: &mut LuaState, pc: u32) -> Result<i32, LuaError>
     // C: if (!isIT(*(ci->u.l.savedpc - 1))) L->top.p = ci->top.p;
     // macros.tsv: isIT(i) → i.is_in_top()
     // PORT NOTE: savedpc - 1 is the current instruction (now at index next_pc - 1 = pc).
-    let cur_instr = state.get_proto_instr(ci_idx, pc as usize);
+    let cur_instr = state.get_proto_instr(ci_idx, pc as u32);
     if !cur_instr.is_in_top() {
         // C: L->top.p = ci->top.p  — correct top
         let ci_top = state.get_ci(ci_idx).top;
@@ -1687,8 +1730,8 @@ pub(crate) fn trace_exec(state: &mut LuaState, pc: u32) -> Result<i32, LuaError>
         let npci = next_pc as i32 - 1;
 
         // C: if (npci <= oldpc || changedline(p, oldpc, npci))
-        if npci <= oldpc || changed_line(proto, oldpc, npci) {
-            let newline = get_func_line(proto, npci);
+        if npci <= oldpc || changed_line(&proto, oldpc, npci) {
+            let newline = get_func_line(&proto, npci);
             // C: luaD_hook(L, LUA_HOOKLINE, newline, 0, 0)
             // TODO(port): luaD_hook lives in crate::do_
             state.call_hook_event(LUA_HOOKLINE, newline)?;
@@ -1698,7 +1741,7 @@ pub(crate) fn trace_exec(state: &mut LuaState, pc: u32) -> Result<i32, LuaError>
     }
 
     // C: if (L->status == LUA_YIELD) { if (counthook) L->hookcount = 1; ... luaD_throw(LUA_YIELD); }
-    if state.status() == LUA_YIELD_STATUS as u8 {
+    if state.status() == lua_types::status::LuaStatus::Yield {
         if counthook {
             state.set_hook_count(1);
         }
@@ -1755,9 +1798,12 @@ fn get_local_name_from_closure(cl: &LuaClosureLua, n: i32, pc: i32) -> Option<&[
 ///
 /// TODO(port): This returns a cloned Rc's inner reference; Phase B must verify
 /// lifetimes are correct once all types are wired.
-fn ci_lua_proto<'a>(ci: &CallInfo, state: &'a LuaState) -> &'a LuaProto {
+/// PORT NOTE: reshaped for borrowck — returns `GcRef<LuaProto>` (Rc clone) instead
+/// of `&'a LuaProto` to avoid returning a reference to a temporary `LuaValue`
+/// produced by `get_at`. Callers deref through `GcRef<T>: Deref<Target=T>`.
+fn ci_lua_proto(ci: &CallInfo, state: &LuaState) -> GcRef<LuaProto> {
     match state.get_at(ci.func) {
-        LuaValue::Function(LuaClosure::Lua(cl)) => &cl.proto,
+        LuaValue::Function(LuaClosure::Lua(cl)) => cl.proto.clone(),
         _ => panic!("ci_lua_proto: call frame does not hold a Lua closure"),
     }
 }

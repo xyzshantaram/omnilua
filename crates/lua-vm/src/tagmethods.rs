@@ -75,6 +75,44 @@ pub(crate) enum TagMethod {
     N,
 }
 
+impl TagMethod {
+    /// Convert a raw u8 discriminant to a `TagMethod`.
+    /// Returns `TagMethod::N` (sentinel) if `v >= TM_N`.
+    ///
+    /// C: `cast(TMS, x)` — direct integer cast to the enum.
+    /// PORT NOTE: reshaped for borrowck — C casts freely; Rust requires an explicit map.
+    pub(crate) fn from_u8(v: u8) -> Self {
+        match v {
+            0  => TagMethod::Index,
+            1  => TagMethod::NewIndex,
+            2  => TagMethod::Gc,
+            3  => TagMethod::Mode,
+            4  => TagMethod::Len,
+            5  => TagMethod::Eq,
+            6  => TagMethod::Add,
+            7  => TagMethod::Sub,
+            8  => TagMethod::Mul,
+            9  => TagMethod::Mod,
+            10 => TagMethod::Pow,
+            11 => TagMethod::Div,
+            12 => TagMethod::IDiv,
+            13 => TagMethod::BAnd,
+            14 => TagMethod::BOr,
+            15 => TagMethod::BXor,
+            16 => TagMethod::Shl,
+            17 => TagMethod::Shr,
+            18 => TagMethod::Unm,
+            19 => TagMethod::BNot,
+            20 => TagMethod::Lt,
+            21 => TagMethod::Le,
+            22 => TagMethod::Concat,
+            23 => TagMethod::Call,
+            24 => TagMethod::Close,
+            _  => TagMethod::N,
+        }
+    }
+}
+
 /// Number of real metamethods (= `TagMethod::N as usize`).
 ///
 /// C: `TM_N`

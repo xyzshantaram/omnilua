@@ -1,0 +1,11 @@
+[2026-05-16T03:24:40Z] ═══════════════════════════════════════════════════════════════
+[2026-05-16T03:24:40Z] Overnight orchestrator starting at 2026-05-16T03:24:40Z
+[2026-05-16T03:24:40Z] Hard cap: $1000.00  Soft cap: $300.00
+[2026-05-16T03:24:40Z] ═══════════════════════════════════════════════════════════════
+[2026-05-16T03:24:40Z] ════ Phase B finish: lua-vm compiler-fix residuals ════
+[2026-05-16T03:24:40Z]   lua-vm starting errors: 211
+[2026-05-16T03:24:40Z]   → pass 1: dispatching compiler-fixer (budget $6, hint=focus on top E0308/E0061)
+[2026-05-16T03:34:40Z]   pass 1 errored (consecutive: 1)
+[2026-05-16T03:34:40Z]   → pass 2: dispatching compiler-fixer (budget $6, hint=focus on top E0308/E0061)
+[2026-05-16T03:43:13Z]   pass 2 errored (consecutive: 2)
+[2026-05-16T03:43:13Z]   → pass 3: dispatching compiler-fixer (budget $6, hint=focus on top E0308/E0061)

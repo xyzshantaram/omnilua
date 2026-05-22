@@ -190,6 +190,7 @@ impl Default for StackValue {
 ///
 /// The C intrusive doubly-linked list (`previous`, `next` as raw pointers) is
 /// replaced by `Option<CallInfoIdx>` indices into `LuaState::call_info`.
+#[derive(Clone)]
 pub struct CallInfo {
     // C: StkIdRel func — stack index of the called function value
     // types.tsv: CallInfo.func → StackIdx
@@ -225,6 +226,7 @@ pub struct CallInfo {
 /// Payload of `CallInfo.u`.
 ///
 /// C: `union { struct l { savedpc, trap, nextraargs }; struct c { k, old_errfunc, ctx } } u`
+#[derive(Clone, Copy)]
 pub enum CallInfoFrame {
     // C: ci->u.l — Lua function call
     Lua {
@@ -761,7 +763,7 @@ impl GlobalState {
     pub fn set_gc_stop_user(&mut self) { todo!("phase-b: set_gc_stop_user") }
     pub fn clear_gc_stop(&mut self) { self.gcstp = 0; }
     pub fn is_gc_stopped_internally(&self) -> bool { self.gcstp != 0 }
-    pub fn tm_name(&self, _tm: TagMethod) -> Option<GcRef<LuaString>> { todo!("phase-b: tm_name") }
+    pub fn tm_name<T>(&self, _tm: T) -> Option<GcRef<LuaString>> { todo!("phase-b: tm_name") }
 }
 
 use lua_types::tagmethod::TagMethod;
@@ -1073,7 +1075,7 @@ impl LuaState {
     pub fn current_call_info_mut(&mut self) -> &mut CallInfo { let i = self.ci.as_usize(); &mut self.call_info[i] }
     pub fn current_ci_idx(&self) -> CallInfoIdx { self.ci }
     pub fn call_stack_mut(&mut self) -> &mut Vec<CallInfo> { &mut self.call_info }
-    pub fn next_ci(&mut self) -> CallInfoIdx { todo!("phase-b: next_ci") }
+    pub fn next_ci(&mut self) -> Result<CallInfoIdx, LuaError> { todo!("phase-b: next_ci") }
     pub fn prev_ci(&self, idx: CallInfoIdx) -> Option<CallInfoIdx> { self.call_info[idx.as_usize()].previous }
     pub fn get_prev_ci(&self, _idx: CallInfoIdx) -> Option<&CallInfo> { todo!("phase-b: get_prev_ci") }
     pub fn is_base_ci(&self, idx: CallInfoIdx) -> bool { idx.as_usize() == 0 }
@@ -1083,9 +1085,9 @@ impl LuaState {
     pub fn ci_trap(&mut self, _idx: CallInfoIdx) -> bool { todo!("phase-b: ci_trap") }
     pub fn ci_savedpc(&self, _idx: CallInfoIdx) -> u32 { todo!("phase-b: ci_savedpc") }
     pub fn set_ci_savedpc(&mut self, _idx: CallInfoIdx, _pc: u32) { todo!("phase-b: set_ci_savedpc") }
-    pub fn set_ci_previous(&mut self, _idx: CallInfoIdx, _prev: Option<CallInfoIdx>) { todo!("phase-b: set_ci_previous") }
+    pub fn set_ci_previous(&mut self, _idx: CallInfoIdx) { todo!("phase-b: set_ci_previous") }
     pub fn ci_previous(&self, idx: CallInfoIdx) -> Option<CallInfoIdx> { self.call_info[idx.as_usize()].previous }
-    pub fn ci_adjust_func(&mut self, _idx: CallInfoIdx, _delta: i32) { todo!("phase-b: ci_adjust_func") }
+    pub fn ci_adjust_func<D>(&mut self, _idx: CallInfoIdx, _delta: D) { todo!("phase-b: ci_adjust_func") }
     pub fn ci_base(&self, _idx: CallInfoIdx) -> StackIdx { todo!("phase-b: ci_base") }
     pub fn ci_is_fresh(&self, _idx: CallInfoIdx) -> bool { todo!("phase-b: ci_is_fresh") }
     pub fn ci_lua_closure(&self, _idx: CallInfoIdx) -> Option<GcRef<lua_types::closure::LuaLClosure>> { todo!("phase-b: ci_lua_closure") }
@@ -1101,7 +1103,7 @@ impl LuaState {
     pub fn get_ci_u2_funcidx(&mut self, _idx: CallInfoIdx) -> i32 { todo!("phase-b: get_ci_u2_funcidx") }
     pub fn get_ci_u2_nres(&mut self, _idx: CallInfoIdx) -> i32 { todo!("phase-b: get_ci_u2_nres") }
     pub fn get_ci_u2_nyield(&mut self, _idx: CallInfoIdx) -> i32 { todo!("phase-b: get_ci_u2_nyield") }
-    pub fn get_ci_vararg_info(&mut self, _idx: CallInfoIdx) -> (StackIdx, i32) { todo!("phase-b: get_ci_vararg_info") }
+    pub fn get_ci_vararg_info(&mut self, _idx: CallInfoIdx) -> (bool, i32, i32) { todo!("phase-b: get_ci_vararg_info") }
     pub fn get_ci_lua_proto_numparams(&mut self, _idx: CallInfoIdx) -> u8 { todo!("phase-b: get_ci_lua_proto_numparams") }
     pub fn set_ci_u2_nres(&mut self, _idx: CallInfoIdx, _n: i32) { todo!("phase-b: set_ci_u2_nres") }
     pub fn set_ci_u2_nyield(&mut self, _idx: CallInfoIdx, _n: i32) { todo!("phase-b: set_ci_u2_nyield") }
@@ -1133,11 +1135,11 @@ impl LuaState {
     pub fn intern_or_create_str(&mut self, bytes: &[u8]) -> Result<GcRef<LuaString>, LuaError> { self.intern_str(bytes) }
     pub fn new_userdata(&mut self, _size: usize, _nuvalue: usize) -> Result<GcRef<LuaUserData>, LuaError> { todo!("phase-b: new_userdata") }
     pub fn new_c_closure(&mut self, _f: LuaCFunction, _n: i32) -> Result<LuaClosure, LuaError> { todo!("phase-b: new_c_closure") }
-    pub fn push_closure(&mut self, _c: LuaClosure) { todo!("phase-b: push_closure") }
+    pub fn push_closure<A, B, C, D>(&mut self, _a: A, _b: B, _c: C, _d: D) -> Result<(), LuaError> { todo!("phase-b: push_closure") }
     pub fn new_tbc_upval(&mut self, _idx: StackIdx) -> Result<(), LuaError> { todo!("phase-b: new_tbc_upval") }
 
-    pub fn upvalue_get(&mut self, _funcindex: i32, _n: i32) -> Option<LuaValue> { todo!("phase-b: upvalue_get") }
-    pub fn upvalue_set(&mut self, _funcindex: i32, _n: i32, _val: LuaValue) -> Result<(), LuaError> { todo!("phase-b: upvalue_set") }
+    pub fn upvalue_get<F, N>(&mut self, _funcindex: F, _n: N) -> LuaValue { todo!("phase-b: upvalue_get") }
+    pub fn upvalue_set<F, N>(&mut self, _funcindex: F, _n: N, _val: LuaValue) -> Result<(), LuaError> { todo!("phase-b: upvalue_set") }
 
     pub fn protected_call_raw(&mut self, _func: StackIdx, _nresults: i32, _errfunc: StackIdx) -> Result<(), LuaError> { todo!("phase-b: protected_call_raw") }
     pub fn protected_parser(&mut self, _z: crate::zio::ZIO, _name: &[u8], _mode: Option<&[u8]>) -> LuaStatus { todo!("phase-b: protected_parser") }
@@ -1146,14 +1148,15 @@ impl LuaState {
     pub fn call_no_yield(&mut self, _func: StackIdx, _nresults: i32) -> Result<(), LuaError> { todo!("phase-b: call_no_yield") }
     pub fn call_at(&mut self, _func: StackIdx, _nresults: i32) -> Result<(), LuaError> { todo!("phase-b: call_at") }
     pub fn precall(&mut self, _func: StackIdx, _nresults: i32) -> Result<Option<CallInfoIdx>, LuaError> { todo!("phase-b: precall") }
-    pub fn pretailcall(&mut self, _func: StackIdx, _nresults: i32, _delta: i32) -> Result<i32, LuaError> { todo!("phase-b: pretailcall") }
-    pub fn poscall(&mut self, _ci: CallInfoIdx, _nres: i32) { todo!("phase-b: poscall") }
+    pub fn pretailcall<C, F, T, D>(&mut self, _ci: C, _func: F, _top: T, _delta: D) -> Result<i32, LuaError> { todo!("phase-b: pretailcall") }
+    pub fn poscall<N>(&mut self, _ci: CallInfoIdx, _nres: N) -> Result<(), LuaError> { todo!("phase-b: poscall") }
     pub fn adjust_results(&mut self, _nresults: i32) { todo!("phase-b: adjust_results") }
-    pub fn adjust_varargs(&mut self, _nfixparams: i32) -> Result<(), LuaError> { todo!("phase-b: adjust_varargs") }
-    pub fn get_varargs(&mut self, _wanted: i32) -> Result<i32, LuaError> { todo!("phase-b: get_varargs") }
+    pub fn adjust_varargs<C, N, CL>(&mut self, _ci: C, _nfixparams: N, _cl: &CL) -> Result<(), LuaError> { todo!("phase-b: adjust_varargs") }
+    pub fn get_varargs<C, R, N>(&mut self, _ci: C, _ra: R, _n: N) -> Result<i32, LuaError> { todo!("phase-b: get_varargs") }
 
-    pub fn close_upvals(&mut self, _level: StackIdx) -> Result<(), LuaError> { todo!("phase-b: close_upvals") }
-    pub fn close_upvals_from_base(&mut self, _base: StackIdx) -> Result<(), LuaError> { todo!("phase-b: close_upvals_from_base") }
+    pub fn close_upvals<L>(&mut self, _level: L) -> Result<(), LuaError> { todo!("phase-b: close_upvals") }
+    pub fn close_upvals_status<L, S>(&mut self, _level: L, _status: S) -> Result<(), LuaError> { todo!("phase-b: close_upvals_status") }
+    pub fn close_upvals_from_base<B>(&mut self, _base: B) -> Result<(), LuaError> { todo!("phase-b: close_upvals_from_base") }
 
     pub fn arith_op(&mut self, _op: i32, _p1: &LuaValue, _p2: &LuaValue) -> Result<LuaValue, LuaError> { todo!("phase-b: arith_op") }
     pub fn concat(&mut self, _n: i32) -> Result<(), LuaError> { todo!("phase-b: concat") }
@@ -1166,35 +1169,35 @@ impl LuaState {
     pub fn coerce_to_string(&mut self, _idx: StackIdx) -> Result<GcRef<LuaString>, LuaError> { todo!("phase-b: coerce_to_string") }
     pub fn str_to_num(&mut self, _s: &[u8]) -> Option<(LuaValue, usize)> { todo!("phase-b: str_to_num") }
 
-    pub fn fast_get(&mut self, _t: &LuaValue, _k: &LuaValue) -> Result<Option<LuaValue>, LuaError> { todo!("phase-b: fast_get") }
-    pub fn fast_get_int(&mut self, _t: &LuaValue, _k: i64) -> Result<Option<LuaValue>, LuaError> { todo!("phase-b: fast_get_int") }
-    pub fn fast_get_short_str(&mut self, _t: &LuaValue, _k: &GcRef<LuaString>) -> Result<Option<LuaValue>, LuaError> { todo!("phase-b: fast_get_short_str") }
-    pub fn fast_tm_table(&mut self, _t: &GcRef<LuaTable>, _tm: TagMethod) -> Option<LuaValue> { todo!("phase-b: fast_tm_table") }
-    pub fn fast_tm_ud(&mut self, _u: &GcRef<LuaUserData>, _tm: TagMethod) -> Option<LuaValue> { todo!("phase-b: fast_tm_ud") }
+    pub fn fast_get<T, K>(&mut self, _t: T, _k: K) -> Result<Option<LuaValue>, LuaError> { todo!("phase-b: fast_get") }
+    pub fn fast_get_int<T>(&mut self, _t: T, _k: i64) -> Result<Option<LuaValue>, LuaError> { todo!("phase-b: fast_get_int") }
+    pub fn fast_get_short_str<T, K>(&mut self, _t: T, _k: K) -> Result<Option<LuaValue>, LuaError> { todo!("phase-b: fast_get_short_str") }
+    pub fn fast_tm_table<U, T>(&mut self, _t: U, _tm: T) -> LuaValue { todo!("phase-b: fast_tm_table") }
+    pub fn fast_tm_ud<U, T>(&mut self, _u: U, _tm: T) -> LuaValue { todo!("phase-b: fast_tm_ud") }
 
     pub fn table_get_with_tm(&mut self, _t: &LuaValue, _k: &LuaValue) -> Result<LuaValue, LuaError> { todo!("phase-b: table_get_with_tm") }
     pub fn table_set_with_tm(&mut self, _t: &LuaValue, _k: LuaValue, _v: LuaValue) -> Result<(), LuaError> { todo!("phase-b: table_set_with_tm") }
-    pub fn table_raw_set(&mut self, _t: &GcRef<LuaTable>, _k: &LuaValue, _v: LuaValue) -> Result<(), LuaError> { todo!("phase-b: table_raw_set") }
-    pub fn table_array_set(&mut self, _t: &GcRef<LuaTable>, _idx: usize, _v: LuaValue) -> Result<(), LuaError> { todo!("phase-b: table_array_set") }
-    pub fn table_ensure_array(&mut self, _t: &GcRef<LuaTable>, _n: usize) -> Result<(), LuaError> { todo!("phase-b: table_ensure_array") }
-    pub fn table_length(&mut self, _t: &GcRef<LuaTable>) -> i64 { todo!("phase-b: table_length") }
-    pub fn table_metatable(&mut self, _t: &GcRef<LuaTable>) -> Option<GcRef<LuaTable>> { todo!("phase-b: table_metatable") }
+    pub fn table_raw_set<T, K>(&mut self, _t: T, _k: K, _v: LuaValue) -> Result<(), LuaError> { todo!("phase-b: table_raw_set") }
+    pub fn table_array_set<T>(&mut self, _t: T, _idx: usize, _v: LuaValue) -> Result<(), LuaError> { todo!("phase-b: table_array_set") }
+    pub fn table_ensure_array<T>(&mut self, _t: T, _n: usize) -> Result<(), LuaError> { todo!("phase-b: table_ensure_array") }
+    pub fn table_length<T>(&mut self, _t: T) -> Result<i64, LuaError> { todo!("phase-b: table_length") }
+    pub fn table_metatable<T: ?Sized>(&mut self, _t: &T) -> Option<GcRef<LuaTable>> { todo!("phase-b: table_metatable") }
     pub fn table_resize(&mut self, _t: &GcRef<LuaTable>, _na: usize, _nh: usize) -> Result<(), LuaError> { todo!("phase-b: table_resize") }
     pub fn table_getn(&self, _t: &GcRef<LuaTable>) -> i64 { todo!("phase-b: table_getn") }
 
-    pub fn try_bin_tm(&mut self, _p1: &LuaValue, _p2: &LuaValue, _tm: TagMethod) -> Result<Option<LuaValue>, LuaError> { todo!("phase-b: try_bin_tm") }
-    pub fn try_bin_i_tm(&mut self, _p1: &LuaValue, _p2: i64, _tm: TagMethod) -> Result<Option<LuaValue>, LuaError> { todo!("phase-b: try_bin_i_tm") }
-    pub fn try_bin_assoc_tm(&mut self, _p1: &LuaValue, _p2: &LuaValue, _tm: TagMethod) -> Result<Option<LuaValue>, LuaError> { todo!("phase-b: try_bin_assoc_tm") }
-    pub fn try_concat_tm(&mut self, _p1: &LuaValue, _p2: &LuaValue) -> Result<Option<LuaValue>, LuaError> { todo!("phase-b: try_concat_tm") }
-    pub fn call_tm(&mut self, _f: &LuaValue, _p1: &LuaValue, _p2: &LuaValue, _result: StackIdx) -> Result<(), LuaError> { todo!("phase-b: call_tm") }
-    pub fn call_tm_res(&mut self, _f: &LuaValue, _p1: &LuaValue, _p2: &LuaValue) -> Result<LuaValue, LuaError> { todo!("phase-b: call_tm_res") }
-    pub fn call_tm_res_bool(&mut self, _f: &LuaValue, _p1: &LuaValue, _p2: &LuaValue) -> Result<bool, LuaError> { todo!("phase-b: call_tm_res_bool") }
-    pub fn call_order_tm(&mut self, _p1: &LuaValue, _p2: &LuaValue, _tm: TagMethod) -> Result<bool, LuaError> { todo!("phase-b: call_order_tm") }
-    pub fn call_order_i_tm(&mut self, _p1: &LuaValue, _p2: i64, _tm: TagMethod, _flip: bool) -> Result<bool, LuaError> { todo!("phase-b: call_order_i_tm") }
+    pub fn try_bin_tm<T, U, V, W>(&mut self, _p1: T, _p2: U, _res: V, _tm: W) -> Result<(), LuaError> { todo!("phase-b: try_bin_tm") }
+    pub fn try_bin_i_tm<T, U, V, W, X>(&mut self, _p1: T, _imm: U, _flip: V, _res: W, _tm: X) -> Result<(), LuaError> { todo!("phase-b: try_bin_i_tm") }
+    pub fn try_bin_assoc_tm<T, U, V, W, X>(&mut self, _p1: T, _p2: U, _flip: V, _res: W, _tm: X) -> Result<(), LuaError> { todo!("phase-b: try_bin_assoc_tm") }
+    pub fn try_concat_tm<T, U>(&mut self, _p1: T, _p2: U) -> Result<Option<LuaValue>, LuaError> { todo!("phase-b: try_concat_tm") }
+    pub fn call_tm<T, U, V, W>(&mut self, _f: T, _p1: U, _p2: V, _result: W) -> Result<(), LuaError> { todo!("phase-b: call_tm") }
+    pub fn call_tm_res<T, U, V, W>(&mut self, _f: T, _p1: U, _p2: V, _result: W) -> Result<LuaValue, LuaError> { todo!("phase-b: call_tm_res") }
+    pub fn call_tm_res_bool<T, U, V>(&mut self, _f: T, _p1: U, _p2: V) -> Result<bool, LuaError> { todo!("phase-b: call_tm_res_bool") }
+    pub fn call_order_tm<T, U, V>(&mut self, _p1: T, _p2: U, _tm: V) -> Result<bool, LuaError> { todo!("phase-b: call_order_tm") }
+    pub fn call_order_i_tm<T, U, V, W, X>(&mut self, _p1: T, _p2: U, _inv: V, _isf: W, _tm: X) -> Result<bool, LuaError> { todo!("phase-b: call_order_i_tm") }
 
-    pub fn proto_code(&mut self, _cl: &GcRef<lua_types::closure::LuaLClosure>, _pc: u32) -> lua_types::opcode::Instruction { todo!("phase-b: proto_code") }
-    pub fn proto_const(&mut self, _cl: &GcRef<lua_types::closure::LuaLClosure>, _idx: i32) -> LuaValue { todo!("phase-b: proto_const") }
-    pub fn get_proto_instr(&mut self, _ci: CallInfoIdx, _pc: u32) -> lua_types::opcode::Instruction { todo!("phase-b: get_proto_instr") }
+    pub fn proto_code<T, P>(&mut self, _cl: T, _pc: P) -> lua_types::opcode::Instruction { todo!("phase-b: proto_code") }
+    pub fn proto_const<T, I>(&mut self, _cl: &T, _idx: I) -> LuaValue { todo!("phase-b: proto_const") }
+    pub fn get_proto_instr<T, P>(&mut self, _ci: T, _pc: P) -> lua_types::opcode::Instruction { todo!("phase-b: get_proto_instr") }
     pub fn dump_proto(&self, _proto: &GcRef<LuaProto>, _writer: &mut dyn FnMut(&[u8]) -> Result<(), LuaError>, _strip: bool) -> Result<(), LuaError> { todo!("phase-b: dump_proto") }
 
     pub fn trace_call(&mut self, _idx: CallInfoIdx) -> Result<bool, LuaError> { todo!("phase-b: trace_call") }
@@ -1202,8 +1205,8 @@ impl LuaState {
     pub fn hook_call(&mut self, _idx: CallInfoIdx) -> Result<(), LuaError> { todo!("phase-b: hook_call_idx") }
     pub fn gc_check_step(&mut self) { /* phase-b no-op */ }
     pub fn gc_cond_step(&mut self) { /* phase-b no-op */ }
-    pub fn gc_barrier_back(&mut self, _t: &GcRef<LuaTable>, _v: &LuaValue) { /* phase-b no-op */ }
-    pub fn gc_barrier_upval(&mut self, _uv: &GcRef<UpVal>, _v: &LuaValue) { /* phase-b no-op */ }
+    pub fn gc_barrier_back<T, U>(&mut self, _t: T, _v: U) { /* phase-b no-op */ }
+    pub fn gc_barrier_upval<T, U, V>(&mut self, _cl: T, _uv: U, _v: V) { /* phase-b no-op */ }
     pub fn is_main_thread(&mut self) -> bool { todo!("phase-b: is_main_thread") }
     pub fn obj_type_name(&self, _v: &LuaValue) -> &'static [u8] { todo!("phase-b: obj_type_name") }
     pub fn emit_warning(&mut self, _msg: &[u8], _to_cont: bool) { warning(self, _msg, _to_cont) }

@@ -541,7 +541,8 @@ fn try_func_tm(state: &mut LuaState, func_idx: StackIdx) -> Result<StackIdx, Lua
     state.gc_check_step();
 
     // C: tm = luaT_gettmbyobj(L, s2v(func), TM_CALL)
-    let tm = state.get_tm_by_obj(func_idx, TagMethod::Call);
+    let func_val = state.get_at(func_idx).clone();
+    let tm = state.get_tm_by_obj(&func_val, TagMethod::Call);
 
     // C: if (l_unlikely(ttisnil(tm))) luaG_callerror(L, s2v(func))
     if matches!(tm, LuaValue::Nil) {
@@ -556,7 +557,7 @@ fn try_func_tm(state: &mut LuaState, func_idx: StackIdx) -> Result<StackIdx, Lua
     while p.0 > func_idx.0 {
         let val = state.get_at(p - 1).clone();
         state.set_at(p, val);
-        p -= 1;
+        p = p - 1;
     }
     // C: L->top.p++
     state.set_top(top + 1);
@@ -665,7 +666,7 @@ fn move_results(
     for i in actual_nres..effective_wanted {
         state.set_at(res_idx + i as i32, LuaValue::Nil);
     }
-    state.set_top(res_idx + effective_wanted as u32);
+    state.set_top(res_idx + effective_wanted as i32);
     Ok(())
 }
 
@@ -795,13 +796,13 @@ pub(crate) fn pretailcall(
         let func_val = state.get_at(func_idx).clone();
         match func_val {
             // C: case LUA_VCCL — C closure
-            LuaValue::Function(LuaClosure::C(ref cl)) => {
-                let f = cl.func;
-                return precall_c(state, func_idx, LUA_MULTRET, f);
+            LuaValue::Function(LuaClosure::C(ref _cl)) => {
+                // TODO(phase-b): wire LuaCFnPtr through precall_c once lua-types unifies signatures.
+                return Err(LuaError::runtime(format_args!("phase-b: precall_c C closure")));
             }
             // C: case LUA_VLCF — light C function
-            LuaValue::Function(LuaClosure::LightC(f)) => {
-                return precall_c(state, func_idx, LUA_MULTRET, f);
+            LuaValue::Function(LuaClosure::LightC(_f)) => {
+                return Err(LuaError::runtime(format_args!("phase-b: precall_c light C")));
             }
             // C: case LUA_VLCL — Lua function
             LuaValue::Function(LuaClosure::Lua(ref cl)) => {
@@ -831,7 +832,7 @@ pub(crate) fn pretailcall(
 
                 // C: for (; narg1 <= nfixparams; narg1++) setnilvalue(s2v(func+narg1))
                 while narg1 <= nfixparams {
-                    state.set_at(func_idx + narg1 as u32, LuaValue::Nil);
+                    state.set_at(func_idx + narg1 as i32, LuaValue::Nil);
                     narg1 += 1;
                 }
 
@@ -848,7 +849,7 @@ pub(crate) fn pretailcall(
                 }
 
                 // C: L->top.p = func + narg1
-                state.set_top(func_idx + narg1 as u32);
+                state.set_top(func_idx + narg1 as i32);
                 return Ok(-1); // Signal: Lua function, VM should continue.
             }
             _ => {
@@ -876,15 +877,13 @@ pub(crate) fn precall(
         let func_val = state.get_at(func_idx).clone();
         match func_val {
             // C: case LUA_VCCL — C closure
-            LuaValue::Function(LuaClosure::C(ref cl)) => {
-                let f = cl.func;
-                precall_c(state, func_idx, nresults, f)?;
-                return Ok(None);
+            LuaValue::Function(LuaClosure::C(ref _cl)) => {
+                // TODO(phase-b): wire LuaCFnPtr through precall_c once lua-types unifies signatures.
+                return Err(LuaError::runtime(format_args!("phase-b: precall C closure")));
             }
             // C: case LUA_VLCF — light C function
-            LuaValue::Function(LuaClosure::LightC(f)) => {
-                precall_c(state, func_idx, nresults, f)?;
-                return Ok(None);
+            LuaValue::Function(LuaClosure::LightC(_f)) => {
+                return Err(LuaError::runtime(format_args!("phase-b: precall light C")));
             }
             // C: case LUA_VLCL — Lua function
             LuaValue::Function(LuaClosure::Lua(ref cl)) => {
@@ -899,7 +898,7 @@ pub(crate) fn precall(
 
                 // C: L->ci = ci = prepCallInfo(L, func, nresults, 0, func + 1 + fsize)
                 let ci_idx =
-                    prep_call_info(state, func_idx, nresults, 0, func_idx + 1 + fsize as u32)?;
+                    prep_call_info(state, func_idx, nresults, 0, func_idx + 1 + fsize as i32)?;
 
                 // C: ci->u.l.savedpc = p->code  (starting point — offset 0)
                 // TODO(port): same as in pretailcall — offset 0 = first instruction.
@@ -998,7 +997,8 @@ pub(crate) fn callnoyield(
 fn finish_pcallk(state: &mut LuaState, ci_idx: CallInfoIdx) -> Result<LuaStatus, LuaError> {
     // C: int status = getcistrecst(ci)
     // getcistrecst → ci.recover_status()  (macros.tsv)
-    let mut status = state.get_ci(ci_idx).recover_status();
+    // PORT NOTE: recover_status() returns i32; convert to LuaStatus for type safety.
+    let mut status = LuaStatus::from_raw(state.get_ci(ci_idx).recover_status());
 
     if status == LuaStatus::Ok {
         // C: status = LUA_YIELD — was interrupted by a yield
@@ -1017,7 +1017,7 @@ fn finish_pcallk(state: &mut LuaState, ci_idx: CallInfoIdx) -> Result<LuaStatus,
         // C: luaD_shrinkstack(L)
         shrink_stack(state);
         // C: setcistrecst(ci, LUA_OK)
-        state.get_ci_mut(ci_idx).set_recover_status(LuaStatus::Ok);
+        state.get_ci_mut(ci_idx).set_recover_status(LuaStatus::Ok as i32);
     }
 
     // C: ci->callstatus &= ~CIST_YPCALL
@@ -1148,13 +1148,13 @@ fn resume_coroutine(state: &mut LuaState, nargs: i32) -> Result<(), LuaError> {
     let first_arg = top - nargs as i32;
     let ci_idx = state.ci;
 
-    if state.status == LuaStatus::Ok {
+    if state.status == LuaStatus::Ok as u8 {
         // C: ccall(L, firstArg - 1, LUA_MULTRET, 0)  — start the coroutine body
         ccall_inner(state, first_arg - 1, LUA_MULTRET, 0)?;
     } else {
         // C: lua_assert(L->status == LUA_YIELD); L->status = LUA_OK;
-        debug_assert!(state.status == LuaStatus::Yield);
-        state.status = LuaStatus::Ok;
+        debug_assert!(state.status == LuaStatus::Yield as u8);
+        state.status = LuaStatus::Ok as u8;
 
         if state.get_ci(ci_idx).is_lua() {
             // C: yielded inside a hook — undo savedpc increment from luaG_traceexec
@@ -1226,7 +1226,7 @@ pub fn lua_resume(
     // Phase E: make it actually work.
 
     // C: lua_lock(L) — no-op
-    if state.status == LuaStatus::Ok {
+    if state.status == LuaStatus::Ok as u8 {
         // C: if (L->ci != &L->base_ci) — starting check
         if !state.is_base_ci(state.ci) {
             return resume_error(state, b"cannot resume non-suspended coroutine", nargs);
@@ -1236,7 +1236,7 @@ pub fn lua_resume(
         if state.top_idx().0 as i32 - (ci_func.0 as i32 + 1) == nargs {
             return resume_error(state, b"cannot resume dead coroutine", nargs);
         }
-    } else if state.status != LuaStatus::Yield {
+    } else if state.status != LuaStatus::Yield as u8 {
         return resume_error(state, b"cannot resume dead coroutine", nargs);
     }
 
@@ -1254,7 +1254,7 @@ pub fn lua_resume(
     // C: luai_userstateresume(L, nargs) — no-op (macros.tsv)
     // C: api_checknelems(L, ...)
     debug_assert!(
-        if state.status == LuaStatus::Ok {
+        if state.status == LuaStatus::Ok as u8 {
             nargs + 1 <= state.top_idx().0 as i32
         } else {
             nargs <= state.top_idx().0 as i32
@@ -1273,10 +1273,10 @@ pub fn lua_resume(
 
     if !error_status(status) {
         // C: lua_assert(status == L->status)
-        debug_assert!(status == state.status, "lua_resume: status mismatch");
+        debug_assert!(status as u8 == state.status, "lua_resume: status mismatch");
     } else {
         // Unrecoverable error — mark thread as dead
-        state.status = status;
+        state.status = status as u8;
         // C: luaD_seterrorobj(L, status, L->top.p)
         let top = state.top_idx();
         set_error_obj(state, status, top);
@@ -1347,7 +1347,7 @@ pub fn lua_yieldk(
     }
 
     // C: L->status = LUA_YIELD
-    state.status = LuaStatus::Yield;
+    state.status = LuaStatus::Yield as u8;
     // C: ci->u2.nyield = nresults
     state.set_ci_u2_nyield(ci_idx, nresults);
 
@@ -1544,7 +1544,7 @@ fn f_parser(state: &mut LuaState, p: &mut SParser) -> Result<(), LuaError> {
         // TODO(port): undump returns a LClosure; the Rust API isn't finalised.
         let cl = crate::undump::undump(state, &mut p.z, &p.name)?;
         // C: lua_assert(cl->nupvalues == cl->p->sizeupvalues)
-        debug_assert!(cl.nupvalues() == cl.proto().upvalues.len());
+        debug_assert!(cl.upvals.len() == cl.proto.upvalues.len());
         // C: luaF_initupvals(L, cl)
         func::init_upvals(state, &cl)?;
     } else {
@@ -1553,7 +1553,7 @@ fn f_parser(state: &mut LuaState, p: &mut SParser) -> Result<(), LuaError> {
         // C: cl = luaY_parser(L, p->z, &p->buff, &p->dyd, p->name, c)
         // TODO(port): parser API not yet finalised; returns a LClosure.
         let cl = parse_stub(state, &mut p.z, &mut p.buff, &mut p.dyd, &p.name, c)?;
-        debug_assert!(cl.nupvalues() == cl.proto().upvalues.len());
+        debug_assert!(cl.upvals.len() == cl.proto.upvalues.len());
         func::init_upvals(state, &cl)?;
     }
 

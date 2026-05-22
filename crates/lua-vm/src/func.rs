@@ -138,7 +138,7 @@ pub(crate) fn new_lua_closure(
 /// live stack variables.
 ///
 /// C: `void luaF_initupvals(lua_State *L, LClosure *cl)`
-pub(crate) fn init_upvals(state: &mut LuaState, cl: &GcRef<crate::state::LuaClosure>) {
+pub(crate) fn init_upvals(state: &mut LuaState, cl: &GcRef<lua_types::LuaLClosure>) -> Result<(), LuaError> {
     // C: for (i = 0; i < cl->nupvalues; i++) {
     //      GCObject *o = luaC_newobj(L, LUA_VUPVAL, sizeof(UpVal));
     //      UpVal *uv = gco2upv(o);
@@ -154,10 +154,7 @@ pub(crate) fn init_upvals(state: &mut LuaState, cl: &GcRef<crate::state::LuaClos
     // `cl.upvals[i]` here requires either Rc<RefCell<LuaClosure>> or Rc::get_mut.
     // The code below captures the intended logic; it will not compile until
     // GcRef provides a borrow_mut() path (Phase B design decision).
-    let n = match cl.as_ref() {
-        crate::state::LuaClosure::Lua(lc) => lc.upvals.len(),
-        _ => return,
-    };
+    let n = cl.upvals.len();
     for i in 0..n {
         // C: luaC_newobj(L, LUA_VUPVAL, sizeof(UpVal)) → Rc::new(UpVal::Closed(Nil))
         let uv: GcRef<UpVal> = GcRef::new(UpVal::Closed(LuaValue::Nil));
@@ -167,6 +164,7 @@ pub(crate) fn init_upvals(state: &mut LuaState, cl: &GcRef<crate::state::LuaClos
         // C: luaC_objbarrier(L, cl, uv) → state.gc().obj_barrier(cl, &uv) — no-op Phase A–C
     }
     let _ = state; // used for GC barrier in Phase D
+    Ok(())
 }
 
 // ── Open-upvalue management ───────────────────────────────────────────────────
@@ -745,7 +743,7 @@ impl LuaState {
     /// C: `luaT_gettmbyobj(L, obj, TM_CLOSE)`.
     /// macros.tsv: `fasttm → state.fast_tm(et, e)`.
     /// TODO(port): real implementation in tagmethods.rs.
-    pub(crate) fn get_tm_by_obj(&self, _val: &LuaValue, _tm: TagMethod) -> LuaValue {
+    pub(crate) fn get_tm_by_obj<T>(&self, _val: &LuaValue, _tm: T) -> LuaValue {
         // TODO(port): implement in tagmethods.rs; for now return Nil (no metamethod).
         LuaValue::Nil
     }

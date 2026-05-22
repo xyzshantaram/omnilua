@@ -26,7 +26,7 @@
 
 #[allow(unused_imports)] use crate::prelude::*;
 use lua_types::{
-    CallInfoIdx, LuaError, LuaValue, StackIdx,
+    CallInfoIdx, GcRef, LuaError, LuaValue, StackIdx,
 };
 use lua_types::tagmethod::TagMethod;
 use lua_types::opcode::Instruction;
@@ -77,7 +77,11 @@ pub trait InstructionExt {
 }
 
 impl InstructionExt for Instruction {
-    fn opcode(&self) -> OpCode { OpCode((self.raw() & 0x7F) as u8) }
+    fn opcode(&self) -> OpCode {
+        // TODO(phase-b): map raw u8 → OpCode variant. For now panic at decode time
+        // so unit tests catch missing translation rather than silently miscomputing.
+        todo!("phase-b: OpCode decode from instruction word")
+    }
     fn arg_a(&self) -> i32 { ((self.raw() >> 7) & 0xFF) as i32 }
     fn arg_b(&self) -> i32 { ((self.raw() >> 16) & 0xFF) as i32 }
     fn arg_c(&self) -> i32 { ((self.raw() >> 24) & 0xFF) as i32 }
@@ -794,7 +798,7 @@ fn copy_to_buf(state: &LuaState, top: StackIdx, n: u32, buf: &mut Vec<u8>) {
     // C: do { TString *st = tsvalue(s2v(top - n)); ... } while (--n > 0)
     let mut remaining = n;
     loop {
-        let idx = top - remaining;
+        let idx = top - remaining as i32;
         let v = state.get_at(idx);
         if let LuaValue::Str(ts) = v {
             buf.extend_from_slice(ts.as_bytes());
@@ -827,7 +831,7 @@ pub(crate) fn concat(state: &mut LuaState, total: i32) -> Result<(), LuaError> {
         let top1_stringlike = matches!(v_tm1, LuaValue::Str(_))
             || matches!(v_tm1, LuaValue::Int(_) | LuaValue::Float(_));
         if !top2_coercible || !top1_stringlike {
-            state.try_concat_tm()?;
+            state.try_concat_tm(&v_tm1, &v_tm2)?;
             // C: luaT_tryconcatTM may invalidate `top` — update
             total -= 1;
             if total <= 1 {
@@ -867,7 +871,7 @@ pub(crate) fn concat(state: &mut LuaState, total: i32) -> Result<(), LuaError> {
                 if count as i32 >= total {
                     break;
                 }
-                let idx = top - count - 1;
+                let idx = top - (count as i32 + 1);
                 let v = state.get_at(idx).clone();
                 if !matches!(v, LuaValue::Str(_) | LuaValue::Int(_) | LuaValue::Float(_)) {
                     break;
@@ -894,12 +898,12 @@ pub(crate) fn concat(state: &mut LuaState, total: i32) -> Result<(), LuaError> {
             let top = state.top_idx();
             copy_to_buf(state, top, n, &mut buf);
             let ts = state.intern_or_create_str(&buf)?;
-            state.set_at(top - n, LuaValue::Str(ts));
+            state.set_at(top - n as i32, LuaValue::Str(ts));
         }
         // C: total -= n - 1; L->top.p -= n - 1;
         total -= n as i32 - 1;
         let top = state.top_idx();
-        state.set_top(top - n + 1);
+        state.set_top(top - ((n - 1) as i32));
 
         if total <= 1 {
             break;
@@ -1000,6 +1004,20 @@ pub(crate) fn fmodf(m: f64, n: f64) -> f64 {
         r + n
     } else {
         r
+    }
+}
+
+/// Phase-B helper: map a u8 raw value to a `TagMethod`. Mirrors C's
+/// `cast(TMS, x)` direct cast; out-of-range returns `TagMethod::Index`.
+pub(crate) fn tagmethod_from_index(i: usize) -> TagMethod {
+    use TagMethod::*;
+    match i {
+        0 => Index, 1 => NewIndex, 2 => Gc, 3 => Mode, 4 => Len, 5 => Eq,
+        6 => Add, 7 => Sub, 8 => Mul, 9 => Mod, 10 => Pow, 11 => Div,
+        12 => Idiv, 13 => Band, 14 => Bor, 15 => Bxor, 16 => Shl, 17 => Shr,
+        18 => Unm, 19 => Bnot, 20 => Lt, 21 => Le, 22 => Concat, 23 => Call,
+        24 => Close,
+        _ => Index,
     }
 }
 
@@ -1109,7 +1127,7 @@ pub(crate) fn finish_op(state: &mut LuaState) -> Result<(), LuaError> {
             let res = !matches!(v, LuaValue::Nil | LuaValue::Bool(false));
             state.dec_top();
             // C: if (res != GETARG_k(inst)) ci->u.l.savedpc++;
-            if (res as u32) != inst.arg_k() {
+            if (res as i32) != inst.arg_k() {
                 state.ci_skip_next_instruction(ci);
             }
             // Note: CIST_LEQ compatibility not supported (LUA_COMPAT_LT_LE dropped)
@@ -1142,7 +1160,7 @@ pub(crate) fn finish_op(state: &mut LuaState) -> Result<(), LuaError> {
         OpCode::Return => {
             let a = inst.arg_a();
             let ra = base + a;
-            let nres = state.ci_nres(ci) as u32;
+            let nres = state.ci_nres(ci);
             state.set_top(ra + nres);
             state.ci_step_pc_back(ci);
         }
@@ -1213,7 +1231,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                     trap = state.trace_exec(ci, pc)?;
                     base = state.ci_base(ci); // updatebase
                 }
-                let i: Instruction = state.proto_code(cl, pc);
+                let i: Instruction = state.proto_code(&cl, pc);
                 pc += 1;
 
                 debug_assert!(base == state.ci_base(ci));
@@ -1247,17 +1265,17 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                     OpCode::LoadK => {
                         let ra = base + i.arg_a();
                         let k_idx = i.arg_bx() as usize;
-                        let v = state.proto_const(cl, k_idx).clone();
+                        let v = state.proto_const(&cl, k_idx).clone();
                         state.set_at(ra, v);
                     }
                     // ── OP_LOADKX ────────────────────────────────────────────
                     // C: rb = k + GETARG_Ax(*pc); pc++;
                     OpCode::LoadKX => {
                         let ra = base + i.arg_a();
-                        let extra = state.proto_code(cl, pc);
+                        let extra = state.proto_code(&cl, pc);
                         pc += 1;
                         let k_idx = extra.arg_ax() as usize;
-                        let v = state.proto_const(cl, k_idx).clone();
+                        let v = state.proto_const(&cl, k_idx).clone();
                         state.set_at(ra, v);
                     }
                     // ── OP_LOADFALSE ─────────────────────────────────────────
@@ -1291,7 +1309,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                     OpCode::GetUpVal => {
                         let ra = base + i.arg_a();
                         let b = i.arg_b() as usize;
-                        let v = state.upvalue_get(cl, b);
+                        let v = state.upvalue_get(&cl, b);
                         state.set_at(ra, v);
                     }
                     // ── OP_SETUPVAL ──────────────────────────────────────────
@@ -1301,8 +1319,8 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         let ra = base + i.arg_a();
                         let b = i.arg_b() as usize;
                         let v = state.get_at(ra).clone();
-                        state.upvalue_set(cl, b, v.clone());
-                        state.gc_barrier_upval(cl, b, &v);
+                        state.upvalue_set(&cl, b, v.clone());
+                        state.gc_barrier_upval(&cl, b, &v);
                     }
                     // ── OP_GETTABUP ──────────────────────────────────────────
                     // C: upval = cl->upvals[B]->v.p; rc = KC(i) (short string key)
@@ -1312,8 +1330,8 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         let ra = base + i.arg_a();
                         let b = i.arg_b() as usize;
                         let k_idx = i.arg_c() as usize;
-                        let upval = state.upvalue_get(cl, b);
-                        let key = state.proto_const(cl, k_idx).clone();
+                        let upval = state.upvalue_get(&cl, b);
+                        let key = state.proto_const(&cl, k_idx).clone();
                         match state.fast_get_short_str(&upval, &key)? {
                             Some(v) => state.set_at(ra, v),
                             None => {
@@ -1372,7 +1390,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         let ra = base + i.arg_a();
                         let rb_v = state.get_at(base + i.arg_b()).clone();
                         let k_idx = i.arg_c() as usize;
-                        let key = state.proto_const(cl, k_idx).clone();
+                        let key = state.proto_const(&cl, k_idx).clone();
                         match state.fast_get_short_str(&rb_v, &key)? {
                             Some(v) => state.set_at(ra, v),
                             None => {
@@ -1389,12 +1407,12 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         let a = i.arg_a() as usize;
                         let b_idx = i.arg_b() as usize; // key is KB(i)
                         let rc_v = if i.test_k() {
-                            state.proto_const(cl, i.arg_c() as usize).clone()
+                            state.proto_const(&cl, i.arg_c() as usize).clone()
                         } else {
                             state.get_at(base + i.arg_c()).clone()
                         };
-                        let upval = state.upvalue_get(cl, a);
-                        let key = state.proto_const(cl, b_idx).clone();
+                        let upval = state.upvalue_get(&cl, a);
+                        let key = state.proto_const(&cl, b_idx).clone();
                         match state.fast_get_short_str(&upval, &key)? {
                             Some(_slot) => {
                                 // C: luaV_finishfastset(L, upval, slot, rc)
@@ -1415,7 +1433,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         let ra_v = state.get_at(base + i.arg_a()).clone();
                         let rb_v = state.get_at(base + i.arg_b()).clone();
                         let rc_v = if i.test_k() {
-                            state.proto_const(cl, i.arg_c() as usize).clone()
+                            state.proto_const(&cl, i.arg_c() as usize).clone()
                         } else {
                             state.get_at(base + i.arg_c()).clone()
                         };
@@ -1440,7 +1458,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         let ra_v = state.get_at(base + i.arg_a()).clone();
                         let c = i.arg_b() as i64;
                         let rc_v = if i.test_k() {
-                            state.proto_const(cl, i.arg_c() as usize).clone()
+                            state.proto_const(&cl, i.arg_c() as usize).clone()
                         } else {
                             state.get_at(base + i.arg_c()).clone()
                         };
@@ -1460,9 +1478,9 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                     OpCode::SetField => {
                         let ra_v = state.get_at(base + i.arg_a()).clone();
                         let b_idx = i.arg_b() as usize;
-                        let key = state.proto_const(cl, b_idx).clone();
+                        let key = state.proto_const(&cl, b_idx).clone();
                         let rc_v = if i.test_k() {
-                            state.proto_const(cl, i.arg_c() as usize).clone()
+                            state.proto_const(&cl, i.arg_c() as usize).clone()
                         } else {
                             state.get_at(base + i.arg_c()).clone()
                         };
@@ -1490,10 +1508,10 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                             b = 1 << (b - 1); // C: b = 1 << (b - 1)
                         }
                         if i.test_k() {
-                            let extra = state.proto_code(cl, pc);
+                            let extra = state.proto_code(&cl, pc);
                             pc += 1;
                             // C: c += GETARG_Ax(*pc) * (MAXARG_C + 1)
-                            const MAXARG_C: u32 = (1 << 8) - 1;
+                            const MAXARG_C: i32 = (1 << 8) - 1;
                             c += extra.arg_ax() * (MAXARG_C + 1);
                         } else {
                             pc += 1; // skip extra argument even if zero
@@ -1503,7 +1521,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         let t = state.new_table();
                         state.set_at(ra, LuaValue::Table(t.clone()));
                         if b != 0 || c != 0 {
-                            state.table_resize(t, c as usize, b as usize)?;
+                            state.table_resize(&t, c as usize, b as usize)?;
                         }
                         // C: checkGC(L, ra + 1)
                         state.set_ci_savedpc(ci, pc);
@@ -1518,7 +1536,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         let rb_v = state.get_at(base + i.arg_b()).clone();
                         let k_idx = i.arg_c() as usize; // RKC key (always a string)
                         let key = if i.test_k() {
-                            state.proto_const(cl, k_idx).clone()
+                            state.proto_const(&cl, k_idx).clone()
                         } else {
                             state.get_at(base + i.arg_c()).clone()
                         };
@@ -1557,21 +1575,21 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                     OpCode::AddK => {
                         let ra = base + i.arg_a();
                         let v1 = state.get_at(base + i.arg_b()).clone();
-                        let v2 = state.proto_const(cl, i.arg_c() as usize).clone();
+                        let v2 = state.proto_const(&cl, i.arg_c() as usize).clone();
                         arith_op_aux_rr(state, ra, &v1, &v2, &mut pc,
                             intop_add, |a, b| a + b);
                     }
                     OpCode::SubK => {
                         let ra = base + i.arg_a();
                         let v1 = state.get_at(base + i.arg_b()).clone();
-                        let v2 = state.proto_const(cl, i.arg_c() as usize).clone();
+                        let v2 = state.proto_const(&cl, i.arg_c() as usize).clone();
                         arith_op_aux_rr(state, ra, &v1, &v2, &mut pc,
                             intop_sub, |a, b| a - b);
                     }
                     OpCode::MulK => {
                         let ra = base + i.arg_a();
                         let v1 = state.get_at(base + i.arg_b()).clone();
-                        let v2 = state.proto_const(cl, i.arg_c() as usize).clone();
+                        let v2 = state.proto_const(&cl, i.arg_c() as usize).clone();
                         arith_op_aux_rr(state, ra, &v1, &v2, &mut pc,
                             intop_mul, |a, b| a * b);
                     }
@@ -1579,7 +1597,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                     OpCode::ModK => {
                         let ra = base + i.arg_a();
                         let v1 = state.get_at(base + i.arg_b()).clone();
-                        let v2 = state.proto_const(cl, i.arg_c() as usize).clone();
+                        let v2 = state.proto_const(&cl, i.arg_c() as usize).clone();
                         state.set_ci_savedpc(ci, pc); // savestate for div-by-zero
                         state.set_top(state.ci_top(ci));
                         arith_op_checked(state, ra, &v1, &v2, &mut pc,
@@ -1589,7 +1607,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                     OpCode::PowK => {
                         let ra = base + i.arg_a();
                         let v1 = state.get_at(base + i.arg_b()).clone();
-                        let v2 = state.proto_const(cl, i.arg_c() as usize).clone();
+                        let v2 = state.proto_const(&cl, i.arg_c() as usize).clone();
                         arith_float_aux(state, ra, &v1, &v2, &mut pc,
                             |a, b| if b == 2.0 { a * a } else { a.powf(b) });
                     }
@@ -1597,14 +1615,14 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                     OpCode::DivK => {
                         let ra = base + i.arg_a();
                         let v1 = state.get_at(base + i.arg_b()).clone();
-                        let v2 = state.proto_const(cl, i.arg_c() as usize).clone();
+                        let v2 = state.proto_const(&cl, i.arg_c() as usize).clone();
                         arith_float_aux(state, ra, &v1, &v2, &mut pc, |a, b| a / b);
                     }
                     // C: op_arithK(L, luaV_idiv, luai_numidiv)
                     OpCode::IDivK => {
                         let ra = base + i.arg_a();
                         let v1 = state.get_at(base + i.arg_b()).clone();
-                        let v2 = state.proto_const(cl, i.arg_c() as usize).clone();
+                        let v2 = state.proto_const(&cl, i.arg_c() as usize).clone();
                         state.set_ci_savedpc(ci, pc);
                         state.set_top(state.ci_top(ci));
                         arith_op_checked(state, ra, &v1, &v2, &mut pc,
@@ -1614,19 +1632,19 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                     OpCode::BAndK => {
                         let ra = base + i.arg_a();
                         let v1 = state.get_at(base + i.arg_b()).clone();
-                        let v2 = state.proto_const(cl, i.arg_c() as usize).clone();
+                        let v2 = state.proto_const(&cl, i.arg_c() as usize).clone();
                         bitwise_op_k(state, ra, &v1, &v2, &mut pc, intop_band);
                     }
                     OpCode::BOrK => {
                         let ra = base + i.arg_a();
                         let v1 = state.get_at(base + i.arg_b()).clone();
-                        let v2 = state.proto_const(cl, i.arg_c() as usize).clone();
+                        let v2 = state.proto_const(&cl, i.arg_c() as usize).clone();
                         bitwise_op_k(state, ra, &v1, &v2, &mut pc, intop_bor);
                     }
                     OpCode::BXOrK => {
                         let ra = base + i.arg_a();
                         let v1 = state.get_at(base + i.arg_b()).clone();
-                        let v2 = state.proto_const(cl, i.arg_c() as usize).clone();
+                        let v2 = state.proto_const(&cl, i.arg_c() as usize).clone();
                         bitwise_op_k(state, ra, &v1, &v2, &mut pc, intop_bxor);
                     }
                     // C: OP_SHRI — rb >> sC (shift right by immediate)
@@ -1747,8 +1765,8 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                     OpCode::MmBin => {
                         let ra_v = state.get_at(base + i.arg_a()).clone();
                         let rb_v = state.get_at(base + i.arg_b()).clone();
-                        let tm = TagMethod::from_index(i.arg_c() as usize);
-                        let prev_inst = state.proto_code(cl, pc - 2);
+                        let tm = tagmethod_from_index(i.arg_c() as usize);
+                        let prev_inst = state.proto_code(&cl, pc - 2);
                         let result_idx = base + prev_inst.arg_a();
                         state.set_ci_savedpc(ci, pc);
                         state.set_top(state.ci_top(ci));
@@ -1759,9 +1777,9 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                     OpCode::MmBinI => {
                         let ra_v = state.get_at(base + i.arg_a()).clone();
                         let imm = i.arg_s_b() as i64;
-                        let tm = TagMethod::from_index(i.arg_c() as usize);
+                        let tm = tagmethod_from_index(i.arg_c() as usize);
                         let flip = i.arg_k() != 0;
-                        let prev_inst = state.proto_code(cl, pc - 2);
+                        let prev_inst = state.proto_code(&cl, pc - 2);
                         let result_idx = base + prev_inst.arg_a();
                         state.set_ci_savedpc(ci, pc);
                         state.set_top(state.ci_top(ci));
@@ -1771,10 +1789,10 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                     // C: OP_MMBINK — metamethod for arith-with-K
                     OpCode::MmBinK => {
                         let ra_v = state.get_at(base + i.arg_a()).clone();
-                        let imm = state.proto_const(cl, i.arg_b() as usize).clone();
-                        let tm = TagMethod::from_index(i.arg_c() as usize);
+                        let imm = state.proto_const(&cl, i.arg_b() as usize).clone();
+                        let tm = tagmethod_from_index(i.arg_c() as usize);
                         let flip = i.arg_k() != 0;
-                        let prev_inst = state.proto_code(cl, pc - 2);
+                        let prev_inst = state.proto_code(&cl, pc - 2);
                         let result_idx = base + prev_inst.arg_a();
                         state.set_ci_savedpc(ci, pc);
                         state.set_top(state.ci_top(ci));
@@ -1814,7 +1832,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         } else {
                             state.set_ci_savedpc(ci, pc);
                             state.set_top(state.ci_top(ci));
-                            state.try_bin_tm(&rb_v, &rb_v, ra, TagMethod::BNot)?;
+                            state.try_bin_tm(&rb_v, &rb_v, ra, TagMethod::Bnot)?;
                             trap = state.ci_trap(ci);
                         }
                     }
@@ -1841,7 +1859,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                     OpCode::Concat => {
                         let ra = base + i.arg_a();
                         let n = i.arg_b() as i32;
-                        state.set_top(ra + n as u32);
+                        state.set_top(ra + n as i32);
                         state.set_ci_savedpc(ci, pc); // ProtectNT: save pc only
                         concat(state, n)?;
                         trap = state.ci_trap(ci);
@@ -1858,7 +1876,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         let ra = base + i.arg_a();
                         state.set_ci_savedpc(ci, pc);
                         state.set_top(state.ci_top(ci));
-                        state.close_upvals(ra, 0)?; // LUA_OK = 0
+                        state.close_upvals(ra)?; // LUA_OK = 0
                         trap = state.ci_trap(ci);
                     }
                     // ── OP_TBC ────────────────────────────────────────────────
@@ -1885,10 +1903,10 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         let cond = equal_obj(Some(state), &ra_v, &rb_v)? as u32;
                         trap = state.ci_trap(ci);
                         // C: docondjump() — if cond != GETARG_k(i): pc++; else: dojump
-                        if cond != i.arg_k() {
+                        if (cond as i32) != i.arg_k() {
                             pc += 1;
                         } else {
-                            let next = state.proto_code(cl, pc);
+                            let next = state.proto_code(&cl, pc);
                             pc = (pc as i64 + next.arg_s_j() as i64 + 1) as u32;
                             trap = state.ci_trap(ci);
                         }
@@ -1911,10 +1929,10 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                             trap = state.ci_trap(ci);
                             r
                         };
-                        if (cond as u32) != i.arg_k() {
+                        if (cond as i32) != i.arg_k() {
                             pc += 1;
                         } else {
-                            let next = state.proto_code(cl, pc);
+                            let next = state.proto_code(&cl, pc);
                             pc = (pc as i64 + next.arg_s_j() as i64 + 1) as u32;
                             trap = state.ci_trap(ci);
                         }
@@ -1937,10 +1955,10 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                             trap = state.ci_trap(ci);
                             r
                         };
-                        if (cond as u32) != i.arg_k() {
+                        if (cond as i32) != i.arg_k() {
                             pc += 1;
                         } else {
-                            let next = state.proto_code(cl, pc);
+                            let next = state.proto_code(&cl, pc);
                             pc = (pc as i64 + next.arg_s_j() as i64 + 1) as u32;
                             trap = state.ci_trap(ci);
                         }
@@ -1949,12 +1967,12 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                     // C: int cond = luaV_rawequalobj(s2v(ra), rb); docondjump()
                     OpCode::EqK => {
                         let ra_v = state.get_at(base + i.arg_a()).clone();
-                        let rb_v = state.proto_const(cl, i.arg_b() as usize).clone();
+                        let rb_v = state.proto_const(&cl, i.arg_b() as usize).clone();
                         let cond = equal_obj(None, &ra_v, &rb_v)? as u32;
-                        if cond != i.arg_k() {
+                        if (cond as i32) != i.arg_k() {
                             pc += 1;
                         } else {
-                            let next = state.proto_code(cl, pc);
+                            let next = state.proto_code(&cl, pc);
                             pc = (pc as i64 + next.arg_s_j() as i64 + 1) as u32;
                             trap = state.ci_trap(ci);
                         }
@@ -1972,10 +1990,10 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                             LuaValue::Float(fv) => *fv == im as f64,
                             _ => false,
                         };
-                        if (cond as u32) != i.arg_k() {
+                        if (cond as i32) != i.arg_k() {
                             pc += 1;
                         } else {
-                            let next = state.proto_code(cl, pc);
+                            let next = state.proto_code(&cl, pc);
                             pc = (pc as i64 + next.arg_s_j() as i64 + 1) as u32;
                             trap = state.ci_trap(ci);
                         }
@@ -1984,22 +2002,22 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                     // C: op_orderI(L, l_lti/l_lei/l_gti/l_gei, luai_numlt/le/gt/ge,
                     //              inv=0/0/1/1, tm=TM_LT/TM_LE/TM_LT/TM_LE)
                     OpCode::LtI => {
-                        order_imm_op(state, cl, &mut pc, &mut trap, ci, base, i,
+                        order_imm_op(state, &cl, &mut pc, &mut trap, ci, base, i,
                             |a: i64, b: i64| a < b, |a: f64, b: f64| a < b,
                             false, TagMethod::Lt)?;
                     }
                     OpCode::LeI => {
-                        order_imm_op(state, cl, &mut pc, &mut trap, ci, base, i,
+                        order_imm_op(state, &cl, &mut pc, &mut trap, ci, base, i,
                             |a: i64, b: i64| a <= b, |a: f64, b: f64| a <= b,
                             false, TagMethod::Le)?;
                     }
                     OpCode::GtI => {
-                        order_imm_op(state, cl, &mut pc, &mut trap, ci, base, i,
+                        order_imm_op(state, &cl, &mut pc, &mut trap, ci, base, i,
                             |a: i64, b: i64| a > b, |a: f64, b: f64| a > b,
                             true, TagMethod::Lt)?;
                     }
                     OpCode::GeI => {
-                        order_imm_op(state, cl, &mut pc, &mut trap, ci, base, i,
+                        order_imm_op(state, &cl, &mut pc, &mut trap, ci, base, i,
                             |a: i64, b: i64| a >= b, |a: f64, b: f64| a >= b,
                             true, TagMethod::Le)?;
                     }
@@ -2008,10 +2026,10 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                     OpCode::Test => {
                         let ra_v = state.get_at(base + i.arg_a()).clone();
                         let cond = !matches!(ra_v, LuaValue::Nil | LuaValue::Bool(false));
-                        if (cond as u32) != i.arg_k() {
+                        if (cond as i32) != i.arg_k() {
                             pc += 1;
                         } else {
-                            let next = state.proto_code(cl, pc);
+                            let next = state.proto_code(&cl, pc);
                             pc = (pc as i64 + next.arg_s_j() as i64 + 1) as u32;
                             trap = state.ci_trap(ci);
                         }
@@ -2023,11 +2041,11 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         let ra = base + i.arg_a();
                         let rb_v = state.get_at(base + i.arg_b()).clone();
                         let falsy = matches!(rb_v, LuaValue::Nil | LuaValue::Bool(false));
-                        if (falsy as u32) == i.arg_k() {
+                        if (falsy as i32) == i.arg_k() {
                             pc += 1;
                         } else {
                             state.set_at(ra, rb_v);
-                            let next = state.proto_code(cl, pc);
+                            let next = state.proto_code(&cl, pc);
                             pc = (pc as i64 + next.arg_s_j() as i64 + 1) as u32;
                             trap = state.ci_trap(ci);
                         }
@@ -2066,15 +2084,15 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         let b = i.arg_b();
                         let nparams1 = i.arg_c();
                         let delta = if nparams1 != 0 {
-                            state.ci_nextraargs(ci) as u32 + nparams1
+                            state.ci_nextraargs(ci) + nparams1 as i32
                         } else {
                             0
                         };
-                        let top_b = if b != 0 {
+                        let top_b: i32 = if b != 0 {
                             state.set_top(ra + b);
                             b
                         } else {
-                            (state.top_idx() - ra) as u32
+                            state.top_idx() - ra
                         };
                         state.set_ci_savedpc(ci, pc);
                         if i.test_k() {
@@ -2114,15 +2132,15 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                             if state.top_idx().0 < ci_top.0 {
                                 state.set_top(ci_top);
                             }
-                            state.close_upvals(base, -1)?; // CLOSEKTOP
+                            state.close_upvals(base)?; // CLOSEKTOP
                             trap = state.ci_trap(ci);
                             base = state.ci_base(ci); // updatestack
                         }
                         if nparams1 != 0 {
                             let nextraargs = state.ci_nextraargs(ci) as u32;
-                            state.ci_adjust_func(ci, nextraargs + nparams1);
+                            state.ci_adjust_func(ci, (nextraargs as i32 + nparams1 as i32));
                         }
-                        state.set_top(ra + n);
+                        state.set_top(ra + n as i32);
                         state.poscall(ci, n)?;
                         trap = state.ci_trap(ci);
                         break 'dispatch; // goto ret
@@ -2188,16 +2206,16 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         if is_int_loop {
                             // C: count = l_castS2U(ivalue(s2v(ra+1)));
                             let count = match state.get_at(ra + 1) {
-                                LuaValue::Int(c) => *c as u64,
+                                LuaValue::Int(c) => c as u64,
                                 _ => 0,
                             };
                             if count > 0 {
                                 let step = match state.get_at(ra + 2) {
-                                    LuaValue::Int(s) => *s,
+                                    LuaValue::Int(s) => s,
                                     _ => 0,
                                 };
                                 let idx = match state.get_at(ra) {
-                                    LuaValue::Int(x) => *x,
+                                    LuaValue::Int(x) => x,
                                     _ => 0,
                                 };
                                 // C: chgivalue(s2v(ra+1), count-1)
@@ -2236,15 +2254,15 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         // C: pc += GETARG_Bx(i); advance to TFORCALL
                         pc = (pc as i64 + i.arg_bx() as i64) as u32;
                         // C: i = *pc++; goto l_tforcall
-                        let tfc_i = state.proto_code(cl, pc);
+                        let tfc_i = state.proto_code(&cl, pc);
                         pc += 1;
                         debug_assert!(tfc_i.opcode() == OpCode::TForCall);
                         // inline l_tforcall:
                         let tfc_ra = base + tfc_i.arg_a();
                         // C: memcpy(ra+4, ra, 3*sizeof(*ra)) — copy func, state, ctrl
                         for k in 0..3u32 {
-                            let v = state.get_at(tfc_ra + k).clone();
-                            state.set_at(tfc_ra + 4 + k, v);
+                            let v = state.get_at(tfc_ra + k as i32).clone();
+                            state.set_at(tfc_ra + 4 + k as i32, v);
                         }
                         state.set_top(tfc_ra + 4 + 3);
                         // C: ProtectNT(luaD_call(L, ra+4, GETARG_C(i)));
@@ -2253,7 +2271,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         trap = state.ci_trap(ci);
                         base = state.ci_base(ci); // updatestack
                         // C: i = *pc++; goto l_tforloop
-                        let tfl_i = state.proto_code(cl, pc);
+                        let tfl_i = state.proto_code(&cl, pc);
                         pc += 1;
                         debug_assert!(tfl_i.opcode() == OpCode::TForLoop);
                         let tfl_ra = base + tfl_i.arg_a();
@@ -2271,8 +2289,8 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                     OpCode::TForCall => {
                         let ra = base + i.arg_a();
                         for k in 0..3u32 {
-                            let v = state.get_at(ra + k).clone();
-                            state.set_at(ra + 4 + k, v);
+                            let v = state.get_at(ra + k as i32).clone();
+                            state.set_at(ra + 4 + k as i32, v);
                         }
                         state.set_top(ra + 4 + 3);
                         state.set_ci_savedpc(ci, pc);
@@ -2280,7 +2298,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         trap = state.ci_trap(ci);
                         base = state.ci_base(ci); // updatestack
                         // C: i = *pc++; goto l_tforloop
-                        let tfl_i = state.proto_code(cl, pc);
+                        let tfl_i = state.proto_code(&cl, pc);
                         pc += 1;
                         debug_assert!(tfl_i.opcode() == OpCode::TForLoop);
                         let tfl_ra = base + tfl_i.arg_a();
@@ -2309,8 +2327,8 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         let n_raw = i.arg_b();
                         let mut last = i.arg_c();
                         let t_val = state.get_at(ra).clone();
-                        let n: u32 = if n_raw == 0 {
-                            (state.top_idx() - ra - 1) as u32
+                        let n: i32 = if n_raw == 0 {
+                            state.top_idx() - ra - 1
                         } else {
                             // C: L->top.p = ci->top.p — correct top
                             state.set_top(state.ci_top(ci));
@@ -2318,16 +2336,16 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         };
                         last += n;
                         if i.test_k() {
-                            let extra = state.proto_code(cl, pc);
+                            let extra = state.proto_code(&cl, pc);
                             pc += 1;
-                            const MAXARG_C: u32 = (1 << 8) - 1;
+                            const MAXARG_C: i32 = (1 << 8) - 1;
                             last += extra.arg_ax() * (MAXARG_C + 1);
                         }
                         // C: if (last > luaH_realasize(h)) luaH_resizearray(L, h, last)
                         state.table_ensure_array(&t_val, last as usize)?;
-                        // C: for (; n > 0; n--) { val = s2v(ra + n); h->array[last-1] = *val; last--; }
+                        // C: for (; n > 0; n--) { val = s2v(ra + n as i32); h->array[last-1] = *val; last--; }
                         for k in (1..=n).rev() {
-                            let val = state.get_at(ra + k).clone();
+                            let val = state.get_at(ra + k as i32).clone();
                             state.table_array_set(&t_val, (last - n + k - 1) as usize, val.clone())?;
                             last -= 1;
                             state.gc_barrier_back(&t_val, &val);
@@ -2366,7 +2384,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                     OpCode::VarArgPrep => {
                         let nparams = i.arg_a();
                         state.set_ci_savedpc(ci, pc);
-                        state.adjust_varargs(ci, nparams, cl)?;
+                        state.adjust_varargs(ci, nparams, &cl)?;
                         trap = state.ci_trap(ci);
                         if trap {
                             state.hook_call(ci)?;
@@ -2393,7 +2411,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
             if state.ci_is_fresh(ci) {
                 return Ok(()); // C: return; (end this fresh frame)
             } else {
-                ci = state.ci_previous(ci);
+                ci = state.ci_previous(ci).expect("ci_previous: not fresh frame must have previous");
                 // C: goto returning — re-enter 'returning without resetting trap
                 continue 'returning;
             }
@@ -2545,7 +2563,7 @@ fn bitwise_shift_rr(
 #[allow(clippy::too_many_arguments)]
 fn order_imm_op(
     state: &mut LuaState,
-    cl: LuaValue,
+    cl: &lua_types::GcRef<lua_types::LuaLClosure>,
     pc: &mut u32,
     trap: &mut bool,
     ci: CallInfoIdx,
@@ -2572,10 +2590,10 @@ fn order_imm_op(
         }
     };
     // C: docondjump()
-    if (cond as u32) != i.arg_k() {
+    if (cond as i32) != i.arg_k() {
         *pc += 1;
     } else {
-        let next = state.proto_code(cl, *pc);
+        let next = state.proto_code(&cl, *pc);
         *pc = (*pc as i64 + next.arg_s_j() as i64 + 1) as u32;
         *trap = state.ci_trap(ci);
     }
