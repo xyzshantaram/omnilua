@@ -93,8 +93,9 @@ pub(crate) fn new_c_closure(
     // LuaClosureC, or add a `new_c_closure(state, nupvals, f)` parameter. For now we
     // store a dummy; reconcile in Phase B.
     let closure = crate::state::LuaClosure::C(GcRef::new(LuaClosureC {
-        // C: c->f is set by caller; placeholder here
-        func: dummy_c_function,
+        // C: c->f is set by caller; placeholder index 0 here. LuaCFnPtr is a
+        // registry index (see lua-types::closure); the caller overwrites it.
+        func: DUMMY_C_FUNCTION_IDX,
         upvalues: vec![LuaValue::Nil; nupvals as usize],
     }));
     // C: luaC_newobj registers with the GC. In Phase A–C this is Rc::new.
@@ -690,11 +691,11 @@ pub(crate) fn get_local_name(
 
 // ── Private helpers (Rust-only) ───────────────────────────────────────────────
 
-/// Placeholder C function used when a CClosure is first allocated before its
-/// real function pointer is set by the caller.
-///
-/// TODO(port): Once LuaClosureC.f becomes `Option<LuaCFunction>`, remove this.
-fn dummy_c_function() -> i32 { 0 }
+/// Sentinel index into `GlobalState.c_functions` used as a placeholder when a
+/// CClosure is first allocated, before its real function pointer is set by
+/// the caller. Calling through this index is a bug; the caller must overwrite
+/// the slot before the closure is invoked.
+const DUMMY_C_FUNCTION_IDX: crate::state::LuaCFnPtr = usize::MAX;
 
 /// Returns `true` if this thread is already registered in `global.twups`.
 ///

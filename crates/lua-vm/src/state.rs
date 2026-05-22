@@ -54,7 +54,7 @@ impl From<StackIdx> for StackIdxConv {
 pub use lua_types::value::{LuaTable, LuaValue, F2Imod};
 pub use lua_types::string::LuaString;
 pub use lua_types::userdata::LuaUserData;
-pub use lua_types::closure::{LuaClosure, LuaLClosure as LuaClosureLua, LuaCClosure as LuaClosureC};
+pub use lua_types::closure::{LuaCFnPtr, LuaClosure, LuaLClosure as LuaClosureLua, LuaCClosure as LuaClosureC};
 pub use lua_types::proto::LuaProto;
 pub use lua_types::upval::UpVal;
 pub use lua_types::gc::GcRef;
@@ -432,53 +432,26 @@ pub trait LuaTableRefExt {
     fn next(&self, _k: LuaValue) -> Result<Option<(LuaValue, LuaValue)>, LuaError>;
 }
 impl LuaTableRefExt for GcRef<LuaTable> {
-    fn metatable(&self) -> Option<GcRef<LuaTable>> {
-        // PORT NOTE: `LuaValue::Table` carries `GcRef<lua_types::value::LuaTable>`
-        // (the placeholder with no storage). The rich `lua_vm::table::LuaTable`
-        // with a metatable field is a separate type whose wire-up is a later
-        // reconcile-step task. C: `luaH_new` initializes Table.metatable to
-        // NULL and no `setmetatable` path currently reaches placeholder
-        // tables, so `None` is the faithful answer.
-        // TODO(port): re-implement once `LuaTable` placeholder reconciliation
-        // (type-vocabulary.tsv: LuaTable audit→enforce) is complete.
-        None
-    }
+    fn metatable(&self) -> Option<GcRef<LuaTable>> { (**self).metatable() }
     fn as_ptr(&self) -> *const () { GcRef::identity(self) as *const () }
-    fn get(&self, _k: &LuaValue) -> LuaValue {
-        // PORT NOTE: `LuaValue::Table` carries `GcRef<lua_types::value::LuaTable>`
-        // (the placeholder with no storage). The rich `lua_vm::table::LuaTable`
-        // implementing `get_slot` / `slot_value` is a separate type whose
-        // wire-up to `LuaValue` is a later reconcile-step task. Until then
-        // every lookup is empty, so a faithful C: `luaH_get` returns Nil here.
-        // TODO(port): re-implement once `LuaTable` placeholder reconciliation
-        // (type-vocabulary.tsv: LuaTable audit→enforce) is complete.
-        LuaValue::Nil
-    }
-    fn get_int(&self, _k: i64) -> LuaValue { todo!("phase-b: LuaTable::get_int") }
-    fn get_short_str(&self, _k: &GcRef<LuaString>) -> LuaValue { todo!("phase-b: LuaTable::get_short_str") }
-    fn raw_set(&self, _state: &mut LuaState, _k: &LuaValue, _v: LuaValue) -> Result<(), LuaError> {
-        // PORT NOTE: `LuaValue::Table` carries `GcRef<lua_types::value::LuaTable>`
-        // (the placeholder with no storage). The rich `lua_vm::table::LuaTable`
-        // implementing the hybrid array+hash and `luaH_set` / `luaH_finishset`
-        // is a separate type whose wire-up to `LuaValue` is a later
-        // reconcile-step task. Until then every store is a no-op, matching
-        // the symmetric `get` no-op above so Phase B's `pcall` of stdlib
-        // bootstrap code doesn't panic — C: `luaH_set` would write into the
-        // slot returned by `luaH_get`, but there is no slot here.
-        // TODO(port): re-implement once `LuaTable` placeholder reconciliation
-        // (type-vocabulary.tsv: LuaTable audit→enforce) is complete.
+    fn get(&self, k: &LuaValue) -> LuaValue { (**self).get(k) }
+    fn get_int(&self, k: i64) -> LuaValue { (**self).get(&LuaValue::Int(k)) }
+    fn get_short_str(&self, k: &GcRef<LuaString>) -> LuaValue { (**self).get_short_str(k) }
+    fn raw_set(&self, _state: &mut LuaState, k: &LuaValue, v: LuaValue) -> Result<(), LuaError> {
+        (**self).raw_set(k.clone(), v);
         Ok(())
     }
-    fn raw_set_int(&self, _state: &mut LuaState, _k: i64, _v: LuaValue) -> Result<(), LuaError> {
-        // PORT NOTE: same rationale as `raw_set` above — placeholder has no
-        // storage, so C: `luaH_setint` becomes a no-op until reconciliation.
-        // TODO(port): re-implement once `LuaTable` placeholder reconciliation
-        // (type-vocabulary.tsv: LuaTable audit→enforce) is complete.
+    fn raw_set_int(&self, _state: &mut LuaState, k: i64, v: LuaValue) -> Result<(), LuaError> {
+        (**self).raw_set(LuaValue::Int(k), v);
         Ok(())
     }
-    fn invalidate_tm_cache(&self) { /* phase-b no-op */ }
-    fn resize(&self, _state: &mut LuaState, _na: usize, _nh: usize) -> Result<(), LuaError> { todo!("phase-b: LuaTable::resize") }
-    fn next(&self, _k: LuaValue) -> Result<Option<(LuaValue, LuaValue)>, LuaError> { todo!("phase-b: LuaTable::next") }
+    fn invalidate_tm_cache(&self) {}
+    fn resize(&self, _state: &mut LuaState, _na: usize, _nh: usize) -> Result<(), LuaError> {
+        Ok(())
+    }
+    fn next(&self, k: LuaValue) -> Result<Option<(LuaValue, LuaValue)>, LuaError> {
+        Ok((**self).next_pair(&k))
+    }
 }
 
 pub trait LuaUserDataRefExt {
@@ -737,6 +710,12 @@ pub struct GlobalState {
     // types.tsv: global_State.warnf → Option<Box<dyn FnMut(&[u8], bool)>>
     pub warnf: Option<Box<dyn FnMut(&[u8], bool)>>,
     // C: void *ud_warn — folded into the `warnf` closure capture; removed
+
+    /// Registry of native `LuaCFunction` pointers. Lua-types cannot reference
+    /// `LuaState`, so `LuaClosure::LightC` carries a `usize` index into this
+    /// vector instead of the real function pointer. `push_c_function`
+    /// registers the function and stores the resulting index in the closure.
+    pub c_functions: Vec<LuaCFunction>,
 }
 
 impl GlobalState {
@@ -2338,6 +2317,7 @@ pub fn new_state() -> Option<LuaState> {
             std::array::from_fn(|_| placeholder_str.clone())
         }),
         warnf: None,
+        c_functions: Vec::new(),
     };
 
     let global_rc = Rc::new(RefCell::new(global));

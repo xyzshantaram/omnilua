@@ -319,10 +319,14 @@ impl LuaStateStubExt for LuaState {
         lua_vm::api::to_boolean(self, idx)
     }
 
-    fn push_c_function(&mut self, _f: lua_CFunction) -> Result<(), LuaError> {
-        fn lightc_phase_b_placeholder() -> i32 { 0 }
-        let placeholder: LuaCFnPtr = lightc_phase_b_placeholder;
-        self.push(LuaValue::Function(LuaClosure::LightC(placeholder)));
+    fn push_c_function(&mut self, f: lua_CFunction) -> Result<(), LuaError> {
+        let idx: LuaCFnPtr = {
+            let mut g = self.global_mut();
+            let i = g.c_functions.len();
+            g.c_functions.push(f);
+            i
+        };
+        self.push(LuaValue::Function(LuaClosure::LightC(idx)));
         Ok(())
     }
 
@@ -345,6 +349,12 @@ impl LuaStateStubExt for LuaState {
         let reader: Box<dyn FnMut() -> Option<Vec<u8>>> = Box::new(move || remaining.take());
         let status = lua_vm::api::load(self, reader, Some(name), mode)?;
         Ok(status == LuaStatus::Ok)
+    }
+
+    fn push_globals(&mut self) -> Result<(), LuaError> {
+        let g = self.global().globals.clone();
+        self.push(g);
+        Ok(())
     }
 }
 

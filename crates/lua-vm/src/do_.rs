@@ -912,11 +912,9 @@ pub(crate) fn precall(
             // C: case LUA_VLCF — light C function
             LuaValue::Function(LuaClosure::LightC(f)) => {
                 // C: precallC(L, func, nresults, fvalue(s2v(func))); return NULL;
-                // PORT NOTE: LuaCFnPtr is a Phase-B placeholder (`fn() -> i32`) that
-                // doesn't take &mut LuaState, so we can't reuse `precall_c` directly.
-                // Inline the same scaffolding (CallInfo, hook, poscall) and invoke
-                // the placeholder; the compiler-fixer pass swaps in the real
-                // `LuaCFunction` type once lua-types unifies signatures.
+                // `f` is a registry index into `GlobalState.c_functions` (lua-types
+                // can't carry a `LuaState`-aware fn pointer directly). Resolve to
+                // the real `LuaCFunction` here and call it with `&mut LuaState`.
                 state.check_stack(LUA_MINSTACK as i32)?;
                 state.gc_check_step();
 
@@ -929,7 +927,8 @@ pub(crate) fn precall(
                     hook(state, LUA_HOOKCALL, -1, 1, narg)?;
                 }
 
-                let n = f() as i32;
+                let cfunc = state.global().c_functions[f];
+                let n = cfunc(state)? as i32;
                 debug_assert!(
                     n <= state.top_idx().0 as i32,
                     "C function returned more values than available"

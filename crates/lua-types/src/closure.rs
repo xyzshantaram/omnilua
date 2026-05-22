@@ -7,11 +7,12 @@ use crate::proto::LuaProto;
 use crate::upval::UpVal;
 use crate::value::LuaValue;
 
-/// Placeholder Phase-A C-function pointer type. Real signature
-/// (`fn(&mut LuaState) -> Result<usize, LuaError>`) lives in `lua-vm`;
-/// lua-types can't reference `LuaState` without a circular dep. Compiler-
-/// fixer pass replaces every use of this placeholder with the real type.
-pub type LuaCFnPtr = fn() -> i32;
+/// Opaque registry index into `GlobalState.c_functions`, where the real
+/// `lua_CFunction` (`fn(&mut LuaState) -> Result<usize, LuaError>`) is stored.
+/// Lua-types can't reference `LuaState` without a circular dep, so we keep
+/// the closure variant type-erased here and resolve through the registry at
+/// call time.
+pub type LuaCFnPtr = usize;
 
 #[derive(Debug, Clone)]
 pub enum LuaClosure {

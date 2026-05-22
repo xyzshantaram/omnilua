@@ -257,3 +257,19 @@ help: use `let _ = ...` to ignore the resulting value
 [2026-05-16T17:41:46Z] ─── iter 5  (spent: $0.00) ───
 [2026-05-16T17:41:47Z]   stub blocker: protected_call_raw
 [2026-05-16T17:41:47Z]   dispatching IMPLEMENT agent for protected_call_raw at crates/lua-vm/src/state.rs:1260:121 (budget $10)
+[2026-05-16T17:45:28Z]   agent done. iter cost=$1.5225615000000001  total=$0.00
+[2026-05-16T17:45:28Z] ─── iter 6  (spent: $0.00) ───
+[2026-05-16T17:45:29Z]   real-error blocker at step 4/4 Executing chunk: pcall_k failed: Runtime: attempt to call a nil value
+[2026-05-16T17:45:29Z]   dispatching DEBUG agent for real-error (budget $15)
+[2026-05-16T17:52:07Z]   agent done. iter cost=$3.7776389999999997  total=$0.00
+[2026-05-16T17:52:07Z] ─── iter 7  (spent: $0.00) ───
+[2026-05-16T17:52:08Z]   stub blocker: push_globals
+[2026-05-16T17:52:08Z]   dispatching IMPLEMENT agent for push_globals at crates/lua-stdlib/src/state_stub.rs:101:58 (budget $10)
+[2026-05-16T17:53:08Z]   agent done. iter cost=$0.63823925  total=$0.00
+[2026-05-16T17:53:08Z] ─── iter 8  (spent: $0.00) ───
+[2026-05-16T17:53:08Z]   stub blocker: set_funcs
+[2026-05-16T17:53:08Z]   dispatching IMPLEMENT agent for set_funcs at crates/lua-stdlib/src/state_stub.rs:185:96 (budget $10)
+[2026-05-16T17:53:52Z]   agent done. iter cost=$0  total=$0.00
+[2026-05-16T17:53:52Z] ─── iter 9  (spent: $0.00) ───
+[2026-05-16T17:53:52Z]   stub blocker: set_funcs
+[2026-05-16T17:53:52Z]   dispatching IMPLEMENT agent for set_funcs at crates/lua-stdlib/src/state_stub.rs:185:96 (budget $10)
