@@ -38,6 +38,21 @@ impl LuaValue {
         }
     }
 
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            LuaValue::Nil               => "nil",
+            LuaValue::Bool(_)           => "boolean",
+            LuaValue::Int(_)            => "number",
+            LuaValue::Float(_)          => "number",
+            LuaValue::Str(_)            => "string",
+            LuaValue::Table(_)          => "table",
+            LuaValue::Function(_)       => "function",
+            LuaValue::UserData(_)       => "userdata",
+            LuaValue::LightUserData(_)  => "userdata",
+            LuaValue::Thread(_)         => "thread",
+        }
+    }
+
     pub fn is_nil(&self) -> bool   { matches!(self, LuaValue::Nil) }
     pub fn is_falsy(&self) -> bool { matches!(self, LuaValue::Nil | LuaValue::Bool(false)) }
     pub fn is_truthy(&self) -> bool { !self.is_falsy() }

@@ -43,23 +43,25 @@ impl LuaError {
     }
 
     // ── Standard-shape constructors ──────────────────────────────────────
-    pub fn type_error(_v: &LuaValue, op: &str) -> Self {
-        LuaError::runtime(format_args!("attempt to {} a {} value", op, "<type>"))
+    pub fn type_error(v: &LuaValue, op: &str) -> Self {
+        LuaError::runtime(format_args!("attempt to {} a {} value", op, v.type_name()))
     }
     pub fn call_error(v: &LuaValue) -> Self {
         Self::type_error(v, "call")
     }
-    pub fn concat_error(_p1: &LuaValue, _p2: &LuaValue) -> Self {
-        LuaError::runtime(format_args!("attempt to concatenate a <type> value"))
+    pub fn concat_error(p1: &LuaValue, p2: &LuaValue) -> Self {
+        let bad = if matches!(p1, LuaValue::Str(_) | LuaValue::Int(_) | LuaValue::Float(_)) { p2 } else { p1 };
+        LuaError::runtime(format_args!("attempt to concatenate a {} value", bad.type_name()))
     }
-    pub fn arith_error(_p1: &LuaValue, _p2: &LuaValue, _msg: &str) -> Self {
-        LuaError::runtime(format_args!("attempt to perform arithmetic on a <type> value"))
+    pub fn arith_error(p1: &LuaValue, p2: &LuaValue, _msg: &str) -> Self {
+        let bad = if matches!(p1, LuaValue::Int(_) | LuaValue::Float(_)) { p2 } else { p1 };
+        LuaError::runtime(format_args!("attempt to perform arithmetic on a {} value", bad.type_name()))
     }
     pub fn int_overflow(_p1: &LuaValue, _p2: &LuaValue) -> Self {
         LuaError::runtime(format_args!("number has no integer representation"))
     }
-    pub fn order_error(_p1: &LuaValue, _p2: &LuaValue) -> Self {
-        LuaError::runtime(format_args!("attempt to compare two <type> values"))
+    pub fn order_error(p1: &LuaValue, p2: &LuaValue) -> Self {
+        LuaError::runtime(format_args!("attempt to compare {} with {}", p1.type_name(), p2.type_name()))
     }
     pub fn for_error(_v: &LuaValue, what: &str) -> Self {
         LuaError::runtime(format_args!("bad 'for' {} (number expected, got <type>)", what))
