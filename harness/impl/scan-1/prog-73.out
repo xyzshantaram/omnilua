@@ -5,4 +5,6 @@
 'os.tmpname' file cannot be open; skipping file tests
 +
 testing date/time
-[err] pcall_k failed: Runtime: [string "_soft = true..."]:30: assertion failed!
+test done on 18/05/2026, at 18:02:34
+Lua 5.4
+[ok] execution completed, status=Ok

@@ -11,4 +11,5 @@ testing scanner
 
  >>> pt_BR locale not available: skipping decimal point tests <<<
 
-[err] pcall_k failed: Runtime: [string "_soft = true..."]:344: assertion failed!
+OK
+[ok] execution completed, status=Ok

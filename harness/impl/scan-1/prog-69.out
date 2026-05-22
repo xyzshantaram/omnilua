@@ -6,4 +6,4 @@ testing functions and calls
 +
 +
 testing tail calls
-[err] pcall_k failed: Runtime: [string "_soft = true..."]:195: assertion failed!
+lua: pcall_k failed: Runtime: [string "_soft = true..."]:195: assertion failed!

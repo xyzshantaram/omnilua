@@ -1077,3 +1077,12 @@
 [2026-05-18T14:03:18Z mega] ═════════════════════════════════════════════════════════════════
 [2026-05-18T14:03:18Z mega] mega-loop end. Total cost: $0  Outer rounds: 1
 [2026-05-18T14:03:18Z mega] ═════════════════════════════════════════════════════════════════
+[2026-05-18T18:02:34Z mega] loaded 79 test programs (with expected outputs)
+[2026-05-18T18:02:34Z mega] ═════════════════════════════════════════════════════════════════
+[2026-05-18T18:02:34Z mega] mega-loop start. 79 test programs.
+[2026-05-18T18:02:34Z mega]   MAX_OUTER=8  MAX_PER_OUTER=25  PER_AGENT_BUDGET=$8  SESSION_BUDGET=$150
+[2026-05-18T18:02:34Z mega]   MODEL_DEFAULT=sonnet  MODEL_ESCALATE=opus
+[2026-05-18T18:02:34Z mega]   SKIP_TESTS=calls.lua,nextvar.lua,gengc.lua
+[2026-05-18T18:02:34Z mega]   HARD_TESTS=gc.lua,locals.lua
+[2026-05-18T18:02:34Z mega] ═════════════════════════════════════════════════════════════════
+[2026-05-18T18:02:34Z mega] ─── outer round 1 (spent: $0) ───
