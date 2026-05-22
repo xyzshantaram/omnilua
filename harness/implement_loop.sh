@@ -60,7 +60,18 @@ record() {
 }
 
 run_test() {
-    cargo run -q -p lua-cli -- "$TEST_PROG" 2>&1
+    if command -v gtimeout >/dev/null 2>&1; then
+        gtimeout 20 cargo run -q -p lua-cli -- "$TEST_PROG" 2>&1
+    elif command -v timeout >/dev/null 2>&1; then
+        timeout 20 cargo run -q -p lua-cli -- "$TEST_PROG" 2>&1
+    else
+        cargo run -q -p lua-cli -- "$TEST_PROG" 2>&1 &
+        local pid=$!
+        ( sleep 20 && kill -9 $pid 2>/dev/null ) &
+        local watcher=$!
+        wait $pid 2>/dev/null
+        kill $watcher 2>/dev/null
+    fi
 }
 
 extract_panic_func() {
@@ -106,6 +117,11 @@ detect_failure_type() {
         && ! grep -qE "not yet implemented:" "$out"; then
         echo "real-error"; return
     fi
+    if ! grep -qE "^\[ok\] execution completed" "$out" \
+        && ! grep -qE "^\[err\]" "$out" \
+        && grep -qE "^\[4/4\] Executing chunk" "$out"; then
+        echo "real-error"; return
+    fi
     if grep -qE "^\[ok\] execution completed" "$out" \
         && ! grep -qE "$SUCCESS_MARKER" "$out"; then
         echo "real-error"; return
@@ -115,13 +131,19 @@ detect_failure_type() {
 
 extract_real_error() {
     # Prefer [err] line (LuaError path); fall back to panic message;
-    # finally describe a silent "Ok but no hello" execution.
+    # then detect timed-out runs; finally describe a silent "Ok but
+    # no expected output" execution.
     local err
     err=$(grep -E "^\[err\]" "$1" | head -1 | sed 's/^\[err\] //')
     if [ -n "$err" ]; then echo "$err"; return; fi
     local panic
     panic=$(grep -oE "panicked at [^:]+:[0-9]+:[0-9]+:.*" "$1" | head -1 | sed -E 's/^panicked at //')
     if [ -n "$panic" ]; then echo "$panic"; return; fi
+    if ! grep -qE "^\[ok\] execution completed" "$1" \
+        && grep -qE "^\[4/4\] Executing chunk" "$1"; then
+        echo "execution did NOT terminate within 20s — likely an INFINITE LOOP in the VM dispatcher or in codegen-emitted bytecode. Most common cause: a JMP instruction was emitted but not patched (NO_JUMP = -1 leftover), so the program loops forever. Look in lua-parse codegen patch-list handlers (luaK_patchlist / luaK_patchtohere / luaK_concat / fixjump) and in if/while/for statement compiler (test_then_block, whilestat, forstat in crates/lua-parse/src/lib.rs). Also check arg_s_j sign extension in crates/lua-vm/src/vm.rs."
+        return
+    fi
     if grep -qE "^\[ok\] execution completed" "$1"; then
         local actual; actual=$(grep -vE "^\[|warning|note|help|^\s*\||^\s*=|^\s*-->|^\s*$" "$1" | tail -20 | tr '\n' ',' )
         echo "execution completed with status=Ok but program output did NOT match SUCCESS_MARKER='$SUCCESS_MARKER'. Actual recent output lines (comma-joined): $actual. Likely causes: (1) codegen emits incomplete bytecode for an expression — e.g. ARITH ops (OP_ADD/OP_ADDI/OP_ADDK) not wired, or (2) a VM dispatch arm uses todo!() that's being masked. Investigate by reading the proto.code for the test program — if missing OP_ADD or similar, the bug is in lua-parse/codegen; if the bytecode is correct but execution gives wrong result, the bug is in lua-vm/vm.rs dispatch."

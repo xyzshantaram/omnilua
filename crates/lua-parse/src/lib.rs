@@ -800,6 +800,146 @@ fn cg_emit_order(
     Ok(())
 }
 
+/// Emit OP_JMP with NO_JUMP offset; return its pc.
+///
+/// Mirrors C's `luaK_jump`.
+fn cg_jump(fs: &mut FuncState, line: i32) -> i32 {
+    let jmp_arg = (NO_JUMP + lua_code::opcodes::OFFSET_S_J) as u32;
+    let jmp = lua_code::opcodes::Instruction::sj(
+        lua_code::opcodes::OpCode::Jmp,
+        jmp_arg,
+        0,
+    );
+    emit_inst(fs, line, jmp)
+}
+
+/// Read an instruction word from `fs.f.code` wrapped in the methodful
+/// `lua_code::opcodes::Instruction` so accessor helpers are available.
+fn cg_inst_at(fs: &FuncState, pc: i32) -> lua_code::opcodes::Instruction {
+    lua_code::opcodes::Instruction(fs.f.code[pc as usize].0)
+}
+
+/// Store an instruction word into `fs.f.code` from a methodful
+/// `lua_code::opcodes::Instruction`.
+fn cg_set_inst_at(fs: &mut FuncState, pc: i32, inst: lua_code::opcodes::Instruction) {
+    fs.f.code[pc as usize] = lua_types::opcode::Instruction::new(inst.0);
+}
+
+/// Return the absolute pc that the jump at `pc` targets, or `NO_JUMP` if the
+/// jump's offset field is still the sentinel.
+///
+/// Mirrors C's `getjump` from `lcode.c`.
+fn cg_get_jump(fs: &FuncState, pc: i32) -> i32 {
+    let offset = cg_inst_at(fs, pc).arg_s_j();
+    if offset == NO_JUMP { NO_JUMP } else { (pc + 1) + offset }
+}
+
+/// Patch the jump at `pc` to land at absolute `dest`.
+///
+/// Mirrors C's `fixjump` from `lcode.c`.
+fn cg_fix_jump(fs: &mut FuncState, pc: i32, dest: i32) -> Result<(), LuaError> {
+    debug_assert!(dest != NO_JUMP);
+    let offset = dest - (pc + 1);
+    let max = lua_code::opcodes::MAXARG_S_J as i32 - lua_code::opcodes::OFFSET_S_J;
+    let min = -lua_code::opcodes::OFFSET_S_J;
+    if offset < min || offset > max {
+        return Err(LuaError::syntax(format_args!("control structure too long")));
+    }
+    let mut inst = cg_inst_at(fs, pc);
+    inst.set_arg_s_j(offset);
+    cg_set_inst_at(fs, pc, inst);
+    Ok(())
+}
+
+/// Record `fs.pc` as a jump label and return it.
+///
+/// Mirrors C's `luaK_getlabel` from `lcode.c`.
+fn cg_get_label(fs: &mut FuncState) -> i32 {
+    fs.lasttarget = fs.pc;
+    fs.pc
+}
+
+/// Concatenate jump-list `l2` onto the tail of `*l1`.
+///
+/// Mirrors C's `luaK_concat` from `lcode.c`.
+fn cg_concat(fs: &mut FuncState, l1: &mut i32, l2: i32) -> Result<(), LuaError> {
+    if l2 == NO_JUMP { return Ok(()); }
+    if *l1 == NO_JUMP { *l1 = l2; return Ok(()); }
+    let mut list = *l1;
+    loop {
+        let next = cg_get_jump(fs, list);
+        if next == NO_JUMP { break; }
+        list = next;
+    }
+    cg_fix_jump(fs, list, l2)
+}
+
+/// Patch every jump in the singly-linked list rooted at `list` to land at
+/// absolute pc `target`.
+///
+/// Phase-A subset of C's `luaK_patchlist`: skips the `TestSet`→`Test`
+/// rewrite (`patchtestreg`) since `goiftrue`/`goiffalse` here only produce
+/// raw comparison-followed-by-jump expressions, not boolean short-circuit
+/// chains that need register patching.
+fn cg_patch_list(fs: &mut FuncState, list: i32, target: i32) -> Result<(), LuaError> {
+    let mut list = list;
+    while list != NO_JUMP {
+        let next = cg_get_jump(fs, list);
+        cg_fix_jump(fs, list, target)?;
+        list = next;
+    }
+    Ok(())
+}
+
+/// Patch every jump in `list` to land at the current `fs.pc`.
+///
+/// Mirrors C's `luaK_patchtohere` from `lcode.c`.
+fn cg_patch_to_here(fs: &mut FuncState, list: i32) -> Result<(), LuaError> {
+    let target = cg_get_label(fs);
+    cg_patch_list(fs, list, target)
+}
+
+/// Flip the `k` (condition) bit of the test instruction that immediately
+/// precedes `e`'s JMP. After this, the jump fires on the opposite truth
+/// value of the original comparison.
+///
+/// Mirrors C's `negatecondition` from `lcode.c`.
+fn cg_negate_condition(fs: &mut FuncState, e: &ExprDesc) {
+    let pc = e.u.info - 1;
+    let mut inst = cg_inst_at(fs, pc);
+    let k = inst.arg_k();
+    inst.set_arg_k(k ^ 1);
+    cg_set_inst_at(fs, pc, inst);
+}
+
+/// Arrange for control to fall through when `e` is true and to jump (via the
+/// patch list rooted at `e.f`) when `e` is false. After this call `e.t` has
+/// been patched to the current pc and `e.f` holds the false-exit list.
+///
+/// Phase-A subset of C's `luaK_goiftrue`: handles `VJMP` (comparisons) and
+/// always-true literal forms (`VK`, `VKFLT`, `VKINT`, `VKSTR`, `VTRUE`).
+/// Other expression kinds aren't reachable from the parser bootstrap yet.
+fn cg_go_if_true(fs: &mut FuncState, e: &mut ExprDesc) -> Result<(), LuaError> {
+    let pc: i32 = match e.k {
+        ExprKind::Jmp => {
+            cg_negate_condition(fs, e);
+            e.u.info
+        }
+        ExprKind::K | ExprKind::KFlt | ExprKind::KInt | ExprKind::KStr | ExprKind::True => {
+            NO_JUMP
+        }
+        _ => {
+            return Err(LuaError::syntax(format_args!(
+                "internal: cg_go_if_true on unsupported expression kind {:?}", e.k
+            )));
+        }
+    };
+    cg_concat(fs, &mut e.f, pc)?;
+    cg_patch_to_here(fs, e.t)?;
+    e.t = NO_JUMP;
+    Ok(())
+}
+
 /// Mirrors C's `isSCint` from `lcode.c` (a restriction of `isSCnumber` to
 /// the integer case): returns `Some(int2sC(ival))` if `e` is a `VKINT`
 /// literal whose value fits the signed-C 8-bit operand field, else `None`.
@@ -2908,6 +3048,7 @@ fn test_then_block(
         let line = ls.linenumber;
         // C: luaK_goiffalse(ls->fs, &v) — jumps if condition is true
         // TODO(port): lua_code::go_if_false(ls.fs.as_mut().unwrap(), &mut v)?;
+        let _ = line;
         lex_next(ls, state)?; // skip 'break'
         enter_block(ls, false);
         // C: newgotoentry(ls, "break", line, v.t)
@@ -2919,12 +3060,11 @@ fn test_then_block(
             return Ok(());
         } else {
             // C: jf = luaK_jump(fs)
-            // TODO(port): jf = lua_code::jump(ls.fs.as_mut().unwrap())?;
-            jf = 0; // placeholder
+            jf = cg_jump(ls.fs.as_mut().unwrap(), ls.linenumber);
         }
     } else {
         // C: luaK_goiftrue(ls->fs, &v); jf = v.f
-        // TODO(port): lua_code::go_if_true(ls.fs.as_mut().unwrap(), &mut v)?;
+        cg_go_if_true(ls.fs.as_mut().unwrap(), &mut v)?;
         enter_block(ls, false);
         jf = v.f;
     }
@@ -2934,11 +3074,12 @@ fn test_then_block(
 
     if ls.t.token == TK_ELSE || ls.t.token == TK_ELSEIF {
         // C: luaK_concat(fs, escapelist, luaK_jump(fs))
-        // TODO(port): let j = lua_code::jump(ls.fs.as_mut().unwrap())?;
-        // TODO(port): lua_code::concat_lists(ls.fs.as_mut().unwrap(), escapelist, j)?;
+        let line = ls.linenumber;
+        let j = cg_jump(ls.fs.as_mut().unwrap(), line);
+        cg_concat(ls.fs.as_mut().unwrap(), escapelist, j)?;
     }
     // C: luaK_patchtohere(fs, jf)
-    // TODO(port): lua_code::patch_to_here(ls.fs.as_mut().unwrap(), jf)?;
+    cg_patch_to_here(ls.fs.as_mut().unwrap(), jf)?;
     Ok(())
 }
 
@@ -2954,7 +3095,7 @@ fn ifstat(ls: &mut LexState, state: &mut LuaState, line: i32) -> Result<(), LuaE
     }
     check_match(ls, state, TK_END, TK_IF, line)?;
     // C: luaK_patchtohere(fs, escapelist)
-    // TODO(port): lua_code::patch_to_here(ls.fs.as_mut().unwrap(), escapelist)?;
+    cg_patch_to_here(ls.fs.as_mut().unwrap(), escapelist)?;
     Ok(())
 }
 
