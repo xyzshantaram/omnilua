@@ -1,1 +1,1 @@
-call_no_yield
+precall light C
