@@ -56,3 +56,4 @@ Per-file outputs: harness/oracle/results/*.translator.json + *.hooks.log
 [2026-05-16T04:22:43Z]   lua-stdlib starting errors: 483
 [2026-05-16T04:22:43Z]   → pass 1: dispatching compiler-fixer (budget $6)
 [2026-05-16T04:36:38Z]   → pass 2: dispatching compiler-fixer (budget $6)
+[2026-05-16T04:44:39Z]   pass 2: 483 → 114 errors, $5.820823000000001
