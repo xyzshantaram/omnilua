@@ -36,7 +36,45 @@ ending in a `PORT STATUS` trailer per PORTING.md §12.
 3. For each C function: identify its mapping (in the macros/types/error-sites TSVs), produce the corresponding Rust function.
 4. For each C macro you encounter: look it up in `ANALYSES/macros.tsv`; translate the *call site*, not the definition.
 5. End the file with a PORT STATUS trailer (§12 of PORTING.md). Required fields: source, target_crate, confidence, todos, port_notes, unsafe_blocks, notes.
-6. STOP. The hooks will check your work. Do not try to make it compile.
+
+# MANDATORY: syntax-check your output before stopping
+
+After writing the file (or after each major Edit), run:
+
+```bash
+rustc --edition 2021 --crate-type=lib --emit=metadata --out-dir /tmp <path/to/your/file.rs> 2>&1 | head -50
+```
+
+Read the output. Errors fall into two categories:
+
+**EXPECTED in Phase A (ignore these):**
+- `error[E0432]: unresolved import ...`
+- `error[E0412]: cannot find type 'X' in this scope`
+- `error[E0433]: failed to resolve: could not find ...`
+- `error[E0425]: cannot find value/function ...`
+- `error: cannot find macro ... in this scope`
+- `error: no \`X\` in module ...`
+- `error: use of undeclared crate or module ...`
+- `error: aborting due to N previous errors` (rustc summary)
+
+These are cross-crate types not yet defined. Phase B will land them.
+
+**REAL syntax errors (you must fix these before stopping):**
+- `error: expected ..., found ...`
+- `error: mismatched closing delimiter`
+- `error: unterminated double quote string`
+- `error: expected one of ...`
+- Anything that looks like a parser failure, not a name-resolution failure.
+
+If you see real syntax errors, re-read the relevant section of your output, fix the bug, save, and re-run `rustc`. **Iterate until the output contains only expected errors.** Only then update the trailer (set `confidence: high` if zero real-syntax errors, `medium` if you had to fix some) and stop.
+
+If you cannot resolve a real syntax error after 2 attempts: leave a `TODO(port): syntax issue at line N — <description>` near the offending region and set `confidence: low`. Do not ship broken syntax silently.
+
+# Final stop checklist
+1. File written to the target path.
+2. PORT STATUS trailer present with all 7 fields.
+3. `rustc` self-check shows only expected (name-resolution) errors.
+4. No `TODO(port): syntax issue` markers (or, if present, `confidence: low`).
 
 # When in doubt
 **TODO(port) and stop.** Wrong code is much worse than flagged-incomplete code. The compiler-fixer and test-fixer roles will pick up the slack later.

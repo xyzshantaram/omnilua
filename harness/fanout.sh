@@ -199,7 +199,7 @@ Use the Translator subagent (.claude/agents/translator.md). When done, stop — 
     claude -p \
         --agent translator \
         --append-system-prompt "$porting_md" \
-        --allowedTools "Read,Write,Edit,Glob,Grep,Bash(cargo check*)" \
+        --allowedTools "Read,Write,Edit,Glob,Grep,Bash(cargo check*),Bash(rustc *)" \
         --permission-mode dontAsk \
         --output-format stream-json \
         --include-partial-messages \
