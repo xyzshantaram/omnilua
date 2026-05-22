@@ -4,4 +4,8 @@
 [4/4] Executing chunk...
 testing strings and string library
 testing 'format %a %A'
-lua: pcall_k failed: Runtime: [string "_soft = true..."]:23: assertion failed!
+
+ >>> testC not active: skipping 'pushfstring' tests <<<
+
+OK
+[ok] execution completed, status=Ok

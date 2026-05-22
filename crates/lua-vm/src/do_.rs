@@ -1384,33 +1384,6 @@ pub fn lua_yieldk(
     // TODO(port): coroutine support (Phase E). Yielding requires stack-switching;
     // stubbed here with a faithful translation of the C logic.
 
-    {
-        let ci_top = state.call_info.len();
-        eprintln!("DEBUG lua_yieldk: call_info depth={}", ci_top);
-        for idx in 0..ci_top {
-            let ci = &state.call_info[idx];
-            let func_slot = ci.func.0 as usize;
-            let fval = if func_slot < state.stack.len() {
-                match &state.stack[func_slot].val {
-                    LuaValue::Function(f) => match f {
-                        lua_types::closure::LuaClosure::LightC(i) => format!("LightC({i})"),
-                        lua_types::closure::LuaClosure::C(c) => format!("CClosure({})", c.func),
-                        lua_types::closure::LuaClosure::Lua(lc) => {
-                            let src = lc.proto.source.as_deref().map(|s| String::from_utf8_lossy(s).into_owned()).unwrap_or_default();
-                            let savedpc = ci.saved_pc();
-                            let line = if savedpc > 0 && (savedpc as usize) <= lc.proto.lineinfo.len() {
-                                lc.proto.lineinfo[savedpc.saturating_sub(1) as usize] as i32
-                            } else { -1 };
-                            format!("LuaFn src='{}' savedpc={} approx_line={}", src, savedpc, line)
-                        }
-                    },
-                    other => format!("type={}", other.type_tag() as u8),
-                }
-            } else { "(oob)".into() };
-            eprintln!("  [{}] slot={} {}", idx, func_slot, fval);
-        }
-    }
-
     // C: luai_userstateyield(L, nresults) — no-op (macros.tsv)
     // C: lua_lock(L) — no-op
     let ci_idx = state.ci;

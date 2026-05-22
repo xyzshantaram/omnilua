@@ -1238,3 +1238,16 @@ warning: unused import: `UpVal`
 [2026-05-18T20:52:46Z mega] ═════════════════════════════════════════════════════════════════
 [2026-05-18T20:52:46Z mega] mega-loop end. Total cost: $48.9241  Outer rounds: 7
 [2026-05-18T20:52:46Z mega] ═════════════════════════════════════════════════════════════════
+[2026-05-19T00:23:55Z mega] loaded 79 test programs (with expected outputs)
+[2026-05-19T00:23:55Z mega] ═════════════════════════════════════════════════════════════════
+[2026-05-19T00:23:55Z mega] mega-loop start. 79 test programs.
+[2026-05-19T00:23:55Z mega]   MAX_OUTER=20  MAX_PER_OUTER=25  PER_AGENT_BUDGET=$20.00  SESSION_BUDGET=$400.00
+[2026-05-19T00:23:55Z mega]   MODEL_DEFAULT=sonnet  MODEL_ESCALATE=opus
+[2026-05-19T00:23:55Z mega]   SKIP_TESTS=calls.lua,nextvar.lua,gengc.lua,gc.lua
+[2026-05-19T00:23:55Z mega]   HARD_TESTS=files.lua
+[2026-05-19T00:23:55Z mega] ═════════════════════════════════════════════════════════════════
+[2026-05-19T00:23:55Z mega] ─── outer round 1 (spent: $0) ───
+[2026-05-19T00:24:11Z mega]   scan: 72/79 programs pass cleanly
+[2026-05-19T00:24:11Z mega]   surface scan returned 1 unique stub blockers
+[2026-05-19T00:24:11Z mega]   grouped into 1 disjoint-file agents (parallel cap 3)
+[2026-05-19T00:24:11Z mega]   [O1.1] dispatch on 'trace_call' @ crates/lua-vm/src/state.rs:2083:81 (budget $20.00) [parallel]

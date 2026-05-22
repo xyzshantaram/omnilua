@@ -1,1 +1,1 @@
-set_hook	crates/lua-vm/src/state.rs:1583:44
+trace_call	crates/lua-vm/src/state.rs:2083:81
