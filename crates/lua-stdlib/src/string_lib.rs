@@ -1954,8 +1954,16 @@ pub fn str_format(state: &mut LuaState) -> Result<usize, LuaError> {
                 addliteral(state, &mut buf, arg)?;
             }
             b's' => {
-                let s = state.to_string_coerced(arg).unwrap_or_default();
+                let s = state.to_display_string(arg)?;
+                let has_modifiers = spec.width != 0 || spec.precision.is_some();
+                if has_modifiers && s.contains(&0u8) {
+                    return Err(LuaError::arg_error(
+                        arg,
+                        "string contains zeros",
+                    ));
+                }
                 pad_str(&mut buf, &s, &spec);
+                state.pop_n(1);
             }
             _ => {
                 return Err(LuaError::runtime(format_args!(

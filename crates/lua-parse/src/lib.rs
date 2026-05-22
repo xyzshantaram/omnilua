@@ -3438,7 +3438,7 @@ fn primaryexp(ls: &mut LexState, state: &mut LuaState, v: &mut ExprDesc) -> Resu
             singlevar(ls, state, v)?;
         }
         _ => {
-            return Err(LuaError::syntax(format_args!("unexpected symbol")));
+            return Err(lua_lex::syntax_error(&mut ls.lex, b"unexpected symbol"));
         }
     }
     Ok(())
