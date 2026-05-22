@@ -4430,6 +4430,7 @@ pub fn parse(
         z,
         buff: lua_lex::LexBuffer::new(),
         h: None,
+        long_str_anchor: std::collections::HashMap::new(),
         dyd: None,
         source: source_str.0.clone(),
         envn: envn_str.0.clone(),

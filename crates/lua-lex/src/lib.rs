@@ -405,6 +405,16 @@ pub struct LexState {
     // C: Table *h;  /* to avoid collection/reuse strings */
     // TODO(port): GcRef<LuaTable> once LuaTable is defined in Phase B
     pub h: Option<GcRef<LuaTable>>,
+    /// Per-parse-session anchor for long strings. C-Lua's `ls->h` is a Lua
+    /// table that deduplicates all literal strings within a chunk (both short
+    /// and long), so e.g. `local s1 <const>="..."` and `local s2 <const>="..."`
+    /// with identical 50-byte payloads share one `TString` object — which is
+    /// what makes `string.format("%p", s1) == string.format("%p", s2)` hold.
+    /// Short strings already share identity via the global `interned_lt` pool,
+    /// but long strings (>LUAI_MAXSHORTLEN = 40) are not globally interned and
+    /// need this session-level map. Keyed by the string bytes; populated lazily
+    /// by `new_string`.
+    pub long_str_anchor: std::collections::HashMap<Vec<u8>, GcRef<LuaString>>,
     // C: struct Dyndata *dyd;  /* dynamic structures used by the parser */
     // TODO(port): DynData once parser types land in Phase B
     pub dyd: Option<()>,
@@ -849,20 +859,20 @@ pub(crate) fn new_string(
     ls: &mut LexState,
     bytes: &[u8],
 ) -> Result<GcRef<LuaString>, LuaError> {
+    // C: const TValue *o = luaH_getstr(ls->h, ts); if (!ttisnil(o)) ts = ...
+    // PORT NOTE: in C, the anchor table ls->h is a Lua table mapping the string
+    // to itself so a second occurrence of the same literal in the chunk returns
+    // the originally-created TString. We use a plain HashMap on LexState
+    // (`long_str_anchor`) for the equivalent dedup — sufficient because Phase
+    // A-C `GcRef<T>` is `Rc<T>` and identity is determined by the `Rc`
+    // allocation. Short strings already share identity via the global pool;
+    // long strings (>LUAI_MAXSHORTLEN) need this session-level map.
+    if let Some(existing) = ls.long_str_anchor.get(bytes) {
+        return Ok(existing.clone());
+    }
     // C: TString *ts = luaS_newlstr(L, str, l);
-    // macros.tsv: luaS_newlstr → state.intern_str(&s[..n])
-    // TODO(port): call state.intern_str(bytes) in Phase B
     let ts = intern_str_stub(state, bytes)?;
-
-    // C: const TValue *o = luaH_getstr(ls->h, ts);
-    // TODO(port): luaH_getstr — table string lookup; needs Phase B table ops.
-    // For Phase A, skip the anchor-table logic and return the interned string directly.
-    // The anchor table prevents GC of strings during parsing.  In Phase A-C,
-    // Rc keeps strings alive as long as there is a reference.
-    // PORT NOTE: the anchor-table set/get logic (luaH_getstr, luaH_finishset,
-    // setsvalue, s2v stack push/pop, luaC_checkGC) is omitted for Phase A.
-    // Phase B must wire ls.h as a GcRef<LuaTable> and call these operations.
-
+    ls.long_str_anchor.insert(bytes.to_vec(), ts.clone());
     Ok(ts)
 }
 

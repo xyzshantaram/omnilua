@@ -8,4 +8,4 @@ testing scanner
 +
 +
 +
-[err] pcall_k failed: Runtime: coroutines not yet implemented (Phase E)
+[err] pcall_k failed: Runtime: coroutine.yield: coroutines not yet implemented (Phase E)
