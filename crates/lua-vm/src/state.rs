@@ -377,7 +377,19 @@ impl LuaValueExt for LuaValue {
     fn to_integer_no_strconv(&self) -> Option<i64> {
         match self {
             LuaValue::Int(i) => Some(*i),
-            LuaValue::Float(f) if f.fract() == 0.0 && f.is_finite() => Some(*f as i64),
+            LuaValue::Float(f) if f.fract() == 0.0 && f.is_finite() => {
+                // C: lua_numbertointeger range check —
+                //   d >= LUA_MININTEGER && d < -(lua_Number)LUA_MININTEGER.
+                // Without this, Rust's `as i64` saturates and silently
+                // produces i64::MAX / i64::MIN for out-of-range floats.
+                let min_f = i64::MIN as f64;
+                let max_plus1_f = -(i64::MIN as f64);
+                if *f >= min_f && *f < max_plus1_f {
+                    Some(*f as i64)
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
