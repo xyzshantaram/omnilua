@@ -1,0 +1,2 @@
+4 [2026-05-17T18:57:32Z mega]   → committed 1d9f732 (debug/reference/lua-c/testes/closure.lua )
+1.3853347500000004 reference/lua-c/testes/closure.lua

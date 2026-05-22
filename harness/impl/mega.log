@@ -378,3 +378,4 @@
 [2026-05-17T18:54:33Z mega]   [O2.D2] DEBUG dispatch on file: reference/lua-c/testes/goto.lua [parallel]
 [2026-05-17T18:54:33Z mega]   [O2.D3] DEBUG dispatch on file: reference/lua-c/testes/sort.lua [parallel]
 [2026-05-17T18:54:33Z mega]   [O2.D4] DEBUG dispatch on file: reference/lua-c/testes/closure.lua [parallel]
+[2026-05-17T18:57:32Z mega]   → committed 1d9f732 (debug/reference/lua-c/testes/closure.lua )
