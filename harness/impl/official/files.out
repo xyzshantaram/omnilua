@@ -6,6 +6,7 @@
 +
 testing date/time
 [close_upval] uv_idx=5 top=2 level=1 openupval.len=1
+  openupval[0] = Open(thread=0, idx=5)
 backtrace:
    0: std::backtrace_rs::backtrace::libunwind::trace
              at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/../../backtrace/src/backtrace/libunwind.rs:117:9
@@ -14,9 +15,9 @@ backtrace:
    2: std::backtrace::Backtrace::create
              at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/backtrace.rs:331:13
    3: lua_vm::func::close_upval
-             at ./crates/lua-vm/src/func.rs:490:41
+             at ./crates/lua-vm/src/func.rs:497:41
    4: lua_vm::func::close
-             at ./crates/lua-vm/src/func.rs:547:5
+             at ./crates/lua-vm/src/func.rs:554:5
    5: lua_vm::do_::close_aux
              at ./crates/lua-vm/src/do_.rs:1460:5
    6: lua_vm::do_::close_protected::{{closure}}
@@ -71,7 +72,7 @@ backtrace:
   31: _main
 
 
-thread 'main' (9929342) panicked at crates/lua-vm/src/func.rs:492:9:
+thread 'main' (9950306) panicked at crates/lua-vm/src/func.rs:499:9:
 open upvalue index must be below stack top
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 [panic] open upvalue index must be below stack top

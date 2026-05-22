@@ -487,6 +487,13 @@ pub(crate) fn close_upval(state: &mut LuaState, level: StackIdx) {
                 "[close_upval] uv_idx={} top={} level={} openupval.len={}",
                 uv_idx.0, state.top.0, level.0, state.openupval.len()
             );
+            for (k, uvr) in state.openupval.iter().enumerate() {
+                let info = match &*uvr.slot() {
+                    lua_types::UpValState::Open { thread_id, idx } => format!("Open(thread={}, idx={})", thread_id, idx.0),
+                    lua_types::UpValState::Closed(_) => "Closed(...)".to_string(),
+                };
+                eprintln!("  openupval[{}] = {}", k, info);
+            }
             eprintln!("backtrace:\n{}", std::backtrace::Backtrace::force_capture());
         }
         debug_assert!(

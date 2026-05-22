@@ -1424,8 +1424,15 @@ fn cg_discharge_vars(
             e.k = ExprKind::Reloc;
         }
         ExprKind::Indexed => {
-            cg_free_reg_if_temp(fs, e.u.ind_t as i32);
-            cg_free_reg_if_temp(fs, e.u.ind_idx as i32);
+            let t_reg = e.u.ind_t as i32;
+            let idx_reg = e.u.ind_idx as i32;
+            if idx_reg > t_reg {
+                cg_free_reg_if_temp(fs, idx_reg);
+                cg_free_reg_if_temp(fs, t_reg);
+            } else {
+                cg_free_reg_if_temp(fs, t_reg);
+                cg_free_reg_if_temp(fs, idx_reg);
+            }
             let inst = lua_code::opcodes::Instruction::abck(
                 lua_code::opcodes::OpCode::GetTable,
                 0,

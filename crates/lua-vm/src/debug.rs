@@ -730,6 +730,14 @@ fn aux_get_info(
             b'n' => {
                 let mut name: Option<Vec<u8>> = None;
                 ar.namewhat = get_func_name(state, ci, &mut name);
+                eprintln!("[debug.getinfo n] ci={:?} prev_ci={:?} namewhat={:?} name={:?}",
+                    ci.map(|c| (c.func.0, c.callstatus, c.previous)),
+                    ci.and_then(|c| c.previous).map(|p| {
+                        let pc = state.get_ci(p);
+                        (pc.func.0, pc.callstatus, pc.is_lua(), pc.saved_pc())
+                    }),
+                    ar.namewhat,
+                    name.as_ref().map(|v| String::from_utf8_lossy(v).to_string()));
                 if ar.namewhat.is_none() {
                     // C: ar->namewhat = ""; ar->name = NULL;
                     ar.namewhat = Some(b"");
@@ -1189,7 +1197,14 @@ fn funcname_from_call<'a>(
     // C: else if (isLua(ci)) return funcnamefromcode(L, ci_func(ci)->p, currentpc(ci), name);
     if ci.is_lua() {
         let proto = ci_lua_proto(ci, state);
-        return funcname_from_code(state, &proto, current_pc(ci), name);
+        let pc = current_pc(ci);
+        let op = if (pc as usize) < proto.code.len() {
+            Some(proto.code[pc as usize].opcode())
+        } else { None };
+        eprintln!("[funcname_from_call] is_lua=true pc={} code_len={} op={:?} code[pc]_raw={:?}",
+            pc, proto.code.len(), op,
+            proto.code.get(pc as usize).map(|i| i.raw()));
+        return funcname_from_code(state, &proto, pc, name);
     }
     None
 }
