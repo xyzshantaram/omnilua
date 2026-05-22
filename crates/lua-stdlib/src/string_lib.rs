@@ -347,7 +347,7 @@ pub fn str_byte(state: &mut LuaState) -> Result<usize, LuaError> {
 ///
 /// C: `static int str_char(lua_State *L)`
 pub fn str_char(state: &mut LuaState) -> Result<usize, LuaError> {
-    let n = state.top_idx() as usize;
+    let n = state.top_idx().as_usize();
     let mut buf = Vec::with_capacity(n);
     for i in 1..=(n as i32) {
         let c = state.check_arg_integer(i)? as u64;
@@ -1484,7 +1484,7 @@ fn addliteral(state: &mut LuaState, buf: &mut Vec<u8>, arg: i32) -> Result<(), L
 /// Rust formatting. Edge cases involving locale-dependent behavior (e.g.
 /// `lua_getlocaledecpoint`) are approximated.
 pub fn str_format(state: &mut LuaState) -> Result<usize, LuaError> {
-    let top = state.top_idx() as i32;
+    let top = state.top_idx().get() as i32;
     let mut arg = 1i32;
     let fmt_bytes = state.check_arg_string(1)?.to_vec();
     let mut buf: Vec<u8> = Vec::new();
