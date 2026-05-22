@@ -456,8 +456,26 @@ impl LuaTableRefExt for GcRef<LuaTable> {
     }
     fn get_int(&self, _k: i64) -> LuaValue { todo!("phase-b: LuaTable::get_int") }
     fn get_short_str(&self, _k: &GcRef<LuaString>) -> LuaValue { todo!("phase-b: LuaTable::get_short_str") }
-    fn raw_set(&self, _state: &mut LuaState, _k: &LuaValue, _v: LuaValue) -> Result<(), LuaError> { todo!("phase-b: LuaTable::raw_set") }
-    fn raw_set_int(&self, _state: &mut LuaState, _k: i64, _v: LuaValue) -> Result<(), LuaError> { todo!("phase-b: LuaTable::raw_set_int") }
+    fn raw_set(&self, _state: &mut LuaState, _k: &LuaValue, _v: LuaValue) -> Result<(), LuaError> {
+        // PORT NOTE: `LuaValue::Table` carries `GcRef<lua_types::value::LuaTable>`
+        // (the placeholder with no storage). The rich `lua_vm::table::LuaTable`
+        // implementing the hybrid array+hash and `luaH_set` / `luaH_finishset`
+        // is a separate type whose wire-up to `LuaValue` is a later
+        // reconcile-step task. Until then every store is a no-op, matching
+        // the symmetric `get` no-op above so Phase B's `pcall` of stdlib
+        // bootstrap code doesn't panic — C: `luaH_set` would write into the
+        // slot returned by `luaH_get`, but there is no slot here.
+        // TODO(port): re-implement once `LuaTable` placeholder reconciliation
+        // (type-vocabulary.tsv: LuaTable audit→enforce) is complete.
+        Ok(())
+    }
+    fn raw_set_int(&self, _state: &mut LuaState, _k: i64, _v: LuaValue) -> Result<(), LuaError> {
+        // PORT NOTE: same rationale as `raw_set` above — placeholder has no
+        // storage, so C: `luaH_setint` becomes a no-op until reconciliation.
+        // TODO(port): re-implement once `LuaTable` placeholder reconciliation
+        // (type-vocabulary.tsv: LuaTable audit→enforce) is complete.
+        Ok(())
+    }
     fn invalidate_tm_cache(&self) { /* phase-b no-op */ }
     fn resize(&self, _state: &mut LuaState, _na: usize, _nh: usize) -> Result<(), LuaError> { todo!("phase-b: LuaTable::resize") }
     fn next(&self, _k: LuaValue) -> Result<Option<(LuaValue, LuaValue)>, LuaError> { todo!("phase-b: LuaTable::next") }
