@@ -80,17 +80,25 @@ impl Trace for UpVal {
 
 /// LuaTable — array+hash entries plus optional metatable.
 ///
-/// Weak-table semantics (Phase D-2):
-///   * `__mode = "v"` — values are weak; mark keys only. Dead values get
-///     pruned in the post-mark hook via [`crate::value::LuaTable::prune_weak_dead`].
-///   * `__mode = "kv"` — both sides weak; trace neither. Both get pruned.
-///   * `__mode = "k"` — keys are weak; trace NEITHER initially. The
+/// Weak-table semantics (matches `lgc.c::traversetable`):
+///   * `__mode = "v"` — strong keys, weak values. Trace keys here; value
+///     side is deferred — string values get marked in `prune_weak_dead`'s
+///     surviving-entry pass (Lua's `iscleared`), non-string dead values
+///     trigger entry removal.
+///   * `__mode = "kv"` — both sides weak. Trace NEITHER here; everything
+///     is handled by `prune_weak_dead` (matches Lua's "just add to allweak,
+///     traverse nothing" path).
+///   * `__mode = "k"` — weak keys, strong values. Trace NEITHER here. The
 ///     post-mark ephemeron convergence pass walks each weak-key table's
 ///     entries and marks values only for entries whose keys are
-///     independently reachable. Iterating to fixed point makes
-///     reachability of value_i transitively depend on key_i — that's the
-///     defining property of ephemerons.
+///     independently reachable. String keys get marked in `prune_weak_dead`.
 ///   * No `__mode` — trace both unconditionally.
+///
+/// Marking strings inline for weak slots (the previous behavior) would
+/// pin them alive even when their containing entry is about to be cleared
+/// because the other side died — breaking the `gc.lua` weak-string-key
+/// block, which expects unreferenced long strings to free their bytes
+/// after a single `collectgarbage()` cycle.
 impl Trace for LuaTable {
     fn trace(&self, m: &mut Marker) {
         const WEAK_KEYS: u8 = 1;
@@ -102,13 +110,9 @@ impl Trace for LuaTable {
         while let Some((k, v)) = self.next_pair(&key) {
             if trace_keys {
                 k.trace(m);
-            } else if let LuaValue::Str(s) = &k {
-                s.trace(m);
             }
             if trace_values {
                 v.trace(m);
-            } else if let LuaValue::Str(s) = &v {
-                s.trace(m);
             }
             key = k;
         }

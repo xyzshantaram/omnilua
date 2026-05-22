@@ -232,50 +232,67 @@ impl LuaTable {
         None
     }
 
-    /// Drop weak entries whose weakly-tracked target is unreachable.
+    /// Drop weak entries whose weakly-tracked target is unreachable, and
+    /// return the list of string values/keys in surviving entries that the
+    /// caller must mark.
     ///
     /// Called from the post-mark hook (`Heap::full_collect_with_post_mark`)
     /// while the GC marker still holds the visited set. `is_reachable(id)`
     /// returns true iff the object at GC identity `id` was reached during
-    /// the mark phase. Non-collectable LuaValue variants (`Int`, `Float`,
-    /// `Bool`, `Nil`, `LightUserData`, primitive strings owned outside the
-    /// heap) are treated as always reachable.
+    /// the mark phase.
+    ///
+    /// Per Lua semantics (`lgc.c::iscleared`), strings in weak slots behave
+    /// "as values": they never cause an entry to be cleared based on the
+    /// string side, AND they get marked when the entry survives. The caller
+    /// is expected to walk the returned `LuaValue`s and propagate marks via
+    /// the GC marker — this crate cannot reach `Marker` directly because of
+    /// the workspace boundary.
     ///
     /// Mode dispatch (`mode` is the `WEAK_KEYS | WEAK_VALUES` bitmask):
-    ///   * `__mode = "v"`: clear when the value side is unreachable.
-    ///   * `__mode = "kv"`: clear when either side is unreachable.
-    ///   * `__mode = "k"`: clear when the key side is unreachable. NOTE:
-    ///     this is a *simplification* of Lua's ephemeron semantics — full
-    ///     ephemerons require a fixed-point iteration where a value's
-    ///     reachability is conditional on the key's, and vice versa for
-    ///     cycles. Here the trace impl marks values strongly regardless
-    ///     of key reachability, so values held only by an entry that we
-    ///     are about to clear survive one extra cycle. Sufficient for
-    ///     `gc.lua`'s weak-table block; full ephemerons remain a follow-up.
+    ///   * `__mode = "v"`: clear when the value side is dead-collectable.
+    ///     String values mark-and-survive.
+    ///   * `__mode = "kv"`: clear when either side is dead-collectable.
+    ///     String keys/values mark-and-survive iff the other side keeps the
+    ///     entry alive.
+    ///   * `__mode = "k"`: clear when the key side is dead-collectable.
+    ///     String keys mark-and-survive. Ephemeron value-marking is handled
+    ///     by the caller's separate `ephemeron_values_to_mark` loop.
     ///
     /// Tombstone semantics (value = Nil with the key slot still occupied)
     /// are preserved: a tombstone is NOT subject to weak-side checks
     /// because callers rely on the key remaining for `next(t, last_key)`.
-    pub fn prune_weak_dead(&self, is_reachable: &dyn Fn(usize) -> bool) {
+    pub fn prune_weak_dead(&self, is_reachable: &dyn Fn(usize) -> bool) -> Vec<LuaValue> {
         let mode = self.weak_mode.get();
         if mode == 0 {
-            return;
+            return Vec::new();
         }
         let weak_k = (mode & WEAK_KEYS) != 0;
         let weak_v = (mode & WEAK_VALUES) != 0;
+        let mut to_mark: Vec<LuaValue> = Vec::new();
         let mut entries = self.entries.borrow_mut();
         entries.retain(|(k, v)| {
             if matches!(v, LuaValue::Nil) {
                 return true;
             }
-            if weak_v && !value_is_reachable(v, is_reachable) {
+            if weak_v && value_is_dead_collectable(v, is_reachable) {
                 return false;
             }
-            if weak_k && !value_is_reachable(k, is_reachable) {
+            if weak_k && value_is_dead_collectable(k, is_reachable) {
                 return false;
+            }
+            if weak_k {
+                if matches!(k, LuaValue::Str(_)) {
+                    to_mark.push(k.clone());
+                }
+            }
+            if weak_v {
+                if matches!(v, LuaValue::Str(_)) {
+                    to_mark.push(v.clone());
+                }
             }
             true
         });
+        to_mark
     }
 
     /// Ephemeron-convergence helper. For a pure `__mode = "k"` table
@@ -305,25 +322,28 @@ impl LuaTable {
     }
 }
 
-/// Reachability check for a `LuaValue` used by [`LuaTable::prune_weak_dead`].
-/// Returns `true` for non-collectable variants (no identity to check) so
-/// they survive the weak-table sweep.
-fn value_is_reachable(v: &LuaValue, is_reachable: &dyn Fn(usize) -> bool) -> bool {
+/// True iff `v` is a collectable non-string LuaValue whose target was
+/// unreached during the mark phase — i.e. one that should trigger removal
+/// of its containing weak-table entry. Strings are explicitly excluded
+/// (per Lua's `iscleared`: strings behave "as values" and never cause an
+/// entry to be cleared on the string side; the caller marks them in the
+/// surviving-entries pass instead).
+fn value_is_dead_collectable(v: &LuaValue, is_reachable: &dyn Fn(usize) -> bool) -> bool {
     match v {
-        LuaValue::Table(t) => is_reachable(t.identity()),
-        LuaValue::UserData(u) => is_reachable(u.identity()),
-        LuaValue::Thread(th) => is_reachable(th.identity()),
+        LuaValue::Table(t) => !is_reachable(t.identity()),
+        LuaValue::UserData(u) => !is_reachable(u.identity()),
+        LuaValue::Thread(th) => !is_reachable(th.identity()),
         LuaValue::Function(c) => match c {
-            LuaClosure::Lua(x) => is_reachable(x.identity()),
-            LuaClosure::C(x) => is_reachable(x.identity()),
-            LuaClosure::LightC(_) => true,
+            LuaClosure::Lua(x) => !is_reachable(x.identity()),
+            LuaClosure::C(x) => !is_reachable(x.identity()),
+            LuaClosure::LightC(_) => false,
         },
         LuaValue::Str(_)
         | LuaValue::Nil
         | LuaValue::Bool(_)
         | LuaValue::Int(_)
         | LuaValue::Float(_)
-        | LuaValue::LightUserData(_) => true,
+        | LuaValue::LightUserData(_) => false,
     }
 }
 

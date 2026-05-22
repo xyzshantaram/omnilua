@@ -2441,10 +2441,26 @@ impl<'a> GcHandle<'a> {
             g.pending_finalizers.clone()
         };
 
+        // Snapshot tracked long-string identities + byte sizes BEFORE the
+        // collect. The post-mark hook compares each identity against the
+        // marker's visited set; anything not visited is unreachable and
+        // its bytes get reclaimed from `gc_debt` after the heap collect
+        // returns. Bare `usize` is safe to carry across the hook — long
+        // strings use `new_uncollected` so the pointer never dangles.
+        let long_string_snapshot: Vec<(usize, usize)> = {
+            let g = state_ref.global.borrow();
+            g.gc_tracked_long_strings
+                .iter()
+                .map(|(w, sz)| (w.0.identity(), *sz))
+                .collect()
+        };
+
         let alive_ids: std::cell::RefCell<std::collections::HashSet<usize>> =
             std::cell::RefCell::new(std::collections::HashSet::new());
         let newly_unreachable: std::cell::RefCell<Vec<lua_types::gc::GcRef<lua_types::value::LuaTable>>> =
             std::cell::RefCell::new(Vec::new());
+        let dead_long_strings: std::cell::RefCell<std::collections::HashSet<usize>> =
+            std::cell::RefCell::new(std::collections::HashSet::new());
         let collect_ran = std::cell::Cell::new(false);
 
         {
@@ -2501,8 +2517,27 @@ impl<'a> GcHandle<'a> {
                 for t in &weak_tables_snapshot {
                     let id = t.identity();
                     if marker.is_visited(id) {
-                        t.prune_weak_dead(&|id| marker.is_visited(id));
+                        let to_mark = t.prune_weak_dead(&|id| marker.is_visited(id));
+                        for v in &to_mark {
+                            v.trace(marker);
+                        }
                         alive_ids.borrow_mut().insert(id);
+                    }
+                }
+                marker.drain_gray_queue();
+                // Long-string Phase-B reclaim. With `new_uncollected`
+                // allocation, long strings never enter the heap's sweep
+                // path, so we rely on the marker's visited set: any
+                // tracked long-string identity that wasn't reached by mark
+                // is unreferenced and its bytes can be returned to
+                // `gc_debt`. Done here (inside the hook) so it sees the
+                // visited set BEFORE drop of the marker.
+                {
+                    let mut dead = dead_long_strings.borrow_mut();
+                    for (id, _sz) in &long_string_snapshot {
+                        if !marker.is_visited(*id) {
+                            dead.insert(*id);
+                        }
                     }
                 }
             };
@@ -2527,6 +2562,7 @@ impl<'a> GcHandle<'a> {
             newly_unreachable.into_inner();
         let promote_ids: std::collections::HashSet<usize> =
             promote.iter().map(|t| t.identity()).collect();
+        let dead_ls_ids = dead_long_strings.into_inner();
         let mut g = state_ref.global.borrow_mut();
         g.weak_tables_registry
             .retain(|w| alive_set.contains(&w.0.identity()));
@@ -2536,6 +2572,23 @@ impl<'a> GcHandle<'a> {
         g.pending_finalizers
             .retain(|t| !promote_ids.contains(&t.identity()));
         g.to_be_finalized.extend(promote);
+        // Reclaim long-string byte accounting for entries the marker said
+        // were unreachable. The underlying `Gc<LuaString>` was allocated
+        // via `new_uncollected` and stays live in process memory; only
+        // `gc_debt` is adjusted so `collectgarbage("count")` reflects the
+        // drop in user-visible live bytes.
+        if !dead_ls_ids.is_empty() {
+            let mut freed: isize = 0;
+            g.gc_tracked_long_strings.retain(|(w, sz)| {
+                if dead_ls_ids.contains(&w.0.identity()) {
+                    freed += *sz as isize;
+                    false
+                } else {
+                    true
+                }
+            });
+            g.gc_debt -= freed;
+        }
     }
 
     /// Phase-B stub for `luaC_step(L)`.
@@ -2572,10 +2625,20 @@ impl<'a> GcHandle<'a> {
             g.pending_finalizers.clone()
         };
 
+        let long_string_snapshot: Vec<(usize, usize)> = {
+            let g = state_ref.global.borrow();
+            g.gc_tracked_long_strings
+                .iter()
+                .map(|(w, sz)| (w.0.identity(), *sz))
+                .collect()
+        };
+
         let alive_ids: std::cell::RefCell<std::collections::HashSet<usize>> =
             std::cell::RefCell::new(std::collections::HashSet::new());
         let newly_unreachable: std::cell::RefCell<Vec<lua_types::gc::GcRef<lua_types::value::LuaTable>>> =
             std::cell::RefCell::new(Vec::new());
+        let dead_long_strings: std::cell::RefCell<std::collections::HashSet<usize>> =
+            std::cell::RefCell::new(std::collections::HashSet::new());
         let atomic_ran = std::cell::Cell::new(false);
 
         let outcome = {
@@ -2632,8 +2695,20 @@ impl<'a> GcHandle<'a> {
                 for t in &weak_tables_snapshot {
                     let id = t.identity();
                     if marker.is_visited(id) {
-                        t.prune_weak_dead(&|id| marker.is_visited(id));
+                        let to_mark = t.prune_weak_dead(&|id| marker.is_visited(id));
+                        for v in &to_mark {
+                            v.trace(marker);
+                        }
                         alive_ids.borrow_mut().insert(id);
+                    }
+                }
+                marker.drain_gray_queue();
+                {
+                    let mut dead = dead_long_strings.borrow_mut();
+                    for (id, _sz) in &long_string_snapshot {
+                        if !marker.is_visited(*id) {
+                            dead.insert(*id);
+                        }
                     }
                 }
             };
@@ -2647,12 +2722,25 @@ impl<'a> GcHandle<'a> {
                 newly_unreachable.into_inner();
             let promote_ids: std::collections::HashSet<usize> =
                 promote.iter().map(|t| t.identity()).collect();
+            let dead_ls_ids = dead_long_strings.into_inner();
             let mut g = state_ref.global.borrow_mut();
             g.weak_tables_registry
                 .retain(|w| alive_set.contains(&w.0.identity()));
             g.pending_finalizers
                 .retain(|t| !promote_ids.contains(&t.identity()));
             g.to_be_finalized.extend(promote);
+            if !dead_ls_ids.is_empty() {
+                let mut freed: isize = 0;
+                g.gc_tracked_long_strings.retain(|(w, sz)| {
+                    if dead_ls_ids.contains(&w.0.identity()) {
+                        freed += *sz as isize;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                g.gc_debt -= freed;
+            }
         }
 
         matches!(outcome, StepOutcome::Paused)
