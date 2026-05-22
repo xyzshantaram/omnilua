@@ -47,10 +47,10 @@ const LUAI_MAXSTACK: usize = 1_000_000;
 const ERRORSTACKSIZE: usize = LUAI_MAXSTACK + 200;
 
 // C: const EXTRA_STACK = 5  (macros.tsv)
-const EXTRA_STACK: u32 = 5;
+const EXTRA_STACK: i32 = 5;
 
 // C: const LUA_MINSTACK = 20  (macros.tsv)
-const LUA_MINSTACK: u32 = 20;
+const LUA_MINSTACK: i32 = 20;
 
 // C: const LUA_MULTRET = -1  (macros.tsv)
 const LUA_MULTRET: i32 = -1;
@@ -237,7 +237,7 @@ pub(crate) fn realloc_stack(
 
     // C: correctstack(L) — no-op in Rust
     // C: L->stack_last.p = L->stack.p + newsize;
-    state.stack_last = new_size as StackIdx;
+    state.stack_last = StackIdx(new_size as u32);
 
     // C: for (i = oldsize+EXTRA_STACK; i < newsize+EXTRA_STACK; i++) setnilvalue(...)
     // Initialize newly allocated slots to Nil.
@@ -272,11 +272,11 @@ pub(crate) fn grow_stack(
             return Err(LuaError::with_status(LuaStatus::ErrErr));
         }
         return Ok(false);
-    } else if n < LUAI_MAXSTACK {
+    } else if (n as usize) < LUAI_MAXSTACK {
         // C: int newsize = 2 * size;
         let mut new_size = 2 * size;
         // C: int needed = cast_int(L->top.p - L->stack.p) + n;
-        let needed = state.top_idx().0 as i32 + n;
+        let needed = (state.top_idx().0 as i32 + n) as usize;
         if new_size > LUAI_MAXSTACK {
             new_size = LUAI_MAXSTACK;
         }
@@ -299,7 +299,7 @@ pub(crate) fn grow_stack(
 /// Computes the number of stack slots currently in use across all call frames.
 ///
 /// C: `static int stackinuse(lua_State *L)`
-fn stack_in_use(state: &LuaState) -> i32 {
+fn stack_in_use(state: &LuaState) -> usize {
     // C: StkId lim = L->top.p;
     let mut lim = state.top_idx();
     // C: for (ci = L->ci; ci != NULL; ci = ci->previous)
@@ -314,9 +314,9 @@ fn stack_in_use(state: &LuaState) -> i32 {
     }
     debug_assert!(true /* TODO(phase-b): lim <= state.stack_last + EXTRA_STACK */);
     // C: res = cast_int(lim - L->stack.p) + 1
-    let res = lim as i32 + 1;
-    if res < LUA_MINSTACK as i32 {
-        LUA_MINSTACK as i32
+    let res = lim.0 as usize + 1;
+    if res < LUA_MINSTACK as usize {
+        LUA_MINSTACK as usize
     } else {
         res
     }
@@ -496,11 +496,11 @@ fn rethook(state: &mut LuaState, ci_idx: CallInfoIdx, nres: i32) -> Result<(), L
         // C: ci->func.p += delta
         // PORT NOTE: temporarily advance func index by delta for hook transfer calc
         let original_func = state.get_ci(ci_idx).func;
-        state.get_ci_mut(ci_idx).func = (original_func as i32 + delta) as StackIdx;
+        state.get_ci_mut(ci_idx).func = StackIdx((original_func.0 as i32 + delta) as u32);
 
         // C: ftransfer = cast(unsigned short, firstres - ci->func.p)
         let ci_func = state.get_ci(ci_idx).func;
-        let ftransfer = (first_res - ci_func as i32) as u16;
+        let ftransfer = (first_res - ci_func.0 as i32) as u16;
 
         hook(state, LUA_HOOKRET, -1, ftransfer as i32, nres)?;
 
@@ -643,12 +643,12 @@ fn move_results(
                 let actual_nres = nres.min(wanted);
                 for i in 0..actual_nres {
                     let src = state.get_at((first_result + i) as u32).clone();
-                    state.set_at(res_idx + i as u32, src);
+                    state.set_at(res_idx + i as i32, src);
                 }
                 for i in actual_nres..wanted {
-                    state.set_at(res_idx + i as u32, LuaValue::Nil);
+                    state.set_at(res_idx + i as i32, LuaValue::Nil);
                 }
-                state.set_top(res_idx + wanted as u32);
+                state.set_top(res_idx + wanted as i32);
                 return Ok(());
             }
         }
@@ -660,10 +660,10 @@ fn move_results(
     let actual_nres = nres.min(effective_wanted);
     for i in 0..actual_nres {
         let src = state.get_at((first_result + i) as u32).clone();
-        state.set_at(res_idx + i as u32, src);
+        state.set_at(res_idx + i as i32, src);
     }
     for i in actual_nres..effective_wanted {
-        state.set_at(res_idx + i as u32, LuaValue::Nil);
+        state.set_at(res_idx + i as i32, LuaValue::Nil);
     }
     state.set_top(res_idx + effective_wanted as u32);
     Ok(())
@@ -758,7 +758,7 @@ fn precall_c(
     // C: if (l_unlikely(L->hookmask & LUA_MASKCALL))
     if state.hookmask & LUA_MASKCALL != 0 {
         // C: int narg = cast_int(L->top.p - func) - 1
-        let narg = (state.top_idx().0 as i32 - func_idx as i32) - 1;
+        let narg = (state.top_idx().0 as i32 - func_idx.0 as i32) - 1;
         hook(state, LUA_HOOKCALL, -1, 1, narg)?;
     }
 
@@ -816,14 +816,14 @@ pub(crate) fn pretailcall(
                 // C: ci->func.p -= delta  (restore 'func' if vararg)
                 {
                     let ci = state.get_ci_mut(ci_idx);
-                    ci.func = (ci.func as i32 - delta) as StackIdx;
+                    ci.func = StackIdx((ci.func.0 as i32 - delta) as u32);
                 }
                 let ci_func = state.get_ci(ci_idx).func;
 
                 // C: for (i = 0; i < narg1; i++) setobjs2s(L, ci->func.p + i, func + i)
                 for i in 0..narg1 {
-                    let src = state.get_at(func_idx + i as u32).clone();
-                    state.set_at(ci_func + i as u32, src);
+                    let src = state.get_at(func_idx + i as i32).clone();
+                    state.set_at(ci_func + i as i32, src);
                 }
 
                 // Update func_idx to reflect the moved-down position.
@@ -889,7 +889,7 @@ pub(crate) fn precall(
             // C: case LUA_VLCL — Lua function
             LuaValue::Function(LuaClosure::Lua(ref cl)) => {
                 let proto = cl.proto.clone();
-                let narg = (state.top_idx().0 as i32 - func_idx as i32) - 1;
+                let narg = (state.top_idx().0 as i32 - func_idx.0 as i32) - 1;
                 let nfixparams = proto.numparams as i32;
                 let fsize = proto.maxstacksize as i32;
 
@@ -1178,7 +1178,7 @@ fn resume_coroutine(state: &mut LuaState, nargs: i32) -> Result<(), LuaError> {
                 poscall(state, ci_idx, n)?;
             } else {
                 // No continuation: just finish the call
-                let n = (state.top_idx().0 as i32 - first_arg as i32).max(0);
+                let n = (state.top_idx().0 as i32 - first_arg.0 as i32).max(0);
                 poscall(state, ci_idx, n)?;
             }
         }
@@ -1233,7 +1233,7 @@ pub fn lua_resume(
         }
         // C: else if (L->top.p - (L->ci->func.p + 1) == nargs) — no function?
         let ci_func = state.get_ci(state.ci).func;
-        if state.top_idx().0 as i32 - (ci_func as i32 + 1) == nargs {
+        if state.top_idx().0 as i32 - (ci_func.0 as i32 + 1) == nargs {
             return resume_error(state, b"cannot resume dead coroutine", nargs);
         }
     } else if state.status != LuaStatus::Yield {
@@ -1292,7 +1292,7 @@ pub fn lua_resume(
         state.get_ci_u2_nyield(ci_idx)
     } else {
         let ci_func = state.get_ci(ci_idx).func;
-        state.top_idx().0 as i32 - (ci_func as i32 + 1)
+        state.top_idx().0 as i32 - (ci_func.0 as i32 + 1)
     };
 
     // C: lua_unlock(L) — no-op

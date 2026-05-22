@@ -435,7 +435,7 @@ pub(crate) fn find_local<'a>(
         let limit: u32 = state.top_idx().0;
         let _ = ci.next;
         // C: if (limit - base >= n && n > 0)
-        if n > 0 && limit.saturating_sub(base) >= n as u32 {
+        if n > 0 && limit.saturating_sub(base.0) >= n as u32 {
             // C: name = isLua(ci) ? "(temporary)" : "(C temporary)";
             name = Some(if ci.is_lua() { b"(temporary)" } else { b"(C temporary)" });
         } else {
@@ -445,7 +445,7 @@ pub(crate) fn find_local<'a>(
 
     // C: if (pos) *pos = base + (n - 1);
     if let Some(out_pos) = pos {
-        *out_pos = StackIdx(base + (n - 1) as u32);
+        *out_pos = base + (n - 1);
     }
     name
 }
@@ -647,8 +647,10 @@ fn get_func_name<'a>(
         return None;
     }
     // TODO(port): ci->previous requires navigating call_stack by prev idx
-    let prev_ci = state.get_prev_ci(ci)?;
-    funcname_from_call(state, prev_ci, name)
+    // TODO(phase-b): get_prev_ci needs to accept &CallInfo or take the previous idx.
+    let prev_idx = ci.previous?;
+    let prev_ci = state.get_ci(prev_idx).clone();
+    funcname_from_call(state, &prev_ci, name)
 }
 
 /// Fills `ar` with the requested debug information about closure `f` / frame `ci`.
