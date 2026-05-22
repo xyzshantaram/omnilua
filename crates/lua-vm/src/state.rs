@@ -2386,6 +2386,104 @@ impl<'a> GcHandle<'a> {
     /// Phase-B stub for `luaC_step(L)`.
     pub fn step(&self) { /* phase-b no-op */ }
 
+    /// Run one budgeted incremental step of the GC.
+    ///
+    /// `work_units` is the number of GC work units the step is allowed to
+    /// perform (one gray trace, one sweep visit, or one phase transition).
+    /// Returns `true` if the step completed a cycle and the collector is
+    /// now in the `Pause` state; `false` otherwise.
+    ///
+    /// Mirrors `collect_via_heap` for the post-mark weak-table /
+    /// finalizer-promotion logic, but only the atomic-phase transition will
+    /// invoke the snapshot-walking hook — propagate and sweep steps reuse
+    /// the snapshot but never execute it. The snapshot is rebuilt on every
+    /// call; the cost is `O(weak_tables_registry)` per step.
+    pub fn incremental_step(&self, work_units: isize) -> bool {
+        use lua_gc::{StepBudget, StepOutcome, Trace};
+        let state_ref: &LuaState = &*self._state;
+
+        let weak_tables_snapshot: Vec<lua_types::gc::GcRef<lua_types::value::LuaTable>> = {
+            let g = state_ref.global.borrow();
+            let mut seen = std::collections::HashSet::<usize>::new();
+            g.weak_tables_registry
+                .iter()
+                .filter_map(|w| w.upgrade())
+                .filter(|t| seen.insert(t.identity()))
+                .collect()
+        };
+
+        let pending_snapshot: Vec<lua_types::gc::GcRef<lua_types::value::LuaTable>> = {
+            let g = state_ref.global.borrow();
+            g.pending_finalizers.clone()
+        };
+
+        let alive_ids: std::cell::RefCell<std::collections::HashSet<usize>> =
+            std::cell::RefCell::new(std::collections::HashSet::new());
+        let newly_unreachable: std::cell::RefCell<Vec<lua_types::gc::GcRef<lua_types::value::LuaTable>>> =
+            std::cell::RefCell::new(Vec::new());
+        let atomic_ran = std::cell::Cell::new(false);
+
+        let outcome = {
+            let global = state_ref.global.borrow();
+            global.heap.unpause();
+            let roots = CollectRoots { global: &*global, thread: state_ref };
+            let hook = |marker: &mut lua_gc::Marker| {
+                atomic_ran.set(true);
+                loop {
+                    let visited_before = marker.visited_count();
+                    for t in &weak_tables_snapshot {
+                        let t_id = t.identity();
+                        if !marker.is_visited(t_id) {
+                            continue;
+                        }
+                        let to_mark = t.ephemeron_values_to_mark(
+                            &|id| marker.is_visited(id),
+                        );
+                        for v in &to_mark {
+                            v.trace(marker);
+                        }
+                    }
+                    marker.drain_gray_queue();
+                    if marker.visited_count() == visited_before {
+                        break;
+                    }
+                }
+                for t in &weak_tables_snapshot {
+                    let id = t.identity();
+                    if marker.is_visited(id) {
+                        t.prune_weak_dead(&|id| marker.is_visited(id));
+                        alive_ids.borrow_mut().insert(id);
+                    }
+                }
+                for pf in &pending_snapshot {
+                    if !marker.is_visited(pf.identity()) {
+                        marker.mark(pf.0);
+                        newly_unreachable.borrow_mut().push(pf.clone());
+                    }
+                }
+                marker.drain_gray_queue();
+            };
+            let budget = StepBudget::from_work(work_units);
+            global.heap.incremental_step_with_post_mark(&roots, budget, hook)
+        };
+
+        if atomic_ran.get() {
+            let alive_set = alive_ids.into_inner();
+            let promote: Vec<lua_types::gc::GcRef<lua_types::value::LuaTable>> =
+                newly_unreachable.into_inner();
+            let promote_ids: std::collections::HashSet<usize> =
+                promote.iter().map(|t| t.identity()).collect();
+            let mut g = state_ref.global.borrow_mut();
+            g.weak_tables_registry
+                .retain(|w| alive_set.contains(&w.0.identity()));
+            g.pending_finalizers
+                .retain(|t| !promote_ids.contains(&t.identity()));
+            g.to_be_finalized.extend(promote);
+        }
+
+        matches!(outcome, StepOutcome::Paused)
+    }
+
     /// Set the GC kind (incremental/generational).
     ///
     /// C: `luaC_changemode(L, newmode)` in `lgc.c` — in Phases A–C the heap

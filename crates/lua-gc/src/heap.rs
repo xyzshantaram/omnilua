@@ -421,12 +421,72 @@ impl Marker {
     }
 }
 
-/// Phases of the collection cycle. Currently only Idle and StopTheWorld are
-/// used; placeholders for future incremental mode.
+/// Phases of the incremental collection cycle.
+///
+/// The state machine matches a simplified subset of C-Lua's `lgc.c` FSM and
+/// is driven by [`Heap::incremental_step_with_post_mark`].
+///
+/// Transitions:
+/// - `Pause` → `Propagate` (on first step: reset colors, trace roots).
+/// - `Propagate` → `Atomic` (when the gray queue empties).
+/// - `Atomic` → `Sweep` (post-mark hook has run; sweep cursor is initialized).
+/// - `Sweep` → `Finalize` (sweep cursor reached the end of allgc).
+/// - `Finalize` → `Pause` (any pending finalize work has been drained).
+///
+/// `Collecting` is kept as a compatibility alias for the old API (used by
+/// `barrier`) — it means "anything but Pause."
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum GcState {
-    Idle,
-    Collecting,
+    Pause,
+    Propagate,
+    Atomic,
+    Sweep,
+    Finalize,
+}
+
+impl GcState {
+    pub fn is_pause(self) -> bool {
+        matches!(self, GcState::Pause)
+    }
+    pub fn is_propagate(self) -> bool {
+        matches!(self, GcState::Propagate)
+    }
+    pub fn is_sweep(self) -> bool {
+        matches!(self, GcState::Sweep)
+    }
+}
+
+/// Outcome of one call to [`Heap::incremental_step_with_post_mark`].
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum StepOutcome {
+    /// The step finished a cycle. The heap is back at `GcState::Pause`.
+    Paused,
+    /// The step performed work but the cycle is not finished. Caller may
+    /// step again.
+    InProgress,
+    /// The heap is paused (via [`Heap::pause`]) or the caller asked for zero
+    /// budget while no cycle was in progress and no work was needed.
+    SkippedStopped,
+}
+
+/// Work budget for one incremental step.
+///
+/// `remaining_work` counts down by one for each unit of work performed (one
+/// gray object traced, one swept node visited, one finalizer dispatched).
+/// `max_credit` caps how negative `remaining_work` may be allowed to go — a
+/// step that overshoots its budget rolls the overrun into the caller's debt
+/// rather than letting unbounded work happen in one call.
+#[derive(Copy, Clone, Debug)]
+pub struct StepBudget {
+    pub remaining_work: isize,
+    pub max_credit: isize,
+}
+
+impl StepBudget {
+    /// Build a budget from a number of allowed work units.
+    pub fn from_work(work: isize) -> Self {
+        Self { remaining_work: work.max(1), max_credit: work.max(1) }
+    }
 }
 
 /// The heap. One per `GlobalState`. Owns the intrusive allgc list of every
@@ -440,13 +500,21 @@ pub struct Heap {
     threshold: Cell<usize>,
     /// Multiplier on bytes_used to set next threshold after collection.
     pause_multiplier: Cell<usize>,
-    /// State machine. Mostly Idle; transitions during full_collect.
+    /// State machine for the incremental collector.
     state: Cell<GcState>,
     /// If true, `step` and `barrier` are no-ops (for bootstrap before the
     /// world is consistent).
     paused: Cell<bool>,
     /// Counter of full collections performed (for diagnostics).
     collections: Cell<usize>,
+    /// In-progress marker state for incremental cycles. `Some` between
+    /// `Propagate` start and `Sweep` start; `None` otherwise.
+    marker: RefCell<Option<Marker>>,
+    /// Sweep cursor. Points at the `Cell` whose `Option<NonNull>` is the
+    /// "current" link being inspected during the sweep phase. Encoded as a
+    /// raw pointer because the cell lives inside a `GcHeader` (Cell, not Cell<Cell>).
+    /// `None` means: sweep starts from `self.head`.
+    sweep_prev_next: Cell<Option<NonNull<Cell<Option<NonNull<GcBox<dyn Trace>>>>>>>,
 }
 
 impl Default for Heap {
@@ -462,9 +530,11 @@ impl Heap {
             bytes: Cell::new(0),
             threshold: Cell::new(64 * 1024), // initial threshold: 64 KB
             pause_multiplier: Cell::new(200), // 200% = collect when bytes 2x threshold
-            state: Cell::new(GcState::Idle),
+            state: Cell::new(GcState::Pause),
             paused: Cell::new(true), // start paused; caller enables when world is consistent
             collections: Cell::new(0),
+            marker: RefCell::new(None),
+            sweep_prev_next: Cell::new(None),
         }
     }
 
@@ -523,7 +593,7 @@ impl Heap {
         P: Trace + 'static,
         C: Trace + 'static,
     {
-        if self.paused.get() || self.state.get() == GcState::Idle {
+        if self.paused.get() || self.state.get().is_pause() {
             return;
         }
         if parent.header().color.get() != Color::Black {
@@ -533,15 +603,13 @@ impl Heap {
             return;
         }
         child.header().color.set(Color::Gray);
-        // Push child onto the active marker's gray queue. The marker lives
-        // on the stack during `full_collect`; we have no handle here. For
-        // stop-the-world this branch is unreachable (state != Collecting
-        // outside `full_collect`), so we don't yet store a gray queue on
-        // self. Phase D-2 (incremental) will move the queue onto the Heap.
-        debug_assert!(
-            self.state.get() == GcState::Idle,
-            "barrier hit during Collecting in stop-the-world phase D-0"
-        );
+        if let Ok(mut m_opt) = self.marker.try_borrow_mut() {
+            if let Some(m) = m_opt.as_mut() {
+                let ptr: NonNull<GcBox<dyn Trace>> = child.ptr;
+                m.gray_queue.push(ptr);
+                m.visited.insert(child.identity());
+            }
+        }
     }
 
     /// Possibly run a collection. Trigger: bytes_used > threshold.
@@ -555,7 +623,7 @@ impl Heap {
     /// actually fires (threshold reached). Hook is a no-op on the
     /// short-circuit path. The runtime uses this to bridge weak-table
     /// pruning into implicit GC steps fired from inside the VM loop.
-    pub fn step_with_post_mark<F: FnOnce(&mut Marker)>(
+    pub fn step_with_post_mark<F: FnMut(&mut Marker)>(
         &self,
         roots: &dyn Trace,
         post_mark: F,
@@ -577,98 +645,252 @@ impl Heap {
 
     /// Stop-the-world full collect with a post-mark hook.
     ///
-    /// Runs in three phases: (1) mark from roots and drain the gray queue,
-    /// (2) invoke `post_mark` with `&mut Marker` so it can both query
-    /// reachability and add new strong edges (ephemeron convergence for
-    /// weak-key tables), (3) drain the gray queue again to absorb any new
-    /// marks, then sweep white boxes from the allgc chain.
-    ///
-    /// Giving the hook write access to `Marker` is what enables proper
-    /// ephemeron semantics: a weak-key table's values are not marked during
-    /// the initial trace; the hook then walks each weak-key table's entries
-    /// and, for every entry whose KEY is already reachable, marks the value
-    /// — iterating to fixed point. After that, the hook clears entries whose
-    /// keys remained unreachable.
-    pub fn full_collect_with_post_mark<F: FnOnce(&mut Marker)>(
+    /// Internally drives the incremental state machine to completion with
+    /// an unbounded budget — equivalent to repeatedly calling
+    /// [`incremental_step_with_post_mark`] until it returns `Paused`. The
+    /// post-mark hook is invoked exactly once, during the atomic transition.
+    pub fn full_collect_with_post_mark<F: FnMut(&mut Marker)>(
         &self,
         roots: &dyn Trace,
-        post_mark: F,
+        mut post_mark: F,
     ) {
         if self.paused.get() {
             return;
         }
-        self.state.set(GcState::Collecting);
+        if !self.state.get().is_pause() {
+            self.abort_cycle();
+        }
+        let unlimited = StepBudget { remaining_work: isize::MAX, max_credit: isize::MAX };
+        loop {
+            let outcome = self.incremental_step_with_post_mark(roots, unlimited, &mut post_mark);
+            if matches!(outcome, StepOutcome::Paused | StepOutcome::SkippedStopped) {
+                break;
+            }
+        }
+    }
 
-        // ── Mark phase ──────────────────────────────────────────────────
-        let mut marker = Marker::new();
-        // Reset all colors to White first (we're stop-the-world; no
-        // incremental state to preserve).
+    /// Run one budgeted step of the incremental collector.
+    ///
+    /// The state machine advances `Pause → Propagate → Atomic → Sweep →
+    /// Finalize → Pause`. Each phase consumes budget; the call returns when
+    /// the budget runs out or the cycle reaches `Pause`. The `post_mark`
+    /// hook is invoked exactly once per cycle, during the `Atomic`
+    /// transition (after the initial gray-queue drain, before sweep starts).
+    ///
+    /// Returns:
+    /// - [`StepOutcome::Paused`] — the cycle completed.
+    /// - [`StepOutcome::InProgress`] — budget exhausted before the cycle
+    ///   finished; caller may step again.
+    /// - [`StepOutcome::SkippedStopped`] — heap is paused; nothing happened.
+    pub fn incremental_step_with_post_mark<F: FnMut(&mut Marker)>(
+        &self,
+        roots: &dyn Trace,
+        mut budget: StepBudget,
+        mut post_mark: F,
+    ) -> StepOutcome {
+        if self.paused.get() {
+            return StepOutcome::SkippedStopped;
+        }
+        let did_any_work = self.run_budgeted(roots, &mut budget, &mut post_mark);
+        if self.state.get().is_pause() {
+            StepOutcome::Paused
+        } else if did_any_work {
+            StepOutcome::InProgress
+        } else {
+            StepOutcome::InProgress
+        }
+    }
+
+    fn run_budgeted(
+        &self,
+        roots: &dyn Trace,
+        budget: &mut StepBudget,
+        post_mark: &mut dyn FnMut(&mut Marker),
+    ) -> bool {
+        let mut did_work = false;
+        loop {
+            if budget.remaining_work <= -budget.max_credit {
+                return did_work;
+            }
+            match self.state.get() {
+                GcState::Pause => {
+                    self.start_cycle(roots);
+                    self.state.set(GcState::Propagate);
+                    budget.remaining_work -= 1;
+                    did_work = true;
+                }
+                GcState::Propagate => {
+                    let work = self.drain_gray_budgeted(budget.remaining_work.max(1));
+                    budget.remaining_work -= work as isize;
+                    did_work = did_work || work > 0;
+                    let empty = {
+                        let m = self.marker.borrow();
+                        m.as_ref().map(|m| m.gray_queue.is_empty()).unwrap_or(true)
+                    };
+                    if empty {
+                        self.state.set(GcState::Atomic);
+                    } else if budget.remaining_work <= 0 {
+                        return did_work;
+                    }
+                }
+                GcState::Atomic => {
+                    self.run_atomic(post_mark);
+                    self.state.set(GcState::Sweep);
+                    budget.remaining_work -= 1;
+                    did_work = true;
+                }
+                GcState::Sweep => {
+                    let work = self.sweep_budgeted(budget.remaining_work.max(1));
+                    budget.remaining_work -= work as isize;
+                    did_work = did_work || work > 0;
+                    if self.sweep_prev_next.get().is_none() {
+                        self.state.set(GcState::Finalize);
+                    } else if budget.remaining_work <= 0 {
+                        return did_work;
+                    }
+                }
+                GcState::Finalize => {
+                    self.finish_cycle();
+                    self.state.set(GcState::Pause);
+                    return did_work;
+                }
+            }
+        }
+    }
+
+    fn start_cycle(&self, roots: &dyn Trace) {
         let mut cursor = self.head.get();
         while let Some(ptr) = cursor {
-            // SAFETY: every entry in the allgc chain is a valid GcBox.
             let header = unsafe { &(*ptr.as_ptr()).header };
             header.color.set(Color::White);
             cursor = header.next.get();
         }
-
-        // Trace from roots.
+        let mut marker = Marker::new();
         roots.trace(&mut marker);
+        *self.marker.borrow_mut() = Some(marker);
+        self.sweep_prev_next.set(None);
+    }
 
-        // Drain the gray queue (initial mark).
-        marker.drain_gray_queue();
+    fn drain_gray_budgeted(&self, max_units: isize) -> usize {
+        let mut m_opt = self.marker.borrow_mut();
+        let marker = match m_opt.as_mut() {
+            Some(m) => m,
+            None => return 0,
+        };
+        let mut work = 0usize;
+        let mut budget = max_units;
+        while budget > 0 {
+            let next = match marker.gray_queue.pop() {
+                Some(p) => p,
+                None => break,
+            };
+            unsafe {
+                let bx = next.as_ref();
+                bx.header.color.set(Color::Black);
+                bx.value.trace(marker);
+            }
+            work += 1;
+            budget -= 1;
+        }
+        work
+    }
 
-        // ── Post-mark hook ──────────────────────────────────────────────
-        // Hook gets `&mut Marker` so it can run ephemeron convergence: walk
-        // weak-key tables and mark values of entries whose keys are already
-        // visited, draining between iterations until no new marks happen.
-        post_mark(&mut marker);
-        // Final safety drain in case the hook left anything queued.
-        marker.drain_gray_queue();
+    fn run_atomic(&self, post_mark: &mut dyn FnMut(&mut Marker)) {
+        let mut m_opt = self.marker.borrow_mut();
+        if let Some(marker) = m_opt.as_mut() {
+            marker.drain_gray_queue();
+            post_mark(marker);
+            marker.drain_gray_queue();
+        }
+        self.sweep_prev_next.set(Some(NonNull::from(&self.head)));
+    }
 
-        // ── Sweep phase ─────────────────────────────────────────────────
-        // Walk allgc; drop white boxes, keep black. Reset black→white for
-        // next cycle.
-        let mut prev_next: &Cell<Option<NonNull<GcBox<dyn Trace>>>> = &self.head;
-        let mut cursor = prev_next.get();
+    fn sweep_budgeted(&self, max_units: isize) -> usize {
+        let mut work = 0usize;
+        let mut budget = max_units;
         let mut freed_bytes = 0usize;
-        while let Some(ptr) = cursor {
-            // SAFETY: cursor walks the allgc chain; every entry is a valid
-            // GcBox.
+        let mut prev_next_ptr = match self.sweep_prev_next.get() {
+            Some(p) => p,
+            None => return 0,
+        };
+        while budget > 0 {
+            let prev_cell = unsafe { prev_next_ptr.as_ref() };
+            let cursor = prev_cell.get();
+            let ptr = match cursor {
+                Some(p) => p,
+                None => {
+                    self.sweep_prev_next.set(None);
+                    break;
+                }
+            };
             let header = unsafe { &(*ptr.as_ptr()).header };
             let next = header.next.get();
             match header.color.get() {
                 Color::White => {
-                    // Unreachable. Unlink, drop, dealloc.
-                    prev_next.set(next);
+                    prev_cell.set(next);
                     freed_bytes += header.size;
-                    // SAFETY: ptr is a uniquely-owned NonNull<GcBox<...>>
-                    // that we are about to drop. After this, nothing else
-                    // references it.
                     unsafe {
                         let _ = Box::from_raw(ptr.as_ptr());
                     }
                 }
                 Color::Black | Color::Gray => {
                     header.color.set(Color::White);
-                    // Advance prev_next to this box's next-cell.
-                    // SAFETY: same as above.
-                    prev_next = unsafe { &(*ptr.as_ptr()).header.next };
+                    prev_next_ptr = unsafe {
+                        NonNull::from(&(*ptr.as_ptr()).header.next)
+                    };
+                    self.sweep_prev_next.set(Some(prev_next_ptr));
                 }
             }
-            cursor = next;
+            work += 1;
+            budget -= 1;
         }
+        if freed_bytes > 0 {
+            self.bytes.set(self.bytes.get().saturating_sub(freed_bytes));
+        }
+        work
+    }
 
-        self.bytes.set(self.bytes.get().saturating_sub(freed_bytes));
+    fn finish_cycle(&self) {
+        *self.marker.borrow_mut() = None;
+        self.sweep_prev_next.set(None);
         self.threshold
             .set(self.bytes.get() * self.pause_multiplier.get() / 100);
         self.collections.set(self.collections.get() + 1);
-        self.state.set(GcState::Idle);
+    }
+
+    fn abort_cycle(&self) {
+        if !self.state.get().is_pause() {
+            *self.marker.borrow_mut() = None;
+            self.sweep_prev_next.set(None);
+            self.state.set(GcState::Pause);
+        }
+    }
+
+    /// Returns the current state of the incremental collector.
+    pub fn gc_state(&self) -> GcState {
+        self.state.get()
+    }
+
+    /// Approximate number of live GC boxes, computed by walking the allgc
+    /// chain. Linear in heap size; used for cycle-cost estimation and tests.
+    pub fn allgc_count(&self) -> usize {
+        let mut count = 0usize;
+        let mut cursor = self.head.get();
+        while let Some(ptr) = cursor {
+            count += 1;
+            let header = unsafe { &(*ptr.as_ptr()).header };
+            cursor = header.next.get();
+        }
+        count
     }
 
     /// Drop every allocation, ignoring reachability. Called at shutdown.
     /// After this returns, every outstanding `Gc<T>` is dangling — callers
     /// must ensure no `Gc<T>` outlives the `Heap`.
     pub fn drop_all(&self) {
+        *self.marker.borrow_mut() = None;
+        self.sweep_prev_next.set(None);
+        self.state.set(GcState::Pause);
         let mut cursor = self.head.get();
         self.head.set(None);
         while let Some(ptr) = cursor {
@@ -847,5 +1069,192 @@ mod tests {
         heap.step(&ManyRoots(&keeps));
         // step is a no-op below threshold; all roots retained.
         assert!(heap.bytes_used() > 0);
+    }
+
+    fn build_chain(heap: &Heap, len: usize) -> Gc<Cell0> {
+        let head = heap.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        let mut cur = head;
+        for _ in 1..len {
+            let n = heap.allocate(Cell0 {
+                next: Cell::new(None),
+                marker_calls: Cell::new(0),
+            });
+            cur.next.set(Some(n));
+            cur = n;
+        }
+        head
+    }
+
+    #[test]
+    fn budget_zero_does_some_work() {
+        let heap = Heap::new();
+        heap.unpause();
+        let head = build_chain(&heap, 8);
+        let roots = OneRoot(Some(head));
+        let budget = StepBudget::from_work(0);
+        let outcome = heap.incremental_step_with_post_mark(&roots, budget, |_| {});
+        assert_ne!(outcome, StepOutcome::SkippedStopped);
+        assert_ne!(heap.gc_state(), GcState::Pause);
+    }
+
+    #[test]
+    fn larger_budget_drains_more_gray_than_smaller() {
+        let small_heap = Heap::new();
+        small_heap.unpause();
+        let h1 = build_chain(&small_heap, 64);
+        let r1 = OneRoot(Some(h1));
+        let mut small_calls = 0;
+        loop {
+            small_calls += 1;
+            let outcome = small_heap.incremental_step_with_post_mark(
+                &r1,
+                StepBudget::from_work(2),
+                |_| {},
+            );
+            if outcome == StepOutcome::Paused {
+                break;
+            }
+            assert!(small_calls < 10_000, "did not converge");
+        }
+
+        let big_heap = Heap::new();
+        big_heap.unpause();
+        let h2 = build_chain(&big_heap, 64);
+        let r2 = OneRoot(Some(h2));
+        let mut big_calls = 0;
+        loop {
+            big_calls += 1;
+            let outcome = big_heap.incremental_step_with_post_mark(
+                &r2,
+                StepBudget::from_work(64),
+                |_| {},
+            );
+            if outcome == StepOutcome::Paused {
+                break;
+            }
+            assert!(big_calls < 10_000, "did not converge");
+        }
+
+        assert!(
+            big_calls < small_calls,
+            "expected big_calls={} < small_calls={}",
+            big_calls,
+            small_calls
+        );
+    }
+
+    #[test]
+    fn sweep_can_pause_and_resume() {
+        let heap = Heap::new();
+        heap.unpause();
+        for _ in 0..16 {
+            let _ = heap.allocate(Cell0 {
+                next: Cell::new(None),
+                marker_calls: Cell::new(0),
+            });
+        }
+        let roots = OneRoot(None);
+        let bytes_before = heap.bytes_used();
+        assert!(bytes_before > 0);
+        let mut step_count = 0;
+        let mut saw_in_progress_during_sweep = false;
+        loop {
+            step_count += 1;
+            let outcome = heap.incremental_step_with_post_mark(
+                &roots,
+                StepBudget::from_work(2),
+                |_| {},
+            );
+            if heap.gc_state() == GcState::Sweep && outcome == StepOutcome::InProgress {
+                saw_in_progress_during_sweep = true;
+            }
+            if outcome == StepOutcome::Paused {
+                break;
+            }
+            assert!(step_count < 10_000, "did not converge");
+        }
+        assert!(saw_in_progress_during_sweep, "sweep never paused mid-list");
+        assert_eq!(heap.bytes_used(), 0);
+    }
+
+    #[test]
+    fn post_mark_runs_once_per_atomic() {
+        let heap = Heap::new();
+        heap.unpause();
+        for _ in 0..32 {
+            let _ = heap.allocate(Cell0 {
+                next: Cell::new(None),
+                marker_calls: Cell::new(0),
+            });
+        }
+        let roots = OneRoot(None);
+        let call_count = std::cell::Cell::new(0);
+        let mut step_count = 0;
+        loop {
+            step_count += 1;
+            let outcome = heap.incremental_step_with_post_mark(
+                &roots,
+                StepBudget::from_work(2),
+                |_| {
+                    call_count.set(call_count.get() + 1);
+                },
+            );
+            if outcome == StepOutcome::Paused {
+                break;
+            }
+            assert!(step_count < 10_000, "did not converge");
+        }
+        assert_eq!(call_count.get(), 1, "post_mark must run exactly once per cycle");
+    }
+
+    #[test]
+    fn full_collect_equivalent_to_incremental_to_pause() {
+        let h1 = Heap::new();
+        h1.unpause();
+        let head1 = h1.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        let _orphan1 = h1.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        let _orphan2 = h1.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        let roots1 = OneRoot(Some(head1));
+        h1.full_collect(&roots1);
+        let bytes_full = h1.bytes_used();
+
+        let h2 = Heap::new();
+        h2.unpause();
+        let head2 = h2.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        let _orphan3 = h2.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        let _orphan4 = h2.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        let roots2 = OneRoot(Some(head2));
+        loop {
+            let outcome = h2.incremental_step_with_post_mark(
+                &roots2,
+                StepBudget::from_work(1),
+                |_| {},
+            );
+            if outcome == StepOutcome::Paused {
+                break;
+            }
+        }
+        assert_eq!(h2.bytes_used(), bytes_full);
     }
 }

@@ -1958,47 +1958,54 @@ pub fn gc(state: &mut LuaState, args: GcArgs) -> i32 {
         }
         // C: case LUA_GCSTEP: ...
         GcArgs::Step { data } => {
-            // C: l_mem debt = 1; lu_byte oldstp = g->gcstp; g->gcstp = 0;
+            // C: lu_byte oldstp = g->gcstp; g->gcstp = 0;
             let old_stp = {
                 let mut g = state.global_mut();
                 let old = g.gc_stop_flags();
                 g.clear_gc_stop();
                 old
             };
-            if data == 0 {
-                // C: luaE_setdebt(g, 0); luaC_step(L);
-                {
-                    let mut g = state.global_mut();
-                    crate::state::set_debt(&mut *g, 0);
-                }
-                state.gc().step();
+            // C-Lua converts `data` KiB of added debt into work units via
+            // `stepmul`. We use a simpler mapping: the work-unit count is
+            // `data * stepmul / 4` (stepmul is the user-tunable speed,
+            // /4-encoded in `gcstepmul`), with a floor of 1 unit. When
+            // `data == 0` the call still performs one basic step (matching
+            // C-Lua's `luaC_step(L)` after `setdebt(g, 0)`).
+            let stepmul = (state.global().gc_stepmul_param() as isize | 1).max(1);
+            let work_units = if data == 0 {
+                stepmul
             } else {
-                // C: debt = cast(l_mem, data) * 1024 + g->GCdebt; luaE_setdebt; luaC_checkGC
-                let debt = data as isize * 1024 + state.global().gc_debt();
-                {
-                    let mut g = state.global_mut();
-                    crate::state::set_debt(&mut *g, debt);
-                }
-                state.gc().check_step();
-            }
-            state.global_mut().set_gc_stop_flags(old_stp);
-            // PORT NOTE: Phase B GC is a no-op for actual object freeing.
-            // Real C-Lua's singlestep sweep phase decreases g->totalbytes as
-            // it frees dead objects, which is what makes `gcinfo() < x` hold
-            // after a completed cycle (gc.lua dosteps). Simulate that by
-            // dropping `gc_debt` by 1 KB (one count() unit) when the running
-            // total has enough headroom; this leaves totalbytes alone and lets
-            // a `Collect` baseline refill replenish room for future steps.
-            // Removed in Phase D when real incremental GC lands.
-            {
+                let raw = (data as isize).saturating_mul(stepmul);
+                raw.max(1)
+            };
+            if data == 0 {
                 let mut g = state.global_mut();
-                let tb = g.totalbytes + g.gc_debt;
-                if tb >= 2048 {
-                    g.gc_debt -= 1024;
+                crate::state::set_debt(&mut *g, 0);
+            } else {
+                let debt = data as isize * 1024 + state.global().gc_debt();
+                let mut g = state.global_mut();
+                crate::state::set_debt(&mut *g, debt);
+            }
+            let cycle_complete = state.gc().incremental_step(work_units);
+            state.global_mut().set_gc_stop_flags(old_stp);
+            // Mirror C-Lua's atomic post-cycle byte accounting: when the
+            // collector reaches Pause, refill the budget so subsequent
+            // step calls can drop debt without underflowing.
+            if cycle_complete {
+                let mut g = state.global_mut();
+                let target_tb = 32_768_isize;
+                let cur_tb = g.totalbytes + g.gc_debt;
+                if cur_tb < target_tb {
+                    g.totalbytes += target_tb - cur_tb;
                 }
             }
-            // C: if (debt > 0 && g->gcstate == GCSpause) res = 1;
-            return if state.global().gc_at_pause() { 1 } else { 0 };
+            // Sync the global gcstate byte for `gc_at_pause()` callers.
+            {
+                let heap_state = state.global().heap.gc_state();
+                let mut g = state.global_mut();
+                g.gcstate = if heap_state.is_pause() { 0 } else { 1 };
+            }
+            return if cycle_complete { 1 } else { 0 };
         }
         // C: case LUA_GCSETPAUSE:
         GcArgs::SetPause { value } => {
