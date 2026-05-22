@@ -678,3 +678,20 @@
 [2026-05-18T02:16:09Z mega]   [O5.D3] DEBUG dispatch on file: reference/lua-c/testes/nextvar.lua [parallel]
 [2026-05-18T02:16:09Z mega]   [O5.D4] DEBUG dispatch on file: reference/lua-c/testes/files.lua [parallel]
 [2026-05-18T02:19:14Z mega]   [O5.D5] DEBUG dispatch on file: reference/lua-c/testes/errors.lua [parallel]
+[2026-05-18T02:32:12Z mega]   [O5.D4] DEBUG done. iter cost=$1.3373040000000003  total=$31.3990
+[2026-05-18T02:32:12Z mega]   [O5.D2] DEBUG done. iter cost=$1.52049625  total=$32.9195
+[2026-05-18T02:32:12Z mega]   [O5.D3] DEBUG done. iter cost=$2.6486095000000005  total=$35.5681
+[2026-05-18T02:32:12Z mega]   [O5.D1] DEBUG done. iter cost=$5.157033749999999  total=$40.7251
+[2026-05-18T02:32:12Z mega] ─── outer round 6 (spent: $40.7251) ───
+[2026-05-18T02:32:43Z mega]   scan: 62/75 programs pass cleanly
+[2026-05-18T02:32:43Z mega]   surface scan returned 0 unique stub blockers
+[2026-05-18T02:32:43Z mega]   no stub blockers — falling back to DEBUG agents on failing programs
+[2026-05-18T02:32:43Z mega]   skip stuck prog (same sig 2 rounds: unknown): reference/lua-c/testes/closure.lua
+[2026-05-18T02:32:43Z mega]   [O6.D1] DEBUG dispatch on file: reference/lua-c/testes/pm.lua [parallel]
+[2026-05-18T02:32:43Z mega]   skip stuck prog (same sig 2 rounds: [err] pcall_k failed: Runtime: 202: assertion failed!): reference/lua-c/testes/strings.lua
+[2026-05-18T02:32:43Z mega]   [O6.D2] DEBUG dispatch on file: reference/lua-c/testes/math.lua [parallel]
+[2026-05-18T02:32:43Z mega]   skip stuck prog (same sig 2 rounds: [err] pcall_k failed: Runtime: coroutines not yet implemented (Phase E)): reference/lua-c/testes/literals.lua
+[2026-05-18T02:32:43Z mega]   [O6.D3] DEBUG dispatch on file: reference/lua-c/testes/locals.lua [parallel]
+[2026-05-18T02:32:43Z mega]   skip stuck prog (same sig 2 rounds: [err] pcall_k failed: Runtime: coroutines not yet implemented (Phase E)): reference/lua-c/testes/calls.lua
+[2026-05-18T02:32:43Z mega]   skip stuck prog (same sig 2 rounds: [err] pcall_k failed: Runtime: 234: assertion failed!): reference/lua-c/testes/constructs.lua
+[2026-05-18T02:32:43Z mega]   [O6.D4] DEBUG dispatch on file: reference/lua-c/testes/nextvar.lua [parallel]

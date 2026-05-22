@@ -7,4 +7,4 @@ testing tables, next, and for
  >>> testC not active: skipping tests for table sizes <<<
 
 +
-[err] pcall_k failed: Runtime: [string "-- harness preamble: emulate the globals lua-..."]:17: assertion failed!
++

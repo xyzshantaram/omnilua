@@ -8,8 +8,9 @@ platform:
 	lua Integer 8, lua Number 8
 	little endian
 	alignment: 8
-[err] pcall_k failed: Runtime: _soft = true
-_port = true
-_nomsg = true
-_U = false
-arg = ar:55: assertion failed!
+testing invalid formats
+testing pack/unpack of floating-point numbers
+testing pack/unpack of strings
+testing alignment
+OK
+[ok] execution completed, status=Ok
