@@ -1,2 +1,3 @@
 1 0.6779695 reference/lua-c/testes/gc.lua
 3 1.9185539999999996 reference/lua-c/testes/nextvar.lua
+4 2.32068475 reference/lua-c/testes/files.lua

@@ -1064,6 +1064,14 @@ pub struct LuaState {
     // C: lu_byte marked — GC color/age bits; Phase D only
     // types.tsv: GCObject.marked → u8
     pub marked: u8,
+
+    /// Stack of yield buffers used by the Phase A–D buffering coroutine
+    /// emulation. Each `coroutine.wrap` invocation pushes an empty buffer
+    /// before running the wrapped function, and pops it when the function
+    /// returns. While a buffer is on top, `coroutine.yield(v...)` appends
+    /// its arguments instead of suspending. Phase E replaces this with the
+    /// real stackful coroutine runtime (corosensei).
+    pub yield_buffers: Vec<Vec<LuaValue>>,
 }
 
 impl LuaState {
@@ -1124,6 +1132,36 @@ impl LuaState {
     /// macros.tsv: `yieldable → state.is_yieldable()`
     pub fn is_yieldable(&self) -> bool {
         (self.nCcalls & 0xffff0000) == 0
+    }
+
+    /// Push an empty yield buffer onto the buffer stack. Subsequent
+    /// `coroutine.yield(v...)` calls will append into this buffer instead
+    /// of suspending. Part of the Phase A–D buffering coroutine emulation;
+    /// Phase E replaces this with real corosensei coroutines.
+    pub fn push_yield_buffer(&mut self) {
+        self.yield_buffers.push(Vec::new());
+    }
+
+    /// Pop the top yield buffer, returning its accumulated values.
+    /// Caller must ensure the buffer stack is non-empty (i.e. a matching
+    /// `push_yield_buffer` was issued earlier).
+    pub fn pop_yield_buffer(&mut self) -> Vec<LuaValue> {
+        self.yield_buffers
+            .pop()
+            .expect("pop_yield_buffer with empty buffer stack")
+    }
+
+    /// Returns `true` if a yield buffer is currently active (a wrap'd
+    /// coroutine body is running).
+    pub fn has_yield_buffer(&self) -> bool {
+        !self.yield_buffers.is_empty()
+    }
+
+    /// Append a value to the top yield buffer. Caller must ensure the
+    /// buffer stack is non-empty (typically guarded by `has_yield_buffer`).
+    pub fn yield_buffer_push(&mut self, v: LuaValue) {
+        let n = self.yield_buffers.len();
+        self.yield_buffers[n - 1].push(v);
     }
 
     /// Reset the hook countdown to the baseline.
@@ -2651,6 +2689,7 @@ pub fn new_thread(state: &mut LuaState) -> Result<(), LuaError> {
         nCcalls: 0,
         oldpc: 0,
         marked: 0,
+        yield_buffers: Vec::new(),
     };
 
     // C: preinit_thread(L1, g);
@@ -3003,6 +3042,7 @@ pub fn new_state() -> Option<LuaState> {
         nCcalls: 0,
         oldpc: 0,
         marked: initial_marked,
+        yield_buffers: Vec::new(),
     };
 
     // C: preinit_thread(L, g);

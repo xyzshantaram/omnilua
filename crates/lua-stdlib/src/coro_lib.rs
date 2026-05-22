@@ -148,28 +148,69 @@ pub fn co_resume(state: &mut LuaState) -> Result<usize, LuaError> {
 }
 
 /// Closure body installed by `coroutine.wrap`.  The wrapped coroutine is
-/// stored in upvalue slot 1.
-///
-/// On error the message is augmented with location info (if a string), then
-/// re-raised.  If the coroutine is in an error state (not simply suspended),
-/// its to-be-closed variables are cleaned up before propagation.
+/// stored in upvalue slot 1; a Lua table acting as the dispenser state is
+/// stored in upvalue slot 2.
 ///
 /// C: `static int luaB_auxwrap(lua_State *L)`
 ///
-/// Phase A–D pragmatic implementation: invoke the wrapped function (stored
-/// in upvalue 1) synchronously on the caller's thread, returning whatever
-/// it returns.  This works for coroutine bodies that never yield, which
-/// covers the `calls.lua` tail-call test.  A body that calls
-/// `coroutine.yield` will surface the Phase-E stub error from `co_yield`.
-/// Phase E replaces this with the full `auxresume` cross-thread sequence.
+/// Phase A–D buffering emulation: on the first call we push a yield
+/// buffer onto the LuaState, invoke the wrapped function synchronously,
+/// pop the buffer, and stash the accumulated yields into the state table.
+/// Each call (including the first) increments the cursor and returns the
+/// next buffered value, or nil once exhausted — which is what the Lua
+/// generic `for v in f do ... end` protocol expects on iterator
+/// completion. State-table layout (using `LuaTable::raw_set` interior
+/// mutability):
+///   - integer key 0: cursor (index of next value to return, 1-based).
+///                    `Nil` = not yet primed; `0` = primed, none returned.
+///   - integer keys 1..N: buffered yield values
+///   - integer key -1: count N of buffered values
+/// Phase E will replace this with the full `auxresume` cross-thread sequence.
 fn aux_wrap(state: &mut LuaState) -> Result<usize, LuaError> {
-    let narg = state.get_top();
-    state.push_value_at(upvalue_index(1))?;
-    if narg > 0 {
-        state.insert(-(narg + 1))?;
+    use lua_types::value::LuaTable;
+    let state_val = state.value_at(upvalue_index(2));
+    let st: GcRef<LuaTable> = match state_val {
+        LuaValue::Table(t) => t,
+        _ => {
+            return Err(LuaError::runtime(format_args!(
+                "coroutine.wrap closure missing dispenser state"
+            )));
+        }
+    };
+
+    let primed = !matches!(st.get(&LuaValue::Int(0)), LuaValue::Nil);
+    if !primed {
+        lua_vm::api::set_top(state, 0)?;
+        state.push_value_at(upvalue_index(1))?;
+        state.push_yield_buffer();
+        let call_result = state.call(0, 0);
+        let buffered = state.pop_yield_buffer();
+        call_result?;
+        for (i, v) in buffered.iter().enumerate() {
+            st.raw_set(LuaValue::Int((i + 1) as i64), v.clone());
+        }
+        st.raw_set(LuaValue::Int(-1), LuaValue::Int(buffered.len() as i64));
+        st.raw_set(LuaValue::Int(0), LuaValue::Int(0));
     }
-    state.call(narg, -1)?;
-    Ok(state.get_top() as usize)
+
+    let cursor = match st.get(&LuaValue::Int(0)) {
+        LuaValue::Int(i) => i,
+        _ => 0,
+    };
+    let count = match st.get(&LuaValue::Int(-1)) {
+        LuaValue::Int(i) => i,
+        _ => 0,
+    };
+    let next = cursor + 1;
+    lua_vm::api::set_top(state, 0)?;
+    if next > count {
+        state.push(LuaValue::Nil);
+        return Ok(1);
+    }
+    let v = st.get(&LuaValue::Int(next));
+    st.raw_set(LuaValue::Int(0), LuaValue::Int(next));
+    state.push(v);
+    Ok(1)
 }
 
 /// `coroutine.create(f)` — create a new coroutine that will run function `f`.
@@ -203,14 +244,19 @@ pub fn co_create(state: &mut LuaState) -> Result<usize, LuaError> {
 ///
 /// C: `static int luaB_cowrap(lua_State *L)`
 ///
-/// Phase A–D pragmatic implementation: rather than allocate a (stubbed)
-/// thread, capture the wrapped function itself as upvalue 1 of `aux_wrap`.
-/// The closure invokes the function synchronously when called.  Phase E
-/// restores `luaB_cocreate` + `lua_pushcclosure` once real coroutines exist.
+/// Phase A–D buffering emulation: capture the wrapped function as
+/// upvalue 1 and a fresh dispenser-state table as upvalue 2 of
+/// `aux_wrap`. The first invocation runs the function with a yield
+/// buffer installed, accumulates all `coroutine.yield(v)` arguments into
+/// the table, and dispenses one per subsequent call. Phase E will
+/// restore `luaB_cocreate` + real `lua_pushcclosure` once stackful
+/// coroutines exist.
 pub fn co_wrap(state: &mut LuaState) -> Result<usize, LuaError> {
     state.check_arg_type(1, LuaType::Function)?;
     state.push_value_at(1)?;
-    state.push_cclosure(aux_wrap, 1)?;
+    let st = state.new_table();
+    state.push(LuaValue::Table(st));
+    state.push_cclosure(aux_wrap, 2)?;
     Ok(1)
 }
 
@@ -221,7 +267,24 @@ pub fn co_wrap(state: &mut LuaState) -> Result<usize, LuaError> {
 /// C: `static int luaB_yield(lua_State *L)`
 /// → `return lua_yield(L, lua_gettop(L));`
 /// → `lua_yield(L,n)` is `lua_yieldk(L, n, 0, NULL)` (lua.h:316)
+///
+/// Phase A–D buffering-emulation hook: if `aux_wrap` has installed a yield
+/// buffer on the LuaState (signalling that a `coroutine.wrap` body is
+/// running synchronously on the main thread), append the arguments into
+/// that buffer and return 0 values without suspending. The wrapped
+/// function continues to run; `aux_wrap` dispenses the buffered values one
+/// per call. If no buffer is active we fall through to the faithful
+/// `lua_yieldk` translation, which on the main thread surfaces the C-Lua
+/// "attempt to yield from outside a coroutine" error.
 pub fn co_yield(state: &mut LuaState) -> Result<usize, LuaError> {
+    if state.has_yield_buffer() {
+        let n = state.get_top();
+        for i in 1..=n {
+            let v = state.value_at(i);
+            state.yield_buffer_push(v);
+        }
+        return Ok(0);
+    }
     let n = state.get_top();
     let r = lua_vm::do_::lua_yieldk(state, n, 0, None)?;
     Ok(r as usize)
