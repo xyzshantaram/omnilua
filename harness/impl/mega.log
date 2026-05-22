@@ -586,3 +586,15 @@
 [2026-05-18T00:29:37Z mega]   MAX_OUTER=20  MAX_PER_OUTER=5  PER_AGENT_BUDGET=$8  SESSION_BUDGET=$400
 [2026-05-18T00:29:37Z mega] ═════════════════════════════════════════════════════════════════
 [2026-05-18T00:29:37Z mega] ─── outer round 1 (spent: $0) ───
+[2026-05-18T00:30:28Z mega] loaded 75 test programs (with expected outputs)
+[2026-05-18T00:30:28Z mega] ═════════════════════════════════════════════════════════════════
+[2026-05-18T00:30:28Z mega] mega-loop start. 75 test programs.
+[2026-05-18T00:30:28Z mega]   MAX_OUTER=1  MAX_PER_OUTER=0  PER_AGENT_BUDGET=$20.00  SESSION_BUDGET=$0.01
+[2026-05-18T00:30:28Z mega] ═════════════════════════════════════════════════════════════════
+[2026-05-18T00:30:28Z mega] ─── outer round 1 (spent: $0) ───
+[2026-05-18T00:30:50Z mega]   scan: 58/75 programs pass cleanly
+[2026-05-18T00:30:51Z mega]   surface scan returned 1 unique stub blockers
+[2026-05-18T00:30:51Z mega]   grouped into 0 disjoint-file agents (parallel cap 3)
+[2026-05-18T00:30:51Z mega] ═════════════════════════════════════════════════════════════════
+[2026-05-18T00:30:51Z mega] mega-loop end. Total cost: $0  Outer rounds: 1
+[2026-05-18T00:30:51Z mega] ═════════════════════════════════════════════════════════════════

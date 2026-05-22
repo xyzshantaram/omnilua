@@ -1,1 +1,1 @@
-new_thread	crates/lua-stdlib/src/state_stub.rs:289:70
+is_main_thread	crates/lua-vm/src/state.rs:1826:48

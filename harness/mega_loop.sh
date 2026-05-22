@@ -38,9 +38,11 @@ SESSION_BUDGET=${SESSION_BUDGET:-400.00}
 AUTO_COMMIT=${AUTO_COMMIT:-1}
 COMMIT_LOCK_DIR="$OUT_DIR/commit.lock"
 PREV_PASS_COUNT=-1
-# Last-seen error sig per prog (key: prog text or label, value: normalized sig).
+# Last-seen error sig per prog (parallel-array, bash-3.2-compatible).
+# LAST_SIG_KEY[i] = prog key; LAST_SIG_VAL[i] = normalized sig.
 # Stuck = same sig as previous round. Reset when sig changes (= progress).
-declare -A LAST_SIG=()
+LAST_SIG_KEY=()
+LAST_SIG_VAL=()
 
 # A frontier of Lua test programs. Each entry is a TSV: program\texpected_stdout.
 # expected_stdout uses literal \n for newlines and \t for tabs (interpreted via printf %b).
@@ -531,15 +533,27 @@ while [ "$OUTER" -lt "$MAX_OUTER" ]; do
             fi
             if [ "$failing" = "0" ]; then continue; fi
             # Stuck-detect: skip if this prog has SAME signature as last round.
-            # Different sig = made progress; update LAST_SIG and dispatch.
             current_sig=$(error_signature "$out_file")
             prog_key="${LABELS[$((idx-1))]:-inline-$idx}"
-            prev_sig="${LAST_SIG[$prog_key]:-}"
+            prev_sig=""
+            sig_idx=-1
+            for i in "${!LAST_SIG_KEY[@]}"; do
+                if [ "${LAST_SIG_KEY[$i]}" = "$prog_key" ]; then
+                    prev_sig="${LAST_SIG_VAL[$i]}"
+                    sig_idx=$i
+                    break
+                fi
+            done
             if [ -n "$prev_sig" ] && [ "$prev_sig" = "$current_sig" ]; then
                 emit "  skip stuck prog (same sig 2 rounds: $current_sig): $prog_key"
                 continue
             fi
-            LAST_SIG[$prog_key]="$current_sig"
+            if [ "$sig_idx" -ge 0 ]; then
+                LAST_SIG_VAL[$sig_idx]="$current_sig"
+            else
+                LAST_SIG_KEY+=("$prog_key")
+                LAST_SIG_VAL+=("$current_sig")
+            fi
             debug_iter=$((debug_iter + 1))
             if [ "$debug_iter" -gt "$MAX_PER_OUTER" ]; then break; fi
             ITER=$debug_iter

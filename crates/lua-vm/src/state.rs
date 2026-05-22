@@ -306,7 +306,7 @@ impl Default for CallInfo {
 }
 
 impl CallInfo {
-    pub fn is_lua(&self) -> bool { matches!(self.u, CallInfoFrame::Lua { .. }) }
+    pub fn is_lua(&self) -> bool { (self.callstatus & CIST_C) == 0 }
     pub fn is_lua_code(&self) -> bool { self.is_lua() }
     pub fn is_vararg_func(&self) -> bool { todo!("phase-b: CallInfo::is_vararg_func") }
     pub fn saved_pc(&self) -> u32 {

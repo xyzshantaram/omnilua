@@ -757,6 +757,11 @@ fn prep_call_info(
         ci.nresults = nret as i16;
         ci.callstatus = mask;
         ci.top = top_idx;
+        ci.u = if (mask & crate::state::CIST_C) != 0 {
+            crate::state::CallInfoFrame::c_default()
+        } else {
+            crate::state::CallInfoFrame::lua_default()
+        };
     }
     Ok(ci_idx)
 }
