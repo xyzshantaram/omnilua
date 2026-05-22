@@ -93,11 +93,11 @@ st=	false
 msg=	stdin:43: @x123
 stack traceback:
 	[C]: in function 'error'
-	stdin:43: in function <:-1>
-	stdin:44: in function <:-1>
+	stdin:43: in metamethod 'close'
+	stdin:44: in function <stdin:42>
 	[C]: in function 'xpcall'
-	stdin:46: in function <:-1>
+	stdin:46: in main chunk
 [DBG] collect_via_heap: force=false snapshot.len=0
 match1=	stdin:43: @x123
-find2=	nil
+find2=	71	91
 [ok] execution completed, status=Ok

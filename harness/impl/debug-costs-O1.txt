@@ -2,3 +2,4 @@
 4 [2026-05-18T18:38:01Z mega]   → committed 71b48a8 (debug/reference/lua-c/testes/errors.lua )
 8.005384349999998 reference/lua-c/testes/errors.lua [sonnet]
 3 1.8957129999999998 reference/lua-c/testes/strings.lua [sonnet]
+5 1.1403303999999999 reference/lua-c/testes/files.lua [sonnet]

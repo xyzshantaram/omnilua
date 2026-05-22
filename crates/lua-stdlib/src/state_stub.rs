@@ -1130,7 +1130,7 @@ impl LuaStateStubExt for LuaState {
         let mut lvm_ar = lua_vm::debug::LuaDebug::default();
         lvm_ar.i_ci = ar.i_ci_idx;
         let ok = lua_vm::debug::get_info(self, what, &mut lvm_ar);
-        copy_lvm_debug_to_stub(&lvm_ar, ar);
+        copy_lvm_debug_to_stub_selective(&lvm_ar, ar, what);
         if ok {
             Ok(())
         } else {
@@ -1296,32 +1296,60 @@ impl LuaStateStubExt for LuaState {
 /// the Phase-B stub `LuaDebug`. The two structs diverge on a few field types
 /// (e.g. `what` is a single byte tag in the stub vs. `Option<&'static [u8]>`
 /// in the canonical struct, `short_src` is `Vec<u8>` vs. fixed array).
-fn copy_lvm_debug_to_stub(src: &lua_vm::debug::LuaDebug, dst: &mut LuaDebug) {
-    dst.name = src.name.clone();
-    dst.namewhat = src.namewhat.map(|s| s.to_vec()).unwrap_or_default();
-    dst.what = match src.what {
-        Some(b"Lua") => b'L',
-        Some(b"C") => b'C',
-        Some(b"main") => b'm',
-        _ => 0,
-    };
-    dst.source = src.source.clone().unwrap_or_default();
-    let zero = src
-        .short_src
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(src.short_src.len());
-    dst.short_src = src.short_src[..zero].to_vec();
-    dst.linedefined = src.linedefined;
-    dst.lastlinedefined = src.lastlinedefined;
-    dst.currentline = src.currentline;
-    dst.nups = src.nups;
-    dst.nparams = src.nparams;
-    dst.isvararg = src.isvararg;
-    dst.istailcall = src.istailcall;
-    dst.ftransfer = src.ftransfer;
-    dst.ntransfer = src.ntransfer;
+/// Copy only the fields that `lua_getinfo`'s `what` string actually populates
+/// in C. Mirrors `auxgetinfo` in `ldebug.c`: each option byte writes a disjoint
+/// subset of `lua_Debug`. Calling `get_info` with one option string must not
+/// clobber fields populated by an earlier call with a different option string
+/// (a pattern the auxiliary library relies on — `pushglobalfuncname` calls
+/// `lua_getinfo(L, "f", ar)` and expects the previously-set `namewhat`/`what`/
+/// `short_src`/`linedefined` to survive).
+fn copy_lvm_debug_to_stub_selective(
+    src: &lua_vm::debug::LuaDebug,
+    dst: &mut LuaDebug,
+    what: &[u8],
+) {
     dst.i_ci_idx = src.i_ci;
+    for &ch in what {
+        match ch {
+            b'S' => {
+                dst.what = match src.what {
+                    Some(b"Lua") => b'L',
+                    Some(b"C") => b'C',
+                    Some(b"main") => b'm',
+                    _ => 0,
+                };
+                dst.source = src.source.clone().unwrap_or_default();
+                let zero = src
+                    .short_src
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(src.short_src.len());
+                dst.short_src = src.short_src[..zero].to_vec();
+                dst.linedefined = src.linedefined;
+                dst.lastlinedefined = src.lastlinedefined;
+            }
+            b'l' => {
+                dst.currentline = src.currentline;
+            }
+            b'u' => {
+                dst.nups = src.nups;
+                dst.nparams = src.nparams;
+                dst.isvararg = src.isvararg;
+            }
+            b't' => {
+                dst.istailcall = src.istailcall;
+            }
+            b'n' => {
+                dst.name = src.name.clone();
+                dst.namewhat = src.namewhat.map(|s| s.to_vec()).unwrap_or_default();
+            }
+            b'r' => {
+                dst.ftransfer = src.ftransfer;
+                dst.ntransfer = src.ntransfer;
+            }
+            _ => {}
+        }
+    }
 }
 
 const STUB_LUA_REGISTRYINDEX: i32 = -(1_000_000) - 1000;
