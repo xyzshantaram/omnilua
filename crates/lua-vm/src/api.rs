@@ -397,6 +397,22 @@ impl LuaState {
         Ok(())
     }
 
+    /// Create a new empty table presized to hold every entry in `funcs`, and
+    /// leave it on top of the stack. No registration is performed — callers
+    /// typically follow up with `set_funcs` / `set_funcs_with_upvalues` to
+    /// populate the table.
+    ///
+    /// C: `luaL_newlibtable(L, l)` =
+    ///   `lua_createtable(L, 0, sizeof(l)/sizeof((l)[0]) - 1)`. The C macro's
+    /// `- 1` discounts the sentinel `{NULL, NULL}` entry; the Rust slice has
+    /// no sentinel, so we use `funcs.len()` directly.
+    pub fn new_lib_table(
+        &mut self,
+        funcs: &[(&[u8], LuaCFunction)],
+    ) -> Result<(), LuaError> {
+        create_table(self, 0, funcs.len() as i32)
+    }
+
     /// Register each entry in `funcs` as a C closure on the table at index
     /// `-(nup + 2)`, sharing the `nup` values currently on top of the stack
     /// as upvalues. The upvalues are popped at the end.
