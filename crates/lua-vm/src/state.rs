@@ -1064,9 +1064,9 @@ impl LuaState {
         let _i: StackIdx = idx.into().0;
         todo!("phase-b: get_at")
     }
-    pub fn set_at(&mut self, idx: impl Into<StackIdxConv>, _v: LuaValue) {
-        let _i: StackIdx = idx.into().0;
-        todo!("phase-b: set_at")
+    pub fn set_at(&mut self, idx: impl Into<StackIdxConv>, v: LuaValue) {
+        let i: StackIdx = idx.into().0;
+        self.stack[i.0 as usize].val = v;
     }
     pub fn set_top(&mut self, idx: impl Into<StackIdxConv>) {
         let _i: StackIdx = idx.into().0;
