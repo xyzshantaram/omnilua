@@ -88,3 +88,6 @@
 {"ts":"2026-05-16T14:38:09Z","action":"dispatch_done","detail":"func=set_top cost=0.6518072499999998","total_cost":0.00}
 {"ts":"2026-05-16T14:38:09Z","action":"panic_detected","detail":"func=adjust_results iter=5","total_cost":0.00}
 {"ts":"2026-05-16T14:38:09Z","action":"dispatch_start","detail":"func=adjust_results loc=crates/lua-vm/src/state.rs:1230:56 iter=5","total_cost":0.00}
+{"ts":"2026-05-16T14:39:13Z","action":"dispatch_done","detail":"func=adjust_results cost=0.5866065","total_cost":0.00}
+{"ts":"2026-05-16T14:39:13Z","action":"panic_detected","detail":"func=remove iter=6","total_cost":0.00}
+{"ts":"2026-05-16T14:39:13Z","action":"dispatch_start","detail":"func=remove loc=crates/lua-stdlib/src/state_stub.rs:109:62 iter=6","total_cost":0.00}

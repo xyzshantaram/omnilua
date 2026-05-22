@@ -330,6 +330,11 @@ impl LuaStateStubExt for LuaState {
     fn call(&mut self, nargs: i32, nresults: i32) -> Result<(), LuaError> {
         lua_vm::api::call_k(self, nargs, nresults, 0, None)
     }
+
+    fn remove(&mut self, idx: i32) -> Result<(), LuaError> {
+        lua_vm::api::rotate(self, idx, -1);
+        lua_vm::api::set_top(self, -2)
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
