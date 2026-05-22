@@ -172,17 +172,24 @@ Use the Translator subagent (.claude/agents/translator.md). When done, stop — 
     local out_json="$RESULTS_DIR/$basename.translator.json"
     local hooks_log="$RESULTS_DIR/$basename.hooks.log"
 
-    # Invocation: --bare for determinism, explicit settings/agents, JSON output,
-    # cost cap, turn cap, permission-mode dontAsk to fail-fast on unallowed tools.
-    claude -p --bare \
-        --settings .claude/settings.json \
-        --agents '@.claude/agents/translator.md' \
-        --append-system-prompt-file PORTING.md \
+    # Invocation. Notes:
+    # - NO --bare: that flag refuses OAuth/keychain auth (API-key only), which
+    #   would block us from using the subscription. See `claude --help`.
+    # - --agent (singular) selects an autodiscovered subagent by name.
+    # - --append-system-prompt takes the prompt as a string, not a file path.
+    # - --settings and --agents-file equivalents are NOT needed because, without
+    #   --bare, the CLI auto-discovers .claude/{settings.json,agents/} from cwd.
+    # - --max-turns doesn't exist in this CLI version; --max-budget-usd is the
+    #   effective bound on how long a single invocation can run.
+    local porting_md
+    porting_md="$(cat PORTING.md)"
+    claude -p \
+        --agent translator \
+        --append-system-prompt "$porting_md" \
         --allowedTools "Read,Write,Edit,Glob,Grep,Bash(cargo check*)" \
         --permission-mode dontAsk \
         --output-format json \
         --max-budget-usd 2.00 \
-        --max-turns 12 \
         "$prompt" \
         > "$out_json" 2>&1 || true
 
