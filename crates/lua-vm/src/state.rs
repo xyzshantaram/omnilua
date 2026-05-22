@@ -1746,7 +1746,12 @@ impl LuaState {
         let ename = self.global().tmname[tm as usize].clone();
         mt.get_short_str(&ename)
     }
-    pub fn fast_tm_ud<U, T>(&mut self, _u: U, _tm: T) -> LuaValue { todo!("phase-b: fast_tm_ud") }
+    pub fn fast_tm_ud(&mut self, u: &GcRef<LuaUserData>, tm: TagMethod) -> LuaValue {
+        // C: fasttm(L, uvalue(o)->metatable, event) — read the userdata's
+        // metatable then index by the interned `__xxx` name.
+        let mt = u.metatable();
+        self.fast_tm_table(mt.as_ref(), tm)
+    }
 
     pub fn table_get_with_tm(&mut self, t: &LuaValue, k: &LuaValue) -> Result<LuaValue, LuaError> {
         if let Some(v) = self.fast_get(t, k)? {
