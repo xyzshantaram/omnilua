@@ -586,6 +586,15 @@ pub struct GlobalState {
     // types.tsv: global_State.l_registry → LuaValue
     pub l_registry: LuaValue,
 
+    // PORT NOTE (phase-b-reconcile): The lua-types LuaTable placeholder has
+    // no storage, so we cannot persist `registry[LUA_RIDX_GLOBALS] = globals`
+    // via the canonical registry path. Until the placeholder reconciles with
+    // lua-vm::table::LuaTable, the globals table lives in a direct field
+    // and `get_global_table` reads it from here. Same for `loaded` (the
+    // module cache normally at `registry[_LOADED]`).
+    pub globals: LuaValue,
+    pub loaded: LuaValue,
+
     // C: TValue nilvalue — nil sentinel; non-nil signals state not yet fully built
     // types.tsv: global_State.nilvalue → LuaValue
     // PORT NOTE: In Rust we use a dedicated `is_complete: bool` flag rather than
@@ -1795,13 +1804,16 @@ fn init_registry(state: &mut LuaState) -> Result<(), LuaError> {
     // TODO(port): set registry[LUA_RIDX_MAINTHREAD - 1] = LuaValue::Thread(main_thread_gcref)
 
     // C: sethvalue(L, &registry->array[LUA_RIDX_GLOBALS - 1], luaH_new(L));
-    // macros.tsv: sethvalue → *o = LuaValue::Table(x.clone())
+    // PORT NOTE (phase-b-reconcile): The lua-types LuaTable placeholder is
+    // storage-less, so we can't actually persist the globals table inside
+    // the registry via array_set. Store it in a direct GlobalState field
+    // and patch get_global_table to read it from there. Symmetric for the
+    // _LOADED module cache. Once the LuaTable placeholder reconciles, the
+    // canonical registry storage takes over and these fields disappear.
     let globals = state.new_table();
-    // TODO(port): table array access requires &mut LuaTable through GcRef (Rc).
-    // Needs RefCell<LuaTable> to mutate through an Rc. Phase B redesign.
-    // For Phase A: stub with a direct push approach.
-    // registry.borrow_mut().array_set(LUA_RIDX_GLOBALS - 1, LuaValue::Table(globals));
-    let _ = globals; // consumed above in the conceptual set; TODO(port) as above
+    state.global_mut().globals = LuaValue::Table(globals);
+    let loaded = state.new_table();
+    state.global_mut().loaded = LuaValue::Table(loaded);
 
     Ok(())
 }
@@ -2220,6 +2232,8 @@ pub fn new_state() -> Option<LuaState> {
         lastatomic: 0,
         strt: StringPool::default(),
         l_registry: LuaValue::Nil,
+        globals: LuaValue::Nil,
+        loaded: LuaValue::Nil,
         // C: setivalue(&g->nilvalue, 0); — non-Nil = incomplete
         nilvalue: LuaValue::Int(0),
         // C: g->seed = luai_makeseed(L);

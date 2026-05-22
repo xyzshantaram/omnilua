@@ -718,8 +718,12 @@ fn aux_get_str(state: &mut LuaState, t: LuaValue, k: &[u8]) -> Result<LuaType, L
 
 // C: #define getGtable(L)  (&hvalue(&G(L)->l_registry)->array[LUA_RIDX_GLOBALS - 1])
 fn get_global_table(state: &LuaState) -> LuaValue {
-    // C: the global table is stored in the registry at index LUA_RIDX_GLOBALS.
-    state.registry_get(LUA_RIDX_GLOBALS as usize)
+    // PORT NOTE (phase-b-reconcile): The lua-types LuaTable placeholder has
+    // no storage, so we cannot fetch the globals table from the registry's
+    // array slot. init_registry now stashes globals in a direct
+    // GlobalState field; read it from there until the LuaTable placeholder
+    // reconciles with lua-vm::table::LuaTable.
+    state.global().globals.clone()
 }
 
 // C: LUA_API int lua_getglobal (lua_State *L, const char *name)

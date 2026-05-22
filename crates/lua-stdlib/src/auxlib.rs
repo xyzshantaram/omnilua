@@ -1245,17 +1245,13 @@ pub fn get_subtable(
     idx: i32,
     fname: &[u8],
 ) -> Result<bool, LuaError> {
-    // C: if (lua_getfield(L, idx, fname) == LUA_TTABLE) return 1;
     if state.get_field(idx, fname)? == LuaType::Table {
         return Ok(true);
     }
-    // C: lua_pop(L, 1);
     state.pop_n(1);
     let idx = state.abs_index(idx);
-    // C: lua_newtable(L);
     let new_tbl = state.new_table();
     state.push(LuaValue::Table(new_tbl));
-    // C: lua_pushvalue(L, -1); lua_setfield(L, idx, fname);
     state.push_value(-1)?;
     state.set_field(idx, fname)?;
     Ok(false)
@@ -1272,25 +1268,16 @@ pub fn requiref(
     openf: fn(&mut LuaState) -> Result<usize, LuaError>,
     glb: bool,
 ) -> Result<(), LuaError> {
-    // C: luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
     get_subtable(state, LUA_REGISTRYINDEX, LUA_LOADED_TABLE)?;
-    // C: lua_getfield(L, -1, modname);
     state.get_field(-1, modname)?;
-    // C: if (!lua_toboolean(L, -1))
     if !state.to_boolean(-1) {
-        // C: lua_pop(L, 1);
         state.pop_n(1);
-        // C: lua_pushcfunction(L, openf);
         state.push_c_function(openf)?;
-        // C: lua_pushstring(L, modname);
         state.push_bytes(modname)?;
-        // C: lua_call(L, 1, 1);
         state.call(1, 1)?;
-        // C: lua_pushvalue(L, -1); lua_setfield(L, -3, modname);
         state.push_value(-1)?;
         state.set_field(-3, modname)?;
     }
-    // C: lua_remove(L, -2);
     state.remove(-2)?;
     if glb {
         // C: lua_pushvalue(L, -1); lua_setglobal(L, modname);
