@@ -181,7 +181,11 @@ pub trait LuaStateStubExt {
     fn load_buffer_ex<M: ?Sized>(&mut self, buf: &[u8], name: &[u8], mode: &M) -> Result<bool, LuaError> { todo!("phase-b-reconcile: load_buffer_ex") }
     fn load_file(&mut self, path: Option<&[u8]>) -> Result<bool, LuaError> { todo!("phase-b-reconcile: load_file") }
     fn load_file_ex(&mut self, path: Option<&[u8]>, mode: Option<&[u8]>) -> Result<bool, LuaError> { todo!("phase-b-reconcile: load_file_ex") }
-    fn load_with_reader<F, M: ?Sized>(&mut self, reader: F, name: &[u8], mode: &M) -> Result<bool, LuaError> { todo!("phase-b-reconcile: load_with_reader") }
+    fn load_with_reader<F, M: ?Sized>(&mut self, reader: F, name: &[u8], mode: &M) -> Result<bool, LuaError>
+    where
+        F: FnMut(&mut LuaState) -> Result<Option<Vec<u8>>, LuaError>,
+        M: AsRef<[u8]>,
+    { let _ = (reader, name, mode); todo!("phase-b-reconcile: load_with_reader") }
     fn dump_function(&mut self, strip: bool) -> Result<Vec<u8>, LuaError> { todo!("phase-b-reconcile: dump_function") }
 
     fn warning(&mut self, msg: &[u8], to_cont: bool) -> Result<(), LuaError> { todo!("phase-b-reconcile: warning") }
@@ -1167,6 +1171,93 @@ impl LuaStateStubExt for LuaState {
     fn join_upvalues(&mut self, fidx1: i32, n1: i32, fidx2: i32, n2: i32) -> Result<(), LuaError> {
         lua_vm::api::upvalue_join(self, fidx1, n1, fidx2, n2);
         Ok(())
+    }
+
+    /// Pre-collect the chunks supplied by `reader` (a state-aware callback)
+    /// and forward the accumulated buffer to `lua_vm::api::load`. The streaming
+    /// loader in `lua_vm::api::load` consumes a `Box<dyn FnMut() -> Option<Vec<u8>>>`
+    /// that does not take a `&mut LuaState`, so the state-touching reader
+    /// (e.g. `generic_reader`, which calls a Lua function to produce each
+    /// chunk) is drained first. C-Lua streams chunks directly through
+    /// `lua_load`; the materialised path here is observable only for very
+    /// large source files and is intentional for the Phase-B shim.
+    fn load_with_reader<F, M: ?Sized>(&mut self, mut reader: F, name: &[u8], mode: &M) -> Result<bool, LuaError>
+    where
+        F: FnMut(&mut LuaState) -> Result<Option<Vec<u8>>, LuaError>,
+        M: AsRef<[u8]>,
+    {
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            match reader(self)? {
+                None => break,
+                Some(piece) => {
+                    if piece.is_empty() {
+                        break;
+                    }
+                    buf.extend_from_slice(&piece);
+                }
+            }
+        }
+        let mut once = Some(buf);
+        let boxed: Box<dyn FnMut() -> Option<Vec<u8>>> = Box::new(move || once.take());
+        let mode_bytes = mode.as_ref();
+        let status = lua_vm::api::load(self, boxed, Some(name), Some(mode_bytes))?;
+        Ok(status == LuaStatus::Ok)
+    }
+
+    fn load_file_ex(&mut self, path: Option<&[u8]>, mode: Option<&[u8]>) -> Result<bool, LuaError> {
+        let status = crate::auxlib::load_filex(self, path, mode)?;
+        Ok(status == 0)
+    }
+
+    fn load_file(&mut self, path: Option<&[u8]>) -> Result<bool, LuaError> {
+        LuaStateStubExt::load_file_ex(self, path, None)
+    }
+
+    fn get_iuservalue(&mut self, idx: i32, n: i32) -> Result<LuaType, LuaError> {
+        Ok(lua_vm::api::get_i_uservalue(self, idx, n))
+    }
+
+    fn set_iuservalue(&mut self, idx: i32, n: i32) -> Result<bool, LuaError> {
+        lua_vm::api::set_i_uservalue(self, idx, n)
+    }
+
+    fn get_hook_mask(&mut self) -> u32 {
+        lua_vm::debug::get_hook_mask(self) as u32
+    }
+
+    fn get_hook_count(&mut self) -> i32 {
+        lua_vm::debug::get_hook_count(self)
+    }
+
+    /// Approximate "is a debug hook installed?" using the hook event mask.
+    /// `lua_sethook` clears the mask whenever the hook is uninstalled, so a
+    /// non-zero mask is equivalent to a non-NULL `L->hook` for the
+    /// `debug.gethook` call site. Avoids invoking `state.hook()`, which is
+    /// still a Phase-B `todo!` on `LuaState`.
+    fn hook_is_set(&mut self) -> bool {
+        lua_vm::debug::get_hook_mask(self) != 0
+    }
+
+    /// The port has no internal Lua-managed hook trampoline yet — any
+    /// installed hook is treated as external. Mirrors what `debug.gethook`
+    /// reports when the user installs their own `lua_Hook`.
+    fn hook_is_internal_lua_hook(&mut self) -> bool {
+        false
+    }
+
+    fn set_c_stack_limit(&mut self, limit: i32) -> Result<i32, LuaError> {
+        let clamped = if limit < 0 { 0u32 } else { limit as u32 };
+        Ok(lua_vm::state::set_c_stack_limit(self, clamped))
+    }
+
+    /// `lua_close(L)` destroys a Lua state. In Rust the state's resources are
+    /// released by `Drop` when the owning value goes out of scope, so the
+    /// in-place `&mut self` form is a no-op. The consuming free function
+    /// `lua_vm::state::close(state)` is reserved for the top-level shutdown
+    /// path in `lua-cli`.
+    fn close(&mut self) {
+        let _ = self;
     }
 }
 

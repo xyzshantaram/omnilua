@@ -838,3 +838,14 @@
 [2026-05-18T05:56:25Z mega]   skip stuck prog (same sig 2 rounds: [err] pcall_k failed: Runtime: 234: assertion failed!): reference/lua-c/testes/constructs.lua
 [2026-05-18T05:58:17Z mega]   [O7.D5] DEBUG dispatch on file: reference/lua-c/testes/nextvar.lua [parallel]
 [2026-05-18T06:03:42Z mega]   → committed 4e234ae (debug/reference/lua-c/testes/gc.lua )
+[2026-05-18T06:06:22Z mega]   [O7.D4] DEBUG done. iter cost=$0.7598192500000002  total=$48.8190
+[2026-05-18T06:06:22Z mega]   [O7.D5] DEBUG done. iter cost=$0.42539250000000006  total=$49.2444
+[2026-05-18T06:06:22Z mega]   [O7.D2] DEBUG done. iter cost=$1.9200854999999994  total=$51.1645
+[2026-05-18T06:06:22Z mega]   [O7.D1] DEBUG done. iter cost=$[2026-05-18T06:03:42Z  total=$51.1645
+[2026-05-18T06:06:22Z mega]   [O7.D2.23403275] DEBUG done. iter cost=$reference/lua-c/testes/gc.lua  total=$51.1645
+[2026-05-18T06:06:22Z mega]   [O7.D3] DEBUG done. iter cost=$4.06634875  total=$55.2308
+[2026-05-18T06:06:22Z mega] ─── outer round 8 (spent: $55.2308) ───
+[2026-05-18T06:06:25Z mega]   scan: 66/79 programs pass cleanly
+[2026-05-18T06:06:26Z mega]   surface scan returned 1 unique stub blockers
+[2026-05-18T06:06:26Z mega]   grouped into 1 disjoint-file agents (parallel cap 4)
+[2026-05-18T06:06:26Z mega]   [O8.1] dispatch on 'load_with_reader' @ crates/lua-stdlib/src/state_stub.rs:184:112 (budget $10) [parallel]

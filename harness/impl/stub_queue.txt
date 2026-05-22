@@ -1,1 +1,1 @@
-trace LuaValue — match each GC-bearing variant (Str, Table, Function, UserData, Thread) and mark via m.mark or field.trace	crates/lua-types/src/trace_impls.rs:19:9
+load_with_reader	crates/lua-stdlib/src/state_stub.rs:184:112
