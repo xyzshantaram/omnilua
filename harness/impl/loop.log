@@ -101,3 +101,7 @@ note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 [2026-05-16T14:22:18Z] ─── iter 14  (spent: $0.00) ───
 [2026-05-16T14:22:18Z]   blocked on: to_boolean
 [2026-05-16T14:22:18Z]   dispatching agent for to_boolean (budget $10)
+[2026-05-16T14:22:51Z]   agent done. iter cost=$0.4096762499999999  total=$0.00
+[2026-05-16T14:22:51Z] ─── iter 15  (spent: $0.00) ───
+[2026-05-16T14:22:51Z]   blocked on: push_c_function
+[2026-05-16T14:22:51Z]   dispatching agent for push_c_function (budget $10)

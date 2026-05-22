@@ -58,3 +58,6 @@
 {"ts":"2026-05-16T14:22:18Z","action":"dispatch_done","detail":"func=LuaTable::raw_set cost=0.58492175","total_cost":0.00}
 {"ts":"2026-05-16T14:22:18Z","action":"panic_detected","detail":"func=to_boolean iter=14","total_cost":0.00}
 {"ts":"2026-05-16T14:22:18Z","action":"dispatch_start","detail":"func=to_boolean iter=14","total_cost":0.00}
+{"ts":"2026-05-16T14:22:51Z","action":"dispatch_done","detail":"func=to_boolean cost=0.4096762499999999","total_cost":0.00}
+{"ts":"2026-05-16T14:22:51Z","action":"panic_detected","detail":"func=push_c_function iter=15","total_cost":0.00}
+{"ts":"2026-05-16T14:22:51Z","action":"dispatch_start","detail":"func=push_c_function iter=15","total_cost":0.00}

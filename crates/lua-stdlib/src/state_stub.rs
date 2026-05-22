@@ -19,6 +19,7 @@
 
 use lua_types::{
     arith::ArithOp,
+    closure::{LuaCFnPtr, LuaClosure},
     error::LuaError,
     gc::GcRef,
     string::LuaString,
@@ -312,6 +313,13 @@ impl LuaStateStubExt for LuaState {
 
     fn to_boolean(&mut self, idx: i32) -> bool {
         lua_vm::api::to_boolean(self, idx)
+    }
+
+    fn push_c_function(&mut self, _f: lua_CFunction) -> Result<(), LuaError> {
+        fn lightc_phase_b_placeholder() -> i32 { 0 }
+        let placeholder: LuaCFnPtr = lightc_phase_b_placeholder;
+        self.push(LuaValue::Function(LuaClosure::LightC(placeholder)));
+        Ok(())
     }
 }
 
