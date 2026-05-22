@@ -85,3 +85,7 @@ note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 [2026-05-16T14:14:28Z] ─── iter 10  (spent: $0.00) ───
 [2026-05-16T14:14:28Z]   blocked on: set_field
 [2026-05-16T14:14:28Z]   dispatching agent for set_field (budget $10)
+[2026-05-16T14:15:24Z]   agent done. iter cost=$0.5875934999999998  total=$0.00
+[2026-05-16T14:15:24Z] ─── iter 11  (spent: $0.00) ───
+[2026-05-16T14:15:24Z]   blocked on: table_set_with_tm
+[2026-05-16T14:15:24Z]   dispatching agent for table_set_with_tm (budget $10)

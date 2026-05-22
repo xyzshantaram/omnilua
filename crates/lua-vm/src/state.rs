@@ -1221,7 +1221,14 @@ impl LuaState {
         self.pop();
         Ok(value)
     }
-    pub fn table_set_with_tm(&mut self, _t: &LuaValue, _k: LuaValue, _v: LuaValue) -> Result<(), LuaError> { todo!("phase-b: table_set_with_tm") }
+    pub fn table_set_with_tm(&mut self, t: &LuaValue, k: LuaValue, v: LuaValue) -> Result<(), LuaError> {
+        if self.fast_get(t, &k)?.is_some() {
+            self.table_raw_set(t, k, v.clone())?;
+            self.gc_barrier_back(t, &v);
+            return Ok(());
+        }
+        crate::vm::finish_set(self, t.clone(), k, v, true)
+    }
     pub fn table_raw_set<T, K>(&mut self, _t: T, _k: K, _v: LuaValue) -> Result<(), LuaError> { todo!("phase-b: table_raw_set") }
     pub fn table_array_set<T>(&mut self, _t: T, _idx: usize, _v: LuaValue) -> Result<(), LuaError> { todo!("phase-b: table_array_set") }
     pub fn table_ensure_array<T>(&mut self, _t: T, _n: usize) -> Result<(), LuaError> { todo!("phase-b: table_ensure_array") }
