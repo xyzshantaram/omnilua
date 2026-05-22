@@ -9,11 +9,27 @@
 //! own `trace` method.
 
 use lua_gc::{Marker, Trace};
+use crate::gc::GcRef;
 use crate::value::{LuaValue, LuaTable};
 use crate::upval::{UpVal, UpValState};
 use crate::string::LuaString;
 use crate::proto::LuaProto;
 use crate::closure::{LuaClosure, LuaLClosure};
+
+/// Cycle-breaking forwarder for the Phase A-D-0 `GcRef<T>` (an `Rc<T>`
+/// newtype). Real `Gc<T>` defers tracing through the gray queue, which is
+/// inherently cycle-safe; until the runtime fully transitions, recursive
+/// `Trace` impls would otherwise blow the Rust call stack on self-referential
+/// graphs (the global table is reachable from itself via `_G._G == _G`).
+/// Every `gc_ref.trace(m)` site dispatches through this impl, so registering
+/// the pointer identity once per collection suffices to break the loop.
+impl<T: Trace + ?Sized> Trace for GcRef<T> {
+    fn trace(&self, m: &mut Marker) {
+        if m.try_visit(self.identity()) {
+            (**self).trace(m);
+        }
+    }
+}
 
 /// LuaValue — central enum. Variants Nil/Bool/Int/Float/LightUserData carry
 /// no GC; Str/Table/Function/UserData/Thread carry collectable payloads.

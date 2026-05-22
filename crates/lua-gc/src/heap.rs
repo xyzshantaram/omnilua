@@ -272,12 +272,14 @@ impl<T> Trace for std::marker::PhantomData<T> {
 /// Holds the gray queue during a mark phase. Passed to `Trace::trace`.
 pub struct Marker {
     gray_queue: Vec<NonNull<GcBox<dyn Trace>>>,
+    visited: std::collections::HashSet<usize>,
 }
 
 impl Marker {
     fn new() -> Self {
         Self {
             gray_queue: Vec::with_capacity(256),
+            visited: std::collections::HashSet::new(),
         }
     }
 
@@ -292,6 +294,14 @@ impl Marker {
             let ptr: NonNull<GcBox<dyn Trace>> = gc.ptr;
             self.gray_queue.push(ptr);
         }
+    }
+
+    /// Record that an Rc-backed object (`GcRef<T>` in Phase A-D-0) has been
+    /// visited and return whether this is the first visit. Used by recursive
+    /// `Trace` impls to break cycles while the real `Gc<T>` gray-queue path is
+    /// not yet wired (e.g. `_G._G == _G` would otherwise infinitely recurse).
+    pub fn try_visit(&mut self, addr: usize) -> bool {
+        self.visited.insert(addr)
     }
 }
 
