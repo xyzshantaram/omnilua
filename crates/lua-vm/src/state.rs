@@ -859,7 +859,7 @@ pub struct GlobalState {
     /// once (with a yield buffer installed), collects all yielded values here,
     /// then dispenses them one per iterator call. Cleared when the iterator is
     /// exhausted. Phase E replaces this with real stackful coroutines.
-    pub wrap_iter_state: std::collections::HashMap<usize, (Vec<Vec<LuaValue>>, usize)>,
+    pub wrap_iter_state: std::collections::HashMap<usize, (Vec<Vec<LuaValue>>, usize, Option<lua_types::error::LuaError>)>,
 }
 
 impl GlobalState {

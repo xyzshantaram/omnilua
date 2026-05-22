@@ -122,6 +122,8 @@ This is the single biggest *shape* change vs. C and the most common source of bo
 
 **Recommendation: stub through Phase D; stackful via `corosensei` in Phase E.** `coroutine.lua` and `cstack.lua` are naturally bracketable.
 
+**Refined 2026-05-18 (see `docs/LUA_PHASE_E_RUNTIME_SPEC.md` Part 1):** `corosensei` is not the whole design — most Lua coroutine semantics live on the **VM stack** (`LuaState.stack`, `CallInfo`, `savedpc`), not the native Rust call stack. Phase E implements heap-backed VM-thread semantics first via a `CoroutineBackend` trait with a `VmThreadBackend` (no native switch, uses `LuaError::Yield` to unwind) and only adds a `CorosenseiBackend` later if yieldable Rust/C-call continuations require preserving native frames. `corosensei` stays confined to `lua-coro` as a replaceable backend, never leaking into `lua-vm` or `lua-stdlib`.
+
 ### 3.7 Error handling: `longjmp` → `Result<T, LuaError>`
 
 ```rust
@@ -149,50 +151,36 @@ enum UpVal {
 
 **Recommendation: the enum form.** Every read goes through a match, but it's faithful and avoids unnecessary heap allocation for hot upvalues.
 
-### 3.9 GC incremental step budget: gray-queue pop count
+### 3.9 GC incremental step budget
 
-Added 2026-05-18 after gc.lua plateau analysis.
+See `docs/LUA_PHASE_E_RUNTIME_SPEC.md` Part 2 for the binding design.
 
-`collectgarbage("step", n)` currently ignores `n` and runs a full collect. To
-match C-Lua's incremental semantics, `n` is interpreted as **the maximum
-number of gray-queue objects to drain in one call**. Concretely:
+Summary: `collectgarbage("step", n)` adds `n * 1024` bytes of debt
+(matching C-Lua's `lua_gc(L, LUA_GCSTEP, data)`). Debt is translated
+through `gcstepmul`/`gcstepsize` into a budgeted amount of incremental
+work in the form of `Heap::incremental_step_with_post_mark(budget,
+post_mark)`. The collector grows a real state machine
+(`Pause / Propagate / Atomic / Sweep / Finalize`) with heap-owned
+`Marker` state preserved across calls. Generational GC is **not** in
+this slice — it stays Phase D-3.
 
-- `Heap::step(budget: usize) -> StepStatus` drains up to `budget` entries
-  from the gray queue.
-- `StepStatus::More` if the queue is non-empty after the budget runs out;
-  `StepStatus::CycleComplete` when the queue is empty and the post-mark
-  hook + sweep have run.
-- `GcArgs::Step { data }` plumbs `data` through unchanged (defaults to a
-  module-level constant if zero).
+This supersedes an earlier (cruder) draft of §3.9 that proposed a
+gray-queue-pop budget. Defer to the spec doc.
 
-This is the cheapest budget model that lets `assert(dosteps(10) <
-dosteps(2))` pass without per-allocation byte tracking. It approximates —
-but does not match byte-for-byte — C-Lua's `g->GCstepmul * data` heuristic.
-Acceptable divergence: the test only checks an inequality, not exact counts.
+### 3.10 Dynamic library loading
 
-Generational mode (gengc.lua) remains out of scope until Phase D-3.
+See `docs/LUA_PHASE_E_RUNTIME_SPEC.md` Part 3 for the binding design.
 
-### 3.10 Dynamic library loading: hook from lua-cli
-
-Added 2026-05-18.
-
-`package.loadlib` and `require` of C extensions (`.so`/`.dylib`/`.dll`) are
-implemented via the **hook injection pattern** already used for filesystem
-access (see `file_open_hook` on `GlobalState`). Specifically:
-
-- `lua-vm/src/state.rs` declares `dlopen_hook: Option<DlopenHook>` and a
-  matching `DlopenHook` trait alias on `GlobalState`.
-- `lua-cli/src/main.rs` installs an implementation backed by the
-  [`libloading`](https://crates.io/crates/libloading) crate, which encapsulates
-  all `unsafe` FFI to `dlopen`/`LoadLibraryEx`.
-- `lua-stdlib/src/loadlib.rs:lsys_load` looks up the hook on `GlobalState`
-  and dispatches through it; when no hook is installed (embedded use),
-  returns `LIB_FAIL = "absent"` as today.
-
-This keeps `lua-stdlib` `unsafe`-free, mirrors §3.10's hook pattern with
-zero ceremony, and lets embedders disable C extension loading by simply
-not installing the hook. Estimated implementation: ~80 LOC across two
-files plus a new dep on `libloading`.
+Summary: `lua-stdlib/src/loadlib.rs` stays `unsafe`-free.
+`GlobalState` gets three optional hooks
+(`dynlib_load_hook`, `dynlib_symbol_hook`, `dynlib_unload_hook`).
+`lua-cli` installs an implementation backed by
+[`libloading`](https://crates.io/crates/libloading); all `unsafe` FFI
+to `dlopen`/`LoadLibraryEx` stays in the CLI backend. A new
+`DynamicSymbol` enum distinguishes Rust-native modules (immediately
+supported) from stock Lua C ABI modules (returns a clear "init"
+failure until a C-ABI facade exists — a separate compatibility
+project).
 
 ## 4. Phase plan
 

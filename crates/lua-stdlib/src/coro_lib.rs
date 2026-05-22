@@ -175,29 +175,37 @@ fn aux_wrap(state: &mut LuaState) -> Result<usize, LuaError> {
     };
     drop(func_val);
 
-    let maybe_next: Option<Option<Vec<LuaValue>>> = {
+    enum Dispense {
+        Batch(Vec<LuaValue>),
+        Drain(Option<LuaError>),
+    }
+
+    let maybe_next: Option<Dispense> = {
         let mut g = state.global_mut();
-        g.wrap_iter_state.get_mut(&cache_key).map(|(batches, idx)| {
+        g.wrap_iter_state.get_mut(&cache_key).map(|(batches, idx, pending_err)| {
             if *idx < batches.len() {
                 let batch = batches[*idx].clone();
                 *idx += 1;
-                Some(batch)
+                Dispense::Batch(batch)
             } else {
-                None
+                Dispense::Drain(pending_err.take())
             }
         })
     };
 
     match maybe_next {
-        Some(Some(batch)) => {
+        Some(Dispense::Batch(batch)) => {
             let n = batch.len();
             for v in batch {
                 state.push(v);
             }
             return Ok(n);
         }
-        Some(None) => {
+        Some(Dispense::Drain(pending_err)) => {
             state.global_mut().wrap_iter_state.remove(&cache_key);
+            if let Some(err) = pending_err {
+                return Err(err);
+            }
             return Ok(0);
         }
         None => {}
@@ -214,35 +222,45 @@ fn aux_wrap(state: &mut LuaState) -> Result<usize, LuaError> {
     // Use LUA_MULTRET (-1) so the function's final return values reach the stack.
     let call_result = state.call(nargs, -1);
 
-    // Collect final return values before popping the yield buffer.
-    let nret = state.get_top() as i32;
-    let final_batch: Vec<LuaValue> = (1..=nret).map(|i| state.value_at(i)).collect();
+    // If the call succeeded, capture its final return values as the closing
+    // batch.  On error we discard whatever residue is on the stack and defer
+    // the error to fire after all already-buffered yield batches have been
+    // dispensed (matches C-Lua: yields happen before the error surfaces).
+    let (mut batches, pending_err) = match call_result {
+        Ok(_) => {
+            let nret = state.get_top() as i32;
+            let final_batch: Vec<LuaValue> =
+                (1..=nret).map(|i| state.value_at(i)).collect();
+            let mut batches = state.pop_yield_buffer();
+            batches.push(final_batch);
+            (batches, None)
+        }
+        Err(e) => {
+            let batches = state.pop_yield_buffer();
+            (batches, Some(e))
+        }
+    };
 
-    // Pop yield buffer — always done, even if the call failed.
-    let mut batches = state.pop_yield_buffer();
-
-    // Propagate call errors after recovering the buffer.
-    call_result?;
-
-    // Append the function's final return values as the last batch.
-    batches.push(final_batch);
-
-    // Clear the return values off the stack; we'll push the first batch instead.
+    // Clear residual stack values; we'll push the first batch instead.
     lua_vm::api::set_top(state, 0)?;
 
     if batches.is_empty() {
+        if let Some(err) = pending_err {
+            return Err(err);
+        }
         return Ok(0);
     }
 
-    // Remove and return the first batch; save the rest for subsequent calls.
+    // Remove and return the first batch; save the rest plus any pending
+    // error for subsequent calls.
     let first = batches.remove(0);
     let first_n = first.len();
 
-    if !batches.is_empty() {
+    if !batches.is_empty() || pending_err.is_some() {
         state
             .global_mut()
             .wrap_iter_state
-            .insert(cache_key, (batches, 0));
+            .insert(cache_key, (batches, 0, pending_err));
     }
 
     for v in first {

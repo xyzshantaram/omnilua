@@ -42,13 +42,9 @@ Concretely, real Lua's `lgc.c:luaC_step` runs `singlestep()` in a loop bounded b
 
 ## Three options, ranked
 
-1. **Add gc.lua to `SKIP_TESTS` until Phase E.** Stop the bleed on opus spend. Document that whole-test "passing" is the wrong success metric for multi-layer GC tests. ★ recommended for the autonomous run.
-2. **Carve `gc.lua` into harness-visible subtests.** Each `do ... end` block in gc.lua tests one feature. Run them as separate programs so the basic ones (weak tables, finalizers, simple collection) can register as wins and only the step-budget / generational ones stay stuck.
-3. **Human-design an incremental budget model**, then let agents implement the mechanical pieces. Roughly:
-   - `Heap::step(work_budget: usize) -> StepStatus` returning {complete, more}
-   - Plumb `data` from `GcArgs::Step` through `collectgarbage("step", n)`
-   - Add `gc_stepmul` multiplier
-   1-2 days of human design + 2-3 agent runs to implement.
+1. **Add gc.lua to `SKIP_TESTS` until the budget slice lands** (current state). Stop the bleed on opus spend. Whole-test "passing" is the wrong success metric for multi-layer GC tests. ★ in effect for the autonomous run.
+2. **Carve `gc.lua` into harness-visible subtests.** Each `do ... end` block tests one feature. Run them as separate programs so the basic ones (weak tables, finalizers, simple collection) can register as wins and only the step-budget / generational ones stay stuck.
+3. **Implement the budget slice now**, then let the autonomous loop pick gc.lua back up. ★ design done — see `harness/prompts/manual/01-gc-budget.md` (a single-Opus-run prompt that should produce the slice end-to-end). Authoritative design in `docs/LUA_PHASE_E_RUNTIME_SPEC.md` Part 2.
 
 ## What past agents have tried
 
