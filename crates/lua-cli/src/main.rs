@@ -73,13 +73,23 @@ fn e_tag(e: &LuaError) -> &'static str {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("usage: {} '<lua source>'", args[0]);
-        eprintln!("example: {} 'print(\"hello\")'", args[0]);
+    let args_os: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args_os.len() < 2 {
+        let prog = args_os
+            .first()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "lua-rs".to_string());
+        eprintln!("usage: {} '<lua source>'", prog);
+        eprintln!("example: {} 'print(\"hello\")'", prog);
         return ExitCode::from(2);
     }
-    let source = args[1].as_bytes().to_vec();
+    #[cfg(unix)]
+    let source: Vec<u8> = {
+        use std::os::unix::ffi::OsStrExt;
+        args_os[1].as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let source: Vec<u8> = args_os[1].to_string_lossy().into_owned().into_bytes();
 
     eprintln!("[1/4] Creating LuaState...");
     let result = catch_unwind(AssertUnwindSafe(|| {

@@ -1930,37 +1930,19 @@ enum NumResult {
     Float(f64),
 }
 
-// TODO(port): replace with lua_vm::object::str2num(bytes) in Phase B.
-// The real implementation handles hex floats (0x1.8p+1), integer overflow, etc.
 fn str2num_stub(bytes: &[u8]) -> Option<NumResult> {
-    // Strip NUL bytes that may have been saved by the lexer
     let s = bytes.iter().position(|&b| b == 0)
         .map(|n| &bytes[..n])
         .unwrap_or(bytes);
-
-    // Attempt integer parse first (decimal and hex)
-    let as_str = std::str::from_utf8(s).ok()?;
-    let as_str = as_str.trim();
-
-    // Hex integer: 0x...
-    if let Some(hex) = as_str.strip_prefix("0x").or_else(|| as_str.strip_prefix("0X")) {
-        if let Ok(v) = i64::from_str_radix(hex, 16) {
-            return Some(NumResult::Int(v));
-        }
-        // Could be a hex float — fall through to float parse
+    let mut value = lua_types::LuaValue::Nil;
+    if lua_vm::object::str2num(s, &mut value) == 0 {
+        return None;
     }
-
-    // Decimal integer
-    if let Ok(v) = as_str.parse::<i64>() {
-        return Some(NumResult::Int(v));
+    match value {
+        lua_types::LuaValue::Int(i) => Some(NumResult::Int(i)),
+        lua_types::LuaValue::Float(f) => Some(NumResult::Float(f)),
+        _ => None,
     }
-
-    // Float (including hex float via standard parse on some platforms)
-    if let Ok(v) = as_str.parse::<f64>() {
-        return Some(NumResult::Float(v));
-    }
-
-    None
 }
 
 // TODO(port): replace with lua_vm::object::hex_value(c) in Phase B.
@@ -2016,6 +1998,7 @@ fn utf8_encode_stub(codepoint: u32) -> Vec<u8> {
 //                  LuaState defined as local stubs — Phase B replaces with real
 //                  imports once the crate graph is wired.  Key Phase B tasks:
 //                  wire import paths; move LuaString.extra accessor to pub;
-//                  implement luaX_newstring anchor-table logic; replace
-//                  str2num_stub with real number parser including hex floats.
+//                  implement luaX_newstring anchor-table logic.  Numeric
+//                  literal parsing now delegates to lua_vm::object::str2num
+//                  (handles hex integers with wrap-around and hex floats).
 // ──────────────────────────────────────────────────────────────────────────────
