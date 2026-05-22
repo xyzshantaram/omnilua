@@ -322,6 +322,10 @@ impl LuaStateStubExt for LuaState {
         lua_vm::api::to_boolean(self, idx)
     }
 
+    fn top(&mut self) -> i32 {
+        lua_vm::api::get_top(self)
+    }
+
     fn push_c_function(&mut self, f: lua_CFunction) -> Result<(), LuaError> {
         let idx: LuaCFnPtr = {
             let mut g = self.global_mut();

@@ -287,3 +287,6 @@
 {"ts":"2026-05-16T20:23:10Z","action":"dispatch_done","detail":"type=debug err=pcall_k failed: Runtime: attempt to call a nil value cost=6.457820500000001","total_cost":0.00}
 {"ts":"2026-05-16T20:23:11Z","action":"panic_detected","detail":"func=top iter=10","total_cost":0.00}
 {"ts":"2026-05-16T20:23:11Z","action":"dispatch_start","detail":"type=implement func=top iter=10","total_cost":0.00}
+{"ts":"2026-05-16T20:24:09Z","action":"dispatch_done","detail":"type=implement func=top cost=0.5421330000000001","total_cost":0.00}
+{"ts":"2026-05-16T20:24:10Z","action":"panic_detected","detail":"func=top iter=11","total_cost":0.00}
+{"ts":"2026-05-16T20:24:10Z","action":"dispatch_start","detail":"type=implement func=top iter=11","total_cost":0.00}

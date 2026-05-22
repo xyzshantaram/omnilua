@@ -345,7 +345,12 @@ impl LuaState {
 
     /// C: `lua_gettop(L)` — number of values in the active call frame
     /// (stack top minus the slot just after the frame's `func`).
-    pub fn top(&self) -> i32 {
+    ///
+    /// Receiver is `&mut self` to match the `LuaStateStubExt::top` trait
+    /// signature exactly; with a different receiver shape (`&self`), Rust's
+    /// method-resolution picks the trait default and the program panics on
+    /// `todo!("phase-b-reconcile: top")`.
+    pub fn top(&mut self) -> i32 {
         get_top(self)
     }
 
