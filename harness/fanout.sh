@@ -56,9 +56,11 @@ for tool in claude jq awk; do
 done
 
 if [ -n "$(git status --porcelain)" ]; then
-    echo "WARN: working tree not clean. fanout writes commits per file." >&2
-    echo "      Stash or commit before continuing, or pass --allow-dirty." >&2
-    if [ "${1:-}" != "--allow-dirty" ]; then
+    allow_dirty=0
+    for a in "$@"; do [ "$a" = "--allow-dirty" ] && allow_dirty=1; done
+    if [ "$allow_dirty" = "0" ]; then
+        echo "WARN: working tree not clean. fanout writes commits per file." >&2
+        echo "      Stash or commit before continuing, or pass --allow-dirty." >&2
         exit 2
     fi
 fi
