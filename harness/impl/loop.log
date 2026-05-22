@@ -496,3 +496,7 @@ help: use `let _ = ...` to ignore the expression or result
 [2026-05-16T20:04:39Z] ─── iter 6  (spent: $0.00) ───
 [2026-05-16T20:04:39Z]   stub blocker: fast_get_short_str
 [2026-05-16T20:04:39Z]   dispatching IMPLEMENT agent for fast_get_short_str at crates/lua-vm/src/state.rs:1345:102 (budget $10)
+[2026-05-16T20:06:08Z]   agent done. iter cost=$0.8011569999999999  total=$0.00
+[2026-05-16T20:06:08Z] ─── iter 7  (spent: $0.00) ───
+[2026-05-16T20:06:09Z]   real-error blocker at step 4/4 Executing chunk: pcall_k failed: Runtime: attempt to index a nil value
+[2026-05-16T20:06:09Z]   dispatching DEBUG agent for real-error (budget $15)

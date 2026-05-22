@@ -1,1 +1,1 @@
-fast_get_short_str
+pcall_k failed: Runtime: attempt to index a nil value

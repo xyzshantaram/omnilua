@@ -1374,14 +1374,22 @@ pub fn load(
         // C: if (f->nupvalues >= 1) { set global table as 1st upvalue }
         let top = state.top_idx();
         let func_val = state.get_at(top - 1);
-        if let LuaValue::Function(LuaClosure::Lua(ref lcl)) = func_val {
+        if let LuaValue::Function(LuaClosure::Lua(lcl)) = func_val {
             if !lcl.upvals.is_empty() {
                 // C: const TValue *gt = getGtable(L); setobj(L, f->upvals[0]->v.p, gt);
-                // TODO(port): setting an open upvalue's slot requires interior
-                // mutability on UpVal::Open or converting it to UpVal::Closed.
+                // PORT NOTE: GcRef<UpVal> = Rc<UpVal> has no interior mutability,
+                // and the closure's `upvals` Vec is reachable only behind a
+                // shared Rc<LuaLClosure>. Rebuild the closure here: clone the
+                // proto, swap upvals[0] for a fresh `Closed(globals)` upvalue,
+                // wrap in a new GcRef, and replace the stack slot.
                 let gt = get_global_table(state);
-                let _ = (lcl, gt);
-                // TODO(port): lcl.upvals[0].set(gt) — needs upvalue write API
+                let mut new_upvals = lcl.upvals.clone();
+                new_upvals[0] = GcRef::new(UpVal::Closed(gt));
+                let new_lcl = GcRef::new(lua_types::LuaLClosure {
+                    proto: lcl.proto.clone(),
+                    upvals: new_upvals,
+                });
+                state.set_at(top - 1, LuaValue::Function(LuaClosure::Lua(new_lcl)));
             }
         }
     }
