@@ -6,8 +6,4 @@ testing functions and calls
 +
 +
 testing tail calls
-+
-+
-testing binary chunks
-OK
-[ok] execution completed, status=Ok
+lua: pcall_k failed: Runtime: Nil
