@@ -589,10 +589,13 @@ fn f_close(state: &mut LuaState) -> Result<usize, LuaError> {
 
 /// `io.close([file])`. C: `io_close`.
 pub fn io_close(state: &mut LuaState) -> Result<usize, LuaError> {
+    eprintln!("DBG io_close enter top={} type@1={:?}", state.top(), state.type_at(1));
     // C: if (lua_isnone(L, 1)) lua_getfield(L, LUA_REGISTRYINDEX, IO_OUTPUT);
     if state.type_at(1) == LuaType::None {
         state.registry_get(IO_OUTPUT_KEY)?;
+        eprintln!("DBG io_close after reg_get top={} type@top={:?}", state.top(), state.type_at(-1));
         state.replace(1);
+        eprintln!("DBG io_close after replace top={} type@1={:?}", state.top(), state.type_at(1));
     }
     f_close(state)
 }
