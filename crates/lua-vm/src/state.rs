@@ -1406,7 +1406,9 @@ impl LuaState {
     pub fn proto_code(&mut self, cl: &GcRef<lua_types::closure::LuaLClosure>, pc: u32) -> lua_types::opcode::Instruction {
         cl.proto.code[pc as usize]
     }
-    pub fn proto_const<T, I>(&mut self, _cl: &T, _idx: I) -> LuaValue { todo!("phase-b: proto_const") }
+    pub fn proto_const(&mut self, cl: &GcRef<lua_types::closure::LuaLClosure>, idx: usize) -> LuaValue {
+        cl.proto.k[idx].clone()
+    }
     pub fn get_proto_instr<T, P>(&mut self, _ci: T, _pc: P) -> lua_types::opcode::Instruction { todo!("phase-b: get_proto_instr") }
     pub fn dump_proto(&self, _proto: &GcRef<LuaProto>, _writer: &mut dyn FnMut(&[u8]) -> Result<(), LuaError>, _strip: bool) -> Result<(), LuaError> { todo!("phase-b: dump_proto") }
 

@@ -1,1 +1,1 @@
-upvalue_get
+proto_const

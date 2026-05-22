@@ -269,3 +269,6 @@
 {"ts":"2026-05-16T20:01:31Z","action":"dispatch_done","detail":"type=implement func=ci_trap cost=0.39213875","total_cost":0.00}
 {"ts":"2026-05-16T20:01:31Z","action":"panic_detected","detail":"func=upvalue_get iter=4","total_cost":0.00}
 {"ts":"2026-05-16T20:01:31Z","action":"dispatch_start","detail":"type=implement func=upvalue_get iter=4","total_cost":0.00}
+{"ts":"2026-05-16T20:03:13Z","action":"dispatch_done","detail":"type=implement func=upvalue_get cost=0.899743","total_cost":0.00}
+{"ts":"2026-05-16T20:03:14Z","action":"panic_detected","detail":"func=proto_const iter=5","total_cost":0.00}
+{"ts":"2026-05-16T20:03:14Z","action":"dispatch_start","detail":"type=implement func=proto_const iter=5","total_cost":0.00}
