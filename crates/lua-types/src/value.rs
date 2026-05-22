@@ -314,7 +314,7 @@ impl LuaTable {
             if matches!(v, LuaValue::Nil) {
                 continue;
             }
-            if value_is_reachable(k, is_reachable) {
+            if !value_is_dead_collectable(k, is_reachable) {
                 out.push(v.clone());
             }
         }
