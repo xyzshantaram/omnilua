@@ -530,7 +530,12 @@ impl LuaState {
             Some(s) => Ok(s.as_bytes().to_vec()),
             None => {
                 let got = index_to_value(self, arg);
-                Err(LuaError::type_arg_error(arg, "string", &got))
+                let got_name = crate::tagmethods::obj_type_name(self, &got)?;
+                let extramsg = format!(
+                    "string expected, got {}",
+                    String::from_utf8_lossy(&got_name)
+                );
+                Err(crate::debug::arg_error_impl(self, arg, extramsg.as_bytes()))
             }
         }
     }
@@ -558,7 +563,12 @@ impl LuaState {
                     ))
                 } else {
                     let got = index_to_value(self, arg);
-                    Err(LuaError::type_arg_error(arg, "number", &got))
+                    let got_name = crate::tagmethods::obj_type_name(self, &got)?;
+                    let extramsg = format!(
+                        "number expected, got {}",
+                        String::from_utf8_lossy(&got_name)
+                    );
+                    Err(crate::debug::arg_error_impl(self, arg, extramsg.as_bytes()))
                 }
             }
         }
@@ -579,7 +589,12 @@ impl LuaState {
             Some(d) => Ok(d),
             None => {
                 let got = index_to_value(self, arg);
-                Err(LuaError::type_arg_error(arg, "number", &got))
+                let got_name = crate::tagmethods::obj_type_name(self, &got)?;
+                let extramsg = format!(
+                    "number expected, got {}",
+                    String::from_utf8_lossy(&got_name)
+                );
+                Err(crate::debug::arg_error_impl(self, arg, extramsg.as_bytes()))
             }
         }
     }

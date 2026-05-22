@@ -97,6 +97,53 @@ fn prefixed_runtime(state: &LuaState, msg: Vec<u8>) -> LuaError {
     runtime_bytes(prefixed)
 }
 
+pub fn c_api_runtime(state: &LuaState, msg: Vec<u8>) -> LuaError {
+    let ci_idx = state.current_ci_idx();
+    if let Some(parent_idx) = state.prev_ci(ci_idx) {
+        let parent_ci = state.get_ci(parent_idx).clone();
+        if parent_ci.is_lua() {
+            let proto = ci_lua_proto(&parent_ci, state);
+            let src = proto.source_string();
+            let line = get_current_line(&parent_ci, state);
+            let prefixed = add_info(None, &msg, src.map(|s| &**s), line);
+            return runtime_bytes(prefixed);
+        }
+    }
+    runtime_bytes(msg)
+}
+
+/// Equivalent of C `luaL_argerror`: build an arg-type error with function name
+/// (from debug info) and caller source location. Handles method calls by
+/// producing "calling 'f' on bad self ..." when arg==1 and namewhat=="method".
+pub fn arg_error_impl(state: &mut LuaState, mut arg: i32, extramsg: &[u8]) -> LuaError {
+    let mut ar = LuaDebug::default();
+    if !get_stack(state, 0, &mut ar) {
+        let msg = format!("bad argument #{} ({})", arg, String::from_utf8_lossy(extramsg));
+        return c_api_runtime(state, msg.into_bytes());
+    }
+    get_info(state, b"n", &mut ar);
+    if ar.namewhat.as_deref() == Some(b"method") {
+        arg -= 1;
+        if arg == 0 {
+            let name = ar.name.clone().unwrap_or_else(|| b"?".to_vec());
+            let msg = format!(
+                "calling '{}' on bad self ({})",
+                String::from_utf8_lossy(&name),
+                String::from_utf8_lossy(extramsg)
+            );
+            return c_api_runtime(state, msg.into_bytes());
+        }
+    }
+    let fname = ar.name.clone().unwrap_or_else(|| b"?".to_vec());
+    let msg = format!(
+        "bad argument #{} to '{}' ({})",
+        arg,
+        String::from_utf8_lossy(&fname),
+        String::from_utf8_lossy(extramsg)
+    );
+    c_api_runtime(state, msg.into_bytes())
+}
+
 /// Build a `LuaError::Runtime` from the top of the Lua stack.
 ///
 /// Pops the error value from the stack and wraps it.
@@ -1357,7 +1404,7 @@ fn typeerror_inner(
     msg.extend_from_slice(b"attempt to ");
     msg.extend_from_slice(op);
     msg.extend_from_slice(b" a ");
-    msg.extend_from_slice(t);
+    msg.extend_from_slice(&t);
     msg.extend_from_slice(b" value");
     msg.extend_from_slice(extra);
     prefixed_runtime(state, msg)
@@ -1407,7 +1454,8 @@ fn obj_type_name_static(val: &LuaValue) -> &'static [u8] {
         LuaValue::Str(_) => b"string",
         LuaValue::Table(_) => b"table",
         LuaValue::Function(_) => b"function",
-        LuaValue::UserData(_) | LuaValue::LightUserData(_) => b"userdata",
+        LuaValue::UserData(_) => b"userdata",
+        LuaValue::LightUserData(_) => b"light userdata",
         LuaValue::Thread(_) => b"thread",
     }
 }
@@ -1530,15 +1578,15 @@ pub(crate) fn order_error(state: &LuaState, p1: &LuaValue, p2: &LuaValue) -> Lua
     let msg = if t1 == t2 {
         let mut m = Vec::new();
         m.extend_from_slice(b"attempt to compare two ");
-        m.extend_from_slice(t1);
+        m.extend_from_slice(&t1);
         m.extend_from_slice(b" values");
         m
     } else {
         let mut m = Vec::new();
         m.extend_from_slice(b"attempt to compare ");
-        m.extend_from_slice(t1);
+        m.extend_from_slice(&t1);
         m.extend_from_slice(b" with ");
-        m.extend_from_slice(t2);
+        m.extend_from_slice(&t2);
         m
     };
     prefixed_runtime(state, msg)

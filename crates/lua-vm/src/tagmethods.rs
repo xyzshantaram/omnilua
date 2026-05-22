@@ -337,6 +337,10 @@ pub(crate) fn obj_type_name(state: &mut LuaState, o: &LuaValue) -> Result<Vec<u8
     //        (ttisfulluserdata(o) && (mt = uvalue(o)->metatable) != NULL)) {
     //
     // TODO(port): same GcRef accessor TBD as in get_tm_by_obj.
+    // C: else if (ttislightuserdata(o)) return "light userdata"
+    if matches!(o, LuaValue::LightUserData(_)) {
+        return Ok(b"light userdata".to_vec());
+    }
     let mt: Option<GcRef<lua_types::value::LuaTable>> = match o {
         LuaValue::Table(t) => t.metatable(),
         LuaValue::UserData(u) => u.metatable(),

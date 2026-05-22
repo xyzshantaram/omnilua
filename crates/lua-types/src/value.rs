@@ -149,6 +149,17 @@ impl LuaTable {
         self.get(&key)
     }
 
+    pub fn get_str_bytes(&self, key_bytes: &[u8]) -> LuaValue {
+        for (k, v) in self.entries.borrow().iter() {
+            if let LuaValue::Str(s) = k {
+                if s.as_bytes() == key_bytes {
+                    return v.clone();
+                }
+            }
+        }
+        LuaValue::Nil
+    }
+
     /// Raw set without metamethod dispatch. nil keys are rejected (Lua
     /// semantics: `table[nil] = x` is an error; we silently ignore here
     /// since callers should validate). Setting a value to nil clears the

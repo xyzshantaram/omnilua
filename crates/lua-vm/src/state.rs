@@ -2099,8 +2099,31 @@ impl LuaState {
     pub fn is_main_thread(&mut self) -> bool {
         self.global().mainthread.is_none()
     }
-    pub fn obj_type_name(&self, v: &LuaValue) -> &'static [u8] {
-        crate::tagmethods::type_name(v.base_type())
+    pub fn obj_type_name<'v>(&self, v: &'v LuaValue) -> std::borrow::Cow<'static, [u8]> {
+        match v {
+            LuaValue::LightUserData(_) => std::borrow::Cow::Borrowed(b"light userdata"),
+            LuaValue::Table(t) => {
+                if let Some(mt) = t.metatable() {
+                    if let LuaValue::Str(s) = mt.get_str_bytes(b"__name") {
+                        return std::borrow::Cow::Owned(s.as_bytes().to_vec());
+                    }
+                }
+                std::borrow::Cow::Borrowed(crate::tagmethods::type_name(v.base_type()))
+            }
+            LuaValue::UserData(u) => {
+                if let Some(mt) = u.metatable() {
+                    if let LuaValue::Str(s) = mt.get_str_bytes(b"__name") {
+                        return std::borrow::Cow::Owned(s.as_bytes().to_vec());
+                    }
+                }
+                std::borrow::Cow::Borrowed(crate::tagmethods::type_name(v.base_type()))
+            }
+            _ => std::borrow::Cow::Borrowed(crate::tagmethods::type_name(v.base_type())),
+        }
+    }
+
+    pub fn full_type_name(&mut self, v: &LuaValue) -> Result<Vec<u8>, LuaError> {
+        crate::tagmethods::obj_type_name(self, v)
     }
     pub fn emit_warning(&mut self, _msg: &[u8], _to_cont: bool) { warning(self, _msg, _to_cont) }
 }

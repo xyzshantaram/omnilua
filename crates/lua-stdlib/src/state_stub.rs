@@ -427,7 +427,12 @@ impl LuaStateStubExt for LuaState {
                 LuaType::UserData => "userdata",
                 LuaType::Thread => "thread",
             };
-            return Err(LuaError::type_arg_error(arg, expected, &got));
+            let got_name = self.full_type_name(&got)?;
+            let extramsg = format!(
+                "{} expected, got {}",
+                expected, String::from_utf8_lossy(&got_name)
+            );
+            return Err(lua_vm::debug::arg_error_impl(self, arg, extramsg.as_bytes()));
         }
         Ok(())
     }
@@ -480,7 +485,12 @@ impl LuaStateStubExt for LuaState {
                     ))
                 } else {
                     let got = self.value_at(arg);
-                    Err(LuaError::type_arg_error(arg, "number", &got))
+                    let got_name = self.full_type_name(&got)?;
+                    let extramsg = format!(
+                        "number expected, got {}",
+                        String::from_utf8_lossy(&got_name)
+                    );
+                    Err(lua_vm::debug::arg_error_impl(self, arg, extramsg.as_bytes()))
                 }
             }
         }
@@ -491,7 +501,12 @@ impl LuaStateStubExt for LuaState {
             Some(s) => Ok(s.as_bytes().to_vec()),
             None => {
                 let got = self.value_at(arg);
-                Err(LuaError::type_arg_error(arg, "string", &got))
+                let got_name = self.full_type_name(&got)?;
+                let extramsg = format!(
+                    "string expected, got {}",
+                    String::from_utf8_lossy(&got_name)
+                );
+                Err(lua_vm::debug::arg_error_impl(self, arg, extramsg.as_bytes()))
             }
         }
     }
@@ -501,7 +516,12 @@ impl LuaStateStubExt for LuaState {
             Some(d) => Ok(d),
             None => {
                 let got = self.value_at(arg);
-                Err(LuaError::type_arg_error(arg, "number", &got))
+                let got_name = self.full_type_name(&got)?;
+                let extramsg = format!(
+                    "number expected, got {}",
+                    String::from_utf8_lossy(&got_name)
+                );
+                Err(lua_vm::debug::arg_error_impl(self, arg, extramsg.as_bytes()))
             }
         }
     }
