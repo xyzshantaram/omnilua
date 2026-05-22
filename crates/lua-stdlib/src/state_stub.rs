@@ -300,6 +300,11 @@ impl LuaStateStubExt for LuaState {
     fn abs_index(&mut self, idx: i32) -> i32 {
         lua_vm::api::abs_index(self, idx)
     }
+
+    fn push_value(&mut self, idx: i32) -> Result<(), LuaError> {
+        lua_vm::api::push_value(self, idx);
+        Ok(())
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
