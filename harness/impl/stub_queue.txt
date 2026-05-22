@@ -1,1 +1,1 @@
-trace_call	crates/lua-vm/src/state.rs:2083:81
+get_ci_pcrel	crates/lua-vm/src/state.rs:1542:64

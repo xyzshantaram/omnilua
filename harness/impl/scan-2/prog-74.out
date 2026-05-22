@@ -6,4 +6,5 @@ testing errors
 
  >>> testC not active: skipping tests for messages in C <<<
 
++
 lua: pcall_k failed: Runtime: stdin:38: assertion failed!

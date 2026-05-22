@@ -1488,10 +1488,19 @@ impl LuaState {
         }
     }
     pub fn prev_ci(&self, idx: CallInfoIdx) -> Option<CallInfoIdx> { self.call_info[idx.as_usize()].previous }
-    pub fn get_prev_ci(&self, _idx: CallInfoIdx) -> Option<&CallInfo> { todo!("phase-b: get_prev_ci") }
+    pub fn get_prev_ci(&self, idx: CallInfoIdx) -> Option<&CallInfo> {
+        self.call_info[idx.as_usize()]
+            .previous
+            .map(|p| &self.call_info[p.as_usize()])
+    }
     pub fn is_base_ci(&self, idx: CallInfoIdx) -> bool { idx.as_usize() == 0 }
     pub fn is_current_ci(&self, idx: CallInfoIdx) -> bool { idx == self.ci }
-    pub fn ci_next_func(&self, _idx: CallInfoIdx) -> StackIdx { todo!("phase-b: ci_next_func") }
+    pub fn ci_next_func(&self, idx: CallInfoIdx) -> StackIdx {
+        let next = self.call_info[idx.as_usize()]
+            .next
+            .expect("ci_next_func: no next CallInfo");
+        self.call_info[next.as_usize()].func
+    }
     pub fn ci_top(&self, idx: CallInfoIdx) -> StackIdx { self.call_info[idx.as_usize()].top }
     pub fn ci_trap(&mut self, idx: CallInfoIdx) -> bool {
         if let CallInfoFrame::Lua { trap, .. } = self.call_info[idx.as_usize()].u {
@@ -1535,11 +1544,29 @@ impl LuaState {
         self.call_info[idx.as_usize()].u2.value = n;
     }
     pub fn ci_nresults(&self, idx: CallInfoIdx) -> i32 { self.call_info[idx.as_usize()].nresults as i32 }
-    pub fn ci_prev_instruction(&self, _idx: CallInfoIdx) -> lua_types::opcode::Instruction { todo!("phase-b: ci_prev_instruction") }
-    pub fn ci_prev2_instruction(&self, _idx: CallInfoIdx) -> lua_types::opcode::Instruction { todo!("phase-b: ci_prev2_instruction") }
-    pub fn ci_skip_next_instruction(&mut self, _idx: CallInfoIdx) { todo!("phase-b: ci_skip_next_instruction") }
-    pub fn ci_step_pc_back(&mut self, _idx: CallInfoIdx) { todo!("phase-b: ci_step_pc_back") }
-    pub fn get_ci_pcrel(&mut self, _idx: CallInfoIdx) -> u32 { todo!("phase-b: get_ci_pcrel") }
+    pub fn ci_prev_instruction(&self, idx: CallInfoIdx) -> lua_types::opcode::Instruction {
+        let pc = self.call_info[idx.as_usize()].saved_pc();
+        let cl = self.ci_lua_closure(idx)
+            .expect("ci_prev_instruction: CallInfo does not hold a Lua closure");
+        cl.proto.code[(pc - 1) as usize]
+    }
+    pub fn ci_prev2_instruction(&self, idx: CallInfoIdx) -> lua_types::opcode::Instruction {
+        let pc = self.call_info[idx.as_usize()].saved_pc();
+        let cl = self.ci_lua_closure(idx)
+            .expect("ci_prev2_instruction: CallInfo does not hold a Lua closure");
+        cl.proto.code[(pc - 2) as usize]
+    }
+    pub fn ci_skip_next_instruction(&mut self, idx: CallInfoIdx) {
+        let pc = self.call_info[idx.as_usize()].saved_pc();
+        self.call_info[idx.as_usize()].set_saved_pc(pc + 1);
+    }
+    pub fn ci_step_pc_back(&mut self, idx: CallInfoIdx) {
+        let pc = self.call_info[idx.as_usize()].saved_pc();
+        self.call_info[idx.as_usize()].set_saved_pc(pc - 1);
+    }
+    pub fn get_ci_pcrel(&mut self, idx: CallInfoIdx) -> u32 {
+        self.call_info[idx.as_usize()].saved_pc().saturating_sub(1)
+    }
     pub fn get_ci_u2_funcidx(&mut self, idx: CallInfoIdx) -> i32 {
         self.call_info[idx.as_usize()].u2.value
     }
@@ -1549,8 +1576,18 @@ impl LuaState {
     pub fn get_ci_u2_nyield(&mut self, idx: CallInfoIdx) -> i32 {
         self.call_info[idx.as_usize()].u2.value
     }
-    pub fn get_ci_vararg_info(&mut self, _idx: CallInfoIdx) -> (bool, i32, i32) { todo!("phase-b: get_ci_vararg_info") }
-    pub fn get_ci_lua_proto_numparams(&mut self, _idx: CallInfoIdx) -> u8 { todo!("phase-b: get_ci_lua_proto_numparams") }
+    pub fn get_ci_vararg_info(&mut self, idx: CallInfoIdx) -> (bool, i32, i32) {
+        let nextraargs = self.call_info[idx.as_usize()].nextra_args();
+        match self.ci_lua_closure(idx) {
+            Some(cl) => (cl.proto.is_vararg, nextraargs, cl.proto.numparams as i32),
+            None => (false, nextraargs, 0),
+        }
+    }
+    pub fn get_ci_lua_proto_numparams(&mut self, idx: CallInfoIdx) -> u8 {
+        self.ci_lua_closure(idx)
+            .map(|cl| cl.proto.numparams)
+            .unwrap_or(0)
+    }
     pub fn set_ci_u2_nres(&mut self, idx: CallInfoIdx, n: i32) {
         self.call_info[idx.as_usize()].u2.value = n;
     }
