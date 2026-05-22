@@ -1386,27 +1386,29 @@ pub fn lua_yieldk(
 
     {
         let ci_top = state.call_info.len();
-        eprintln!("DEBUG lua_yieldk: stack depth={}, nresults={}", ci_top, nresults);
+        eprintln!("DEBUG lua_yieldk: call_info depth={}", ci_top);
         for idx in 0..ci_top {
             let ci = &state.call_info[idx];
-            let is_lua = ci.is_lua();
             let func_slot = ci.func.0 as usize;
-            let func_val = if func_slot < state.stack.len() {
+            let fval = if func_slot < state.stack.len() {
                 match &state.stack[func_slot].val {
                     LuaValue::Function(f) => match f {
-                        lua_types::closure::LuaClosure::LightC(i) => format!("LightC({})", i),
+                        lua_types::closure::LuaClosure::LightC(i) => format!("LightC({i})"),
                         lua_types::closure::LuaClosure::C(c) => format!("CClosure({})", c.func),
-                        lua_types::closure::LuaClosure::Lua(_) => "LuaClosure".to_string(),
+                        lua_types::closure::LuaClosure::Lua(lc) => {
+                            let src = lc.proto.source.as_deref().map(|s| String::from_utf8_lossy(s).into_owned()).unwrap_or_default();
+                            let savedpc = ci.saved_pc();
+                            let line = if savedpc > 0 && (savedpc as usize) <= lc.proto.lineinfo.len() {
+                                lc.proto.lineinfo[savedpc.saturating_sub(1) as usize] as i32
+                            } else { -1 };
+                            format!("LuaFn src='{}' savedpc={} approx_line={}", src, savedpc, line)
+                        }
                     },
-                    other => format!("{}", other.type_tag() as u8),
+                    other => format!("type={}", other.type_tag() as u8),
                 }
-            } else {
-                "(out of range)".to_string()
-            };
-            eprintln!("  ci[{}]: func_slot={}, is_lua={}, val={}", idx, func_slot, is_lua, func_val);
+            } else { "(oob)".into() };
+            eprintln!("  [{}] slot={} {}", idx, func_slot, fval);
         }
-        let n_cfuncs = state.global().c_functions.len();
-        eprintln!("  total registered c_functions: {}", n_cfuncs);
     }
 
     // C: luai_userstateyield(L, nresults) — no-op (macros.tsv)

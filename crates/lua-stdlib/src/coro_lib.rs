@@ -228,6 +228,7 @@ pub fn co_wrap(state: &mut LuaState) -> Result<usize, LuaError> {
 /// `lua_yieldk` translation, which on the main thread surfaces the C-Lua
 /// "attempt to yield from outside a coroutine" error.
 pub fn co_yield(state: &mut LuaState) -> Result<usize, LuaError> {
+    eprintln!("DEBUG co_yield called with {} args, stack top={}", state.get_top(), state.top_idx().0);
     if state.has_yield_buffer() {
         let n = state.get_top();
         for i in 1..=n {
