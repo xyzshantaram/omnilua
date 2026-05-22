@@ -5,4 +5,87 @@
 'os.tmpname' file cannot be open; skipping file tests
 +
 testing date/time
+[INSTR type_error] op=index val_type=nil
+[INSTR backtrace]
+   0: std::backtrace_rs::backtrace::libunwind::trace
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/../../backtrace/src/backtrace/libunwind.rs:117:9
+   1: std::backtrace_rs::backtrace::trace_unsynchronized
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/../../backtrace/src/backtrace/mod.rs:66:14
+   2: std::backtrace::Backtrace::create
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/backtrace.rs:331:13
+   3: lua_types::error::LuaError::type_error
+             at ./crates/lua-types/src/error.rs:48:18
+   4: lua_vm::vm::finish_get
+             at ./crates/lua-vm/src/vm.rs:595:29
+   5: lua_vm::state::LuaState::table_get_with_tm
+             at ./crates/lua-vm/src/state.rs:1827:9
+   6: lua_vm::api::aux_get_str
+   7: lua_vm::api::get_field
+             at ./crates/lua-vm/src/api.rs:1282:5
+   8: <lua_vm::state::LuaState as lua_stdlib::state_stub::LuaStateStubExt>::get_field
+             at ./crates/lua-stdlib/src/state_stub.rs:313:9
+   9: lua_stdlib::os_lib::get_field
+             at ./crates/lua-stdlib/src/os_lib.rs:169:20
+  10: lua_stdlib::os_lib::os_time
+             at ./crates/lua-stdlib/src/os_lib.rs:559:24
+  11: lua_vm::do_::precall
+             at ./crates/lua-vm/src/do_.rs:938:25
+  12: lua_vm::state::LuaState::precall
+             at ./crates/lua-vm/src/state.rs:1629:9
+  13: lua_vm::vm::execute
+             at ./crates/lua-vm/src/vm.rs:2252:37
+  14: lua_vm::do_::ccall_inner
+  15: lua_vm::do_::callnoyield
+             at ./crates/lua-vm/src/do_.rs:1045:5
+  16: lua_vm::state::LuaState::call_no_yield
+             at ./crates/lua-vm/src/state.rs:1623:9
+  17: lua_vm::state::LuaState::protected_call_raw::{{closure}}
+             at ./crates/lua-vm/src/state.rs:1591:19
+  18: lua_vm::do_::raw_run_protected
+             at ./crates/lua-vm/src/do_.rs:212:18
+  19: lua_vm::do_::pcall
+             at ./crates/lua-vm/src/do_.rs:1521:28
+  20: lua_vm::state::LuaState::protected_call_raw
+             at ./crates/lua-vm/src/state.rs:1589:22
+  21: lua_vm::api::pcall_k
+             at ./crates/lua-vm/src/api.rs:1777:11
+  22: lua_rs::main::{{closure}}
+             at ./crates/lua-cli/src/main.rs:140:28
+  23: core::ops::function::FnOnce::call_once
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/core/src/ops/function.rs:250:5
+  24: <core::panic::unwind_safe::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/core/src/panic/unwind_safe.rs:274:9
+  25: std::panicking::catch_unwind::do_call
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/panicking.rs:581:40
+  26: std::panicking::catch_unwind
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/panicking.rs:544:19
+  27: std::panic::catch_unwind
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/panic.rs:359:14
+  28: lua_rs::main
+             at ./crates/lua-cli/src/main.rs:117:18
+  29: core::ops::function::FnOnce::call_once
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/core/src/ops/function.rs:250:5
+  30: std::sys::backtrace::__rust_begin_short_backtrace
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/sys/backtrace.rs:160:18
+  31: std::rt::lang_start::{{closure}}
+  32: core::ops::function::impls::<impl core::ops::function::FnOnce<A> for &F>::call_once
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/core/src/ops/function.rs:287:21
+  33: std::panicking::catch_unwind::do_call
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/panicking.rs:581:40
+  34: std::panicking::catch_unwind
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/panicking.rs:544:19
+  35: std::panic::catch_unwind
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/panic.rs:359:14
+  36: std::rt::lang_start_internal::{{closure}}
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/rt.rs:175:24
+  37: std::panicking::catch_unwind::do_call
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/panicking.rs:581:40
+  38: std::panicking::catch_unwind
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/panicking.rs:544:19
+  39: std::panic::catch_unwind
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/panic.rs:359:14
+  40: std::rt::lang_start_internal
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/rt.rs:171:5
+  41: _main
+
 [err] pcall_k failed: Runtime: attempt to index a nil value

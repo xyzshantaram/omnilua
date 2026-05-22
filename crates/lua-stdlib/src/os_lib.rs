@@ -553,7 +553,10 @@ pub(crate) fn os_time(state: &mut LuaState) -> Result<usize, LuaError> {
         // C: luaL_checktype(L, 1, LUA_TTABLE);
         state.check_arg_type(1, LuaType::Table)?;
         // C: lua_settop(L, 1);  /* make sure table is at the top */
-        state.set_top(1);
+        // PORT NOTE: must use the public-API `set_top` (relative to the current
+        // C-frame's `func`), not `LuaState::set_top` which is an inherent that
+        // sets an absolute stack index and would truncate the entire stack.
+        lua_vm::api::set_top(state, 1)?;
 
         // C: ts.tm_year = getfield(L, "year",  -1, 1900);
         let tm_year  = get_field(state, b"year",  -1, 1900)?;
