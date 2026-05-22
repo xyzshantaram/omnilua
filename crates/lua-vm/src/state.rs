@@ -1238,7 +1238,9 @@ impl LuaState {
     pub fn upvalue_set<F, N>(&mut self, _funcindex: F, _n: N, _val: LuaValue) -> Result<(), LuaError> { todo!("phase-b: upvalue_set") }
 
     pub fn protected_call_raw(&mut self, _func: StackIdx, _nresults: i32, _errfunc: StackIdx) -> Result<(), LuaError> { todo!("phase-b: protected_call_raw") }
-    pub fn protected_parser(&mut self, _z: crate::zio::ZIO, _name: &[u8], _mode: Option<&[u8]>) -> LuaStatus { todo!("phase-b: protected_parser") }
+    pub fn protected_parser(&mut self, z: crate::zio::ZIO, name: &[u8], mode: Option<&[u8]>) -> LuaStatus {
+        crate::do_::protected_parser(self, z, name, mode)
+    }
     pub fn do_call(&mut self, _func: StackIdx, _nresults: i32) -> Result<(), LuaError> { todo!("phase-b: do_call") }
     pub fn do_call_no_yield(&mut self, _func: StackIdx, _nresults: i32) -> Result<(), LuaError> { todo!("phase-b: do_call_no_yield") }
     pub fn call_no_yield(&mut self, func: StackIdx, nresults: i32) -> Result<(), LuaError> {
