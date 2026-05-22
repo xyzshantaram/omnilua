@@ -1410,3 +1410,69 @@ warning: unused import: `UpVal`
 [2026-05-19T04:06:14Z mega]   [hard-test] reference/lua-c/testes/files.lua → opus (skip Sonnet)
 [2026-05-19T04:17:44Z mega]   → no commit (probably nothing in crates/)
 [2026-05-19T04:17:44Z mega]   → committed 5d6c26a (debug/reference/lua-c/testes/literals.lua )
+[2026-05-19T04:20:54Z mega] loaded 79 test programs (with expected outputs)
+[2026-05-19T04:20:54Z mega] ═════════════════════════════════════════════════════════════════
+[2026-05-19T04:20:54Z mega] mega-loop start. 79 test programs.
+[2026-05-19T04:20:54Z mega]   MAX_OUTER=20  MAX_PER_OUTER=25  PER_AGENT_BUDGET=$20.00  SESSION_BUDGET=$400.00
+[2026-05-19T04:20:54Z mega]   MODEL_DEFAULT=sonnet  MODEL_ESCALATE=opus
+[2026-05-19T04:20:54Z mega]   SKIP_TESTS=calls.lua,nextvar.lua,gengc.lua
+[2026-05-19T04:20:54Z mega]   HARD_TESTS=files.lua,gc.lua
+[2026-05-19T04:20:54Z mega] ═════════════════════════════════════════════════════════════════
+[2026-05-19T04:20:54Z mega] ─── outer round 1 (spent: $0) ───
+[2026-05-19T04:21:10Z mega]   scan: 72/79 programs pass cleanly
+[2026-05-19T04:21:11Z mega]   surface scan returned 0 unique stub blockers
+[2026-05-19T04:21:11Z mega]   no stub blockers — falling back to DEBUG agents on failing programs
+[2026-05-19T04:21:11Z mega]   [hard-test] reference/lua-c/testes/gc.lua → opus (skip Sonnet)
+[2026-05-19T04:21:11Z mega]   [O1.D1] DEBUG dispatch on file: reference/lua-c/testes/gc.lua [model=opus] [parallel]
+[2026-05-19T04:21:11Z mega]   skip prog (in SKIP_TESTS): reference/lua-c/testes/gengc.lua
+[2026-05-19T04:21:11Z mega]   [O1.D2] DEBUG dispatch on file: reference/lua-c/testes/literals.lua [model=sonnet] [parallel]
+[2026-05-19T04:21:11Z mega]   [O1.D3] DEBUG dispatch on file: reference/lua-c/testes/locals.lua [model=sonnet] [parallel]
+[2026-05-19T04:21:11Z mega]   skip prog (in SKIP_TESTS): reference/lua-c/testes/nextvar.lua
+[2026-05-19T04:21:11Z mega]   [hard-test] reference/lua-c/testes/files.lua → opus (skip Sonnet)
+[2026-05-19T04:39:25Z mega]   → committed ccbe31e (debug/reference/lua-c/testes/locals.lua )
+[2026-05-19T04:39:25Z mega]   [O1.D4] DEBUG dispatch on file: reference/lua-c/testes/files.lua [model=opus] [parallel]
+[2026-05-19T04:39:29Z mega]   [O1.D5] DEBUG dispatch on file: reference/lua-c/testes/errors.lua [model=sonnet] [parallel]
+[2026-05-19T04:39:32Z mega]   → committed 6cbf7a8 (debug/reference/lua-c/testes/errors.lua )
+[2026-05-19T04:43:24Z mega]   [O1.D3] DEBUG done. iter cost=$[2026-05-19T04:39:25Z  total=$0.0000
+[2026-05-19T04:43:24Z mega]   [O1.D3.31997705] DEBUG done. iter cost=$reference/lua-c/testes/locals.lua  total=$0.0000
+[2026-05-19T04:43:24Z mega]   [O1.D4] DEBUG done. iter cost=$0  total=$0.0000
+[2026-05-19T04:43:24Z mega]   [O1.D5] DEBUG done. iter cost=$[2026-05-19T04:39:32Z  total=$0.0000
+[2026-05-19T04:43:24Z mega]   [O1.D0] DEBUG done. iter cost=$reference/lua-c/testes/errors.lua  total=$0.0000
+[2026-05-19T04:43:24Z mega]   [O1.D1] DEBUG done. iter cost=$7.522402999999999  total=$7.5224
+[2026-05-19T04:43:24Z mega]   [O1.D2] DEBUG done. iter cost=$2.99542455  total=$10.5178
+[2026-05-19T04:43:24Z mega] ─── outer round 2 (spent: $10.5178) ───
+[2026-05-19T04:43:43Z mega]   scan: 72/79 programs pass cleanly
+[2026-05-19T04:43:43Z mega]   surface scan returned 0 unique stub blockers
+[2026-05-19T04:43:43Z mega]   no stub blockers — falling back to DEBUG agents on failing programs
+[2026-05-19T04:43:44Z mega]   [hard-test] reference/lua-c/testes/gc.lua → opus (skip Sonnet)
+[2026-05-19T04:43:44Z mega]   [O2.D1] DEBUG dispatch on file: reference/lua-c/testes/gc.lua [model=opus] [parallel]
+[2026-05-19T04:43:44Z mega]   skip prog (in SKIP_TESTS): reference/lua-c/testes/gengc.lua
+[2026-05-19T04:43:44Z mega]   [stuck-escalate] reference/lua-c/testes/literals.lua → opus
+[2026-05-19T04:43:44Z mega]   [O2.D2] DEBUG dispatch on file: reference/lua-c/testes/literals.lua [model=opus] [parallel]
+[2026-05-19T04:43:44Z mega]   [stuck-escalate] reference/lua-c/testes/locals.lua → opus
+[2026-05-19T04:43:44Z mega]   [O2.D3] DEBUG dispatch on file: reference/lua-c/testes/locals.lua [model=opus] [parallel]
+[2026-05-19T04:43:44Z mega]   skip prog (in SKIP_TESTS): reference/lua-c/testes/nextvar.lua
+[2026-05-19T04:43:44Z mega]   [hard-test] reference/lua-c/testes/files.lua → opus (skip Sonnet)
+[2026-05-19T04:43:46Z mega]   [O2.D4] DEBUG dispatch on file: reference/lua-c/testes/files.lua [model=opus] [parallel]
+[2026-05-19T04:43:46Z mega]   [stuck-escalate] reference/lua-c/testes/errors.lua → opus
+[2026-05-19T04:43:48Z mega]   [O2.D5] DEBUG dispatch on file: reference/lua-c/testes/errors.lua [model=opus] [parallel]
+[2026-05-19T04:43:50Z mega]   [O2.D1] DEBUG done. iter cost=$0  total=$10.5178
+[2026-05-19T04:43:50Z mega]   [O2.D3] DEBUG done. iter cost=$0  total=$10.5178
+[2026-05-19T04:43:50Z mega]   [O2.D2] DEBUG done. iter cost=$0  total=$10.5178
+[2026-05-19T04:43:50Z mega]   [O2.D4] DEBUG done. iter cost=$0  total=$10.5178
+[2026-05-19T04:43:50Z mega]   [O2.D5] DEBUG done. iter cost=$0  total=$10.5178
+[2026-05-19T04:43:50Z mega] ─── outer round 3 (spent: $10.5178) ───
+[2026-05-19T04:44:06Z mega]   scan: 72/79 programs pass cleanly
+[2026-05-19T04:44:07Z mega]   surface scan returned 0 unique stub blockers
+[2026-05-19T04:44:07Z mega]   no stub blockers — falling back to DEBUG agents on failing programs
+[2026-05-19T04:44:07Z mega]   skip stuck prog (no progress 2 rounds, sig=unknown): reference/lua-c/testes/gc.lua
+[2026-05-19T04:44:07Z mega]   skip prog (in SKIP_TESTS): reference/lua-c/testes/gengc.lua
+[2026-05-19T04:44:07Z mega]   skip stuck prog (no progress 2 rounds, sig=unknown): reference/lua-c/testes/literals.lua
+[2026-05-19T04:44:07Z mega]   skip stuck prog (no progress 2 rounds, sig=unknown): reference/lua-c/testes/locals.lua
+[2026-05-19T04:44:07Z mega]   skip prog (in SKIP_TESTS): reference/lua-c/testes/nextvar.lua
+[2026-05-19T04:44:07Z mega]   skip stuck prog (no progress 2 rounds, sig=unknown): reference/lua-c/testes/files.lua
+[2026-05-19T04:44:07Z mega]   skip stuck prog (no progress 2 rounds, sig=unknown): reference/lua-c/testes/errors.lua
+[2026-05-19T04:44:07Z mega]   no failing programs and no stubs — done.
+[2026-05-19T04:44:07Z mega] ═════════════════════════════════════════════════════════════════
+[2026-05-19T04:44:07Z mega] mega-loop end. Total cost: $10.5178  Outer rounds: 3
+[2026-05-19T04:44:07Z mega] ═════════════════════════════════════════════════════════════════

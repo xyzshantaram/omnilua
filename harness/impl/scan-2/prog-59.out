@@ -4,4 +4,4 @@
 [4/4] Executing chunk...
 testing generational garbage collection
 +
-lua: pcall_k failed: Runtime: stdin:110: attempt to call a string value (local 'f')
+lua: pcall_k failed: Runtime: stdin:99: attempt to index a nil value (upvalue 'x')
