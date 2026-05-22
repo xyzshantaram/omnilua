@@ -257,3 +257,13 @@
 [2026-05-16T21:04:47Z respawn] outer run #25 exited rc=0
 [2026-05-16T21:04:52Z respawn] outer run #26 starting (test: print(1+2))
 [2026-05-16T21:04:52Z respawn] outer run #26 exited rc=0
+[2026-05-16T21:04:57Z respawn] outer run #27 starting (test: print(1+2))
+[2026-05-16T21:04:58Z respawn] outer run #27 exited rc=0
+[2026-05-16T21:05:03Z respawn] outer run #28 starting (test: print(1+2))
+[2026-05-16T21:05:03Z respawn] outer run #28 exited rc=0
+[2026-05-16T21:05:08Z respawn] outer run #29 starting (test: print(1+2))
+[2026-05-16T21:05:09Z respawn] outer run #29 exited rc=0
+[2026-05-16T21:05:14Z respawn] outer run #30 starting (test: print(1+2))
+[2026-05-16T21:05:14Z respawn] outer run #30 exited rc=0
+[2026-05-16T21:06:00Z respawn] respawn watchdog starting. GLOBAL_CAP=$2000.00 PER_RUN_MAX_ITER=80 OUTER_MAX_RUNS=50
+[2026-05-16T21:06:00Z respawn] outer run #1 starting (test: local x = 5; print(x))

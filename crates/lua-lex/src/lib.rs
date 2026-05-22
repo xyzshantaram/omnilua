@@ -1872,20 +1872,20 @@ fn llex(
                     let ts = new_string(state, ls, &content)?;
 
                     // C: seminfo->ts = ts
-                    let is_reserved = ts.is_reserved_word();
+                    // PORT NOTE: canonical `lua_types::LuaString` lacks the `extra`
+                    // byte that C-Lua uses to mark reserved words. Recover the
+                    // keyword index directly from the interned bytes via the
+                    // `LUAX_TOKENS` table; the first `NUM_RESERVED` entries are
+                    // the keywords in declaration order, so token id =
+                    // `FIRST_RESERVED + index`.
+                    let reserved_token: Option<i32> = LUAX_TOKENS[..NUM_RESERVED]
+                        .iter()
+                        .position(|kw| *kw == content.as_slice())
+                        .map(|i| FIRST_RESERVED + i as i32);
                     *seminfo = TokenValue::Str(ts);
 
-                    if is_reserved {
-                        // C: return ts->extra - 1 + FIRST_RESERVED
-                        // macros.tsv: isreserved → ts.is_reserved_word()
-                        // TODO_ARCH(phase-b-reconcile): canonical lua_types::LuaString
-                        // does not expose `extra` (reserved-word index).  Routing
-                        // reserved-word recognition through `extra` requires either
-                        // adding an accessor to lua-types::LuaString or recovering
-                        // the index from the byte slice via a keyword table.
-                        return Err(todo!(
-                            "phase-b-reconcile: LuaString::extra accessor missing on canonical type"
-                        ));
+                    if let Some(tk) = reserved_token {
+                        return Ok(tk);
                     } else {
                         return Ok(TK_NAME);
                     }
