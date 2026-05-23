@@ -752,6 +752,46 @@ impl TableInner {
         TableSlotRef::Absent
     }
 
+    /// Read an integer key directly to a [`LuaValue`], mirroring C's
+    /// `luaH_getint`. The array-part fast path returns the slot in a
+    /// single bounds-checked load without constructing an intermediate
+    /// [`TableSlotRef`] enum; only when the key falls through to the
+    /// hash part do we walk the chain. Equivalent in observable
+    /// behaviour to `slot_value(get_int_slot(key))`.
+    #[inline]
+    fn get_int_value(&self, key: i64) -> LuaValue {
+        let alimit = self.alimit as u64;
+        let uk = key as u64;
+        if uk.wrapping_sub(1) < alimit {
+            return self.array[(key - 1) as usize].clone();
+        }
+        self.get_int_value_cold(key)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn get_int_value_cold(&self, key: i64) -> LuaValue {
+        let alimit = self.alimit as u64;
+        let uk = key as u64;
+        if !self.is_real_asize() && alimit > 0 {
+            let masked = (uk.wrapping_sub(1)) & !(alimit.wrapping_sub(1));
+            if masked < alimit {
+                return self.array[(key - 1) as usize].clone();
+            }
+        }
+        if self.is_dummy() { return LuaValue::Nil; }
+        let mut n = self.hash_idx_for_int(key);
+        loop {
+            if self.node[n].key_is_int() && self.node[n].key_int() == key {
+                return self.node[n].value.clone();
+            }
+            let nx = self.node[n].next;
+            if nx == 0 { break; }
+            n = (n as isize + nx as isize) as usize;
+        }
+        LuaValue::Nil
+    }
+
     fn get_short_str_slot(&self, key: &GcRef<LuaString>) -> TableSlotRef {
         debug_assert!(key.is_short());
         if self.is_dummy() { return TableSlotRef::Absent; }
@@ -979,18 +1019,30 @@ impl LuaTable {
     }
 
     /// Read a key. Returns `LuaValue::Nil` if absent or if `k` is nil.
+    /// Integer keys take the same direct array-part fast path used by
+    /// [`LuaTable::get_int`]; other key shapes fall through to the
+    /// generic slot lookup.
     pub fn get(&self, k: &LuaValue) -> LuaValue {
-        if matches!(k, LuaValue::Nil) { return LuaValue::Nil; }
         let inner = self.inner.borrow();
-        let slot = inner.get_slot(k);
-        inner.slot_value(slot)
+        match k {
+            LuaValue::Nil => LuaValue::Nil,
+            LuaValue::Int(i) => inner.get_int_value(*i),
+            _ => {
+                let slot = inner.get_slot(k);
+                inner.slot_value(slot)
+            }
+        }
     }
 
-    /// Read by integer key.
+    /// Read by integer key. Hot path: callers like `state.fast_get_int`
+    /// and `state.table_get_with_tm` dispatch here on every integer-key
+    /// access in user code (`t[1]`, `OP_GETI`, ipairs loops, etc.). The
+    /// array-part lookup folds into a single bounds-checked load,
+    /// matching C's `luaH_getint`.
+    #[inline]
     pub fn get_int(&self, key: i64) -> LuaValue {
         let inner = self.inner.borrow();
-        let slot = inner.get_int_slot(key);
-        inner.slot_value(slot)
+        inner.get_int_value(key)
     }
 
     /// Read by string key. Despite the name (kept for compatibility
@@ -1273,7 +1325,12 @@ fn extract_weak_mode(mt: &LuaTable) -> u8 {
 //                  Vec<LuaValue> + Vec<TableNode> in place of raw C pointers, and
 //                  Option<usize> indexing in place of Node*. The luaH_getn
 //                  boundary search + alimit-aware integer-key fast path are
-//                  ported faithfully (see getn() and get_int_slot()). Weak-table
-//                  mode flags + the prune_weak_dead / ephemeron_values_to_mark
-//                  helpers integrate with the lua-gc Trace impl.
+//                  ported faithfully (see getn() and get_int_slot()). The
+//                  integer-key read path also exposes get_int_value, which
+//                  mirrors C's luaH_getint by returning the array slot directly
+//                  in one bounds-checked load (no TableSlotRef indirection) and
+//                  splitting the rare alimit-aliased / hash-part path into a
+//                  cold helper. Weak-table mode flags + the prune_weak_dead /
+//                  ephemeron_values_to_mark helpers integrate with the lua-gc
+//                  Trace impl.
 // ──────────────────────────────────────────────────────────────────────────────
