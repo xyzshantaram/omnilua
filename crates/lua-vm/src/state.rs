@@ -2581,6 +2581,18 @@ impl<'a> GcHandle<'a> {
         use lua_gc::Trace;
         let state_ref: &LuaState = &*self._state;
 
+        // Fast path: when the caller did not force a collection, skip all
+        // the snapshot work (3 Vec allocations + 3 HashSet allocations) if
+        // the heap is paused or under threshold — a `step()` in that state
+        // is a no-op, so the snapshot would be pure waste. Called millions
+        // of times per recursive workload via `gc_check_step` in `precall`.
+        if !force {
+            let g = state_ref.global.borrow();
+            if !g.heap.would_collect() {
+                return;
+            }
+        }
+
         // Snapshot weak tables BEFORE the collect. `identity()` reads only
         // the pointer address — safe even on still-dangling weak handles —
         // and dedup by identity keeps the iteration linear.

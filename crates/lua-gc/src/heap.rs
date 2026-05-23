@@ -575,6 +575,21 @@ impl Heap {
         self.bytes.get()
     }
 
+    /// Current collection threshold in bytes. When `bytes_used() >= threshold_bytes()`,
+    /// the next `step()` will run a full collection (unless paused). Used by
+    /// callers that want to short-circuit expensive prep work (e.g. snapshotting
+    /// weak tables / pending finalizers) when no collection will actually fire.
+    pub fn threshold_bytes(&self) -> usize {
+        self.threshold.get()
+    }
+
+    /// Cheap predicate: would a `step()` actually do work? Equivalent to
+    /// `!paused && bytes_used() >= threshold_bytes()`. Callers that build
+    /// snapshot state before invoking the heap should gate on this.
+    pub fn would_collect(&self) -> bool {
+        !self.paused.get() && self.bytes.get() >= self.threshold.get()
+    }
+
     pub fn collections(&self) -> usize {
         self.collections.get()
     }
