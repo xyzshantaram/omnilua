@@ -366,8 +366,14 @@ def render_html(history: dict[str, Any]) -> str:
     }}
     .bench-info dd {{ margin: 0; color: var(--text); }}
     .bench-info code {{ background: rgba(47, 111, 237, .08); padding: 1px 5px; border-radius: 4px; }}
-    .control-row {{ display: flex; gap: 14px; align-items: center; margin: 10px 0; flex-wrap: wrap; }}
-    .control-row label {{ font-size: 13px; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }}
+    .control-row {{ display: flex; gap: 18px; align-items: center; margin: 10px 0; flex-wrap: wrap; font-size: 13px; color: var(--muted); }}
+    .control-row .group-label {{ font-weight: 600; color: var(--text); }}
+    .pill-group {{ display: inline-flex; gap: 4px; background: #eef1f7; border: 1px solid var(--line); border-radius: 999px; padding: 3px; }}
+    .pill {{ border: 0; background: transparent; color: var(--muted); font-size: 12px; padding: 4px 12px; border-radius: 999px; cursor: pointer; font-weight: 600; }}
+    .pill:hover {{ color: var(--text); }}
+    .pill.active {{ background: var(--accent); color: #fff; }}
+    .pill.active:hover {{ color: #fff; }}
+    .overflow-arrow {{ fill: #5e6878; opacity: .7; }}
     @media (max-width: 900px) {{
       main {{ padding: 18px; }}
       header {{ display: block; }}
@@ -391,10 +397,12 @@ def render_html(history: dict[str, Any]) -> str:
 
   <section class="panel">
     <h2>Wall-time ratio per workload</h2>
-    <p>Ratio = lua-rs wall time ÷ reference lua-c wall time on the same workload. Lower is better; <code>1.00×</code> is parity. Click a legend chip to mute that series.</p>
+    <p>Ratio = lua-rs wall time ÷ reference lua-c wall time on the same workload. Lower is better; <code>1.00×</code> is parity. Click a legend chip to mute that series. Off-screen points show as small triangles at the top edge.</p>
     <div class="control-row">
-      <label><input type="checkbox" id="wall-log-toggle" checked> log y-axis (recommended — early baseline spans 10,000×)</label>
-      <label><input type="checkbox" id="wall-clip-toggle"> clip to ≤ 10×</label>
+      <span class="group-label">y-max</span>
+      <span class="pill-group" id="wall-ymax-pills"></span>
+      <span class="group-label">window</span>
+      <span class="pill-group" id="wall-window-pills"></span>
     </div>
     <div class="chart-wrap"><svg id="wall-chart" role="img" aria-label="Wall-time ratio per workload over time"></svg></div>
     <div class="legend" id="wall-legend"></div>
@@ -410,8 +418,10 @@ def render_html(history: dict[str, Any]) -> str:
     <h2>RSS ratio per workload</h2>
     <p>Ratio = lua-rs peak resident-set ÷ reference lua-c peak resident-set on the same workload. Lower is better; <code>1.00×</code> is parity.</p>
     <div class="control-row">
-      <label><input type="checkbox" id="rss-log-toggle"> log y-axis</label>
-      <label><input type="checkbox" id="rss-clip-toggle"> clip to ≤ 10×</label>
+      <span class="group-label">y-max</span>
+      <span class="pill-group" id="rss-ymax-pills"></span>
+      <span class="group-label">window</span>
+      <span class="pill-group" id="rss-window-pills"></span>
     </div>
     <div class="chart-wrap"><svg id="rss-chart" role="img" aria-label="RSS ratio per workload over time"></svg></div>
     <div class="legend" id="rss-legend"></div>
@@ -492,6 +502,16 @@ function hideTooltip() {{
 
 const MUTED_SERIES = new Set();
 
+function pickGridStep(yMax) {{
+  if (yMax <= 3) return 0.25;
+  if (yMax <= 10) return 1;
+  if (yMax <= 30) return 5;
+  if (yMax <= 100) return 10;
+  if (yMax <= 500) return 50;
+  if (yMax <= 2000) return 250;
+  return Math.pow(10, Math.floor(Math.log10(yMax / 8)));
+}}
+
 function drawChart(svgId, legendId, seriesIds, opts = {{}}) {{
   const svg = document.getElementById(svgId);
   const legend = document.getElementById(legendId);
@@ -505,58 +525,37 @@ function drawChart(svgId, legendId, seriesIds, opts = {{}}) {{
   const all = active.flatMap(id => (HISTORY.series[id] || []).map(p => ({{...p, seriesId: id}})));
   if (!all.length) return;
 
-  const clipMax = opts.clip ? opts.clip : null;
-  const sorted = [...all].sort((a, b) => new Date(a.ts) - new Date(b.ts));
-  const tickPoints = [];
-  const seenTs = new Set();
-  for (const point of sorted) {{
-    if (!point.ts || seenTs.has(point.ts)) continue;
-    seenTs.add(point.ts);
-    tickPoints.push(point);
+  const sortedAll = [...all].sort((a, b) => new Date(a.ts) - new Date(b.ts));
+  const allTimestamps = [];
+  const seenAllTs = new Set();
+  for (const p of sortedAll) {{
+    if (!p.ts || seenAllTs.has(p.ts)) continue;
+    seenAllTs.add(p.ts);
+    allTimestamps.push(p.ts);
   }}
-  const timestamps = tickPoints.map(p => p.ts);
+
+  const windowN = opts.windowN || allTimestamps.length;
+  const allowedTs = new Set(allTimestamps.slice(Math.max(0, allTimestamps.length - windowN)));
+
+  const filtered = sortedAll.filter(p => allowedTs.has(p.ts));
+  if (!filtered.length) return;
+
+  const tickPoints = filtered.filter((p, idx, arr) => idx === 0 || arr[idx - 1].ts !== p.ts);
+  const timestamps = [...allowedTs];
   const xByTs = new Map(timestamps.map((ts, idx) => [ts, idx]));
   const maxIndex = Math.max(1, timestamps.length - 1);
 
-  const rawValues = all.map(p => p.value).filter(v => Number.isFinite(v) && v > 0);
-  let yMin, yMax;
-  const log = !!opts.log;
-  if (log) {{
-    const minV = Math.min(...rawValues);
-    const maxV = clipMax ? Math.min(Math.max(...rawValues), clipMax) : Math.max(...rawValues);
-    yMin = Math.pow(10, Math.floor(Math.log10(Math.min(minV, 1))));
-    yMax = Math.pow(10, Math.ceil(Math.log10(Math.max(maxV, 1.5))));
-  }} else {{
-    yMin = 0;
-    const maxV = clipMax ? Math.min(Math.max(...rawValues), clipMax) : Math.max(...rawValues);
-    yMax = Math.max(1.5, Math.ceil(maxV * 10 + 1) / 10);
-  }}
+  const yMax = opts.yMax || 10;
+  const yMin = 0;
 
   const chartW = width - margin.left - margin.right;
   const chartH = height - margin.top - margin.bottom;
   const x = ts => margin.left + (xByTs.get(ts) ?? 0) / maxIndex * chartW;
-  const y = value => {{
-    let v = value;
-    if (clipMax && v > clipMax) v = clipMax;
-    if (log) {{
-      const lv = Math.log10(Math.max(v, yMin));
-      const lMin = Math.log10(yMin);
-      const lMax = Math.log10(yMax);
-      return margin.top + (lMax - lv) / (lMax - lMin) * chartH;
-    }}
-    return margin.top + (yMax - v) / (yMax - yMin) * chartH;
-  }};
+  const y = value => margin.top + (yMax - Math.min(value, yMax)) / (yMax - yMin) * chartH;
 
-  let gridTicks;
-  if (log) {{
-    gridTicks = [];
-    const lMin = Math.log10(yMin), lMax = Math.log10(yMax);
-    for (let p = lMin; p <= lMax + 0.0001; p += 1) gridTicks.push(Math.pow(10, p));
-  }} else {{
-    gridTicks = [];
-    const step = yMax <= 3 ? 0.25 : (yMax <= 10 ? 1 : Math.ceil(yMax / 10));
-    for (let v = 0; v <= yMax + 0.0001; v += step) gridTicks.push(v);
-  }}
+  let gridTicks = [];
+  const step = pickGridStep(yMax);
+  for (let v = 0; v <= yMax + 0.0001; v += step) gridTicks.push(v);
 
   for (const tick of gridTicks) {{
     const yy = y(tick);
@@ -602,7 +601,8 @@ function drawChart(svgId, legendId, seriesIds, opts = {{}}) {{
   for (const id of seriesIds) {{
     const spec = SERIES[id];
     const muted = MUTED_SERIES.has(svgId + "::" + id);
-    const points = (HISTORY.series[id] || []);
+    const allPoints = (HISTORY.series[id] || []);
+    const points = allPoints.filter(p => allowedTs.has(p.ts));
     if (points.length && !muted) {{
       const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
       path.setAttribute("class", "series-line");
@@ -611,18 +611,29 @@ function drawChart(svgId, legendId, seriesIds, opts = {{}}) {{
       svg.appendChild(path);
 
       points.forEach(p => {{
-        const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-        circle.setAttribute("class", "point");
-        circle.setAttribute("cx", x(p.ts));
-        circle.setAttribute("cy", y(p.value));
-        circle.setAttribute("r", 4);
-        circle.setAttribute("fill", spec.color);
-        svg.appendChild(circle);
+        const overflow = p.value > yMax;
+        if (overflow) {{
+          const tri = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+          const tx = x(p.ts);
+          const ty = margin.top + 1;
+          tri.setAttribute("points", `${{tx}},${{ty}} ${{tx - 5}},${{ty + 8}} ${{tx + 5}},${{ty + 8}}`);
+          tri.setAttribute("fill", spec.color);
+          tri.setAttribute("class", "overflow-arrow");
+          svg.appendChild(tri);
+        }} else {{
+          const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+          circle.setAttribute("class", "point");
+          circle.setAttribute("cx", x(p.ts));
+          circle.setAttribute("cy", y(p.value));
+          circle.setAttribute("r", 4);
+          circle.setAttribute("fill", spec.color);
+          svg.appendChild(circle);
+        }}
 
         const hit = document.createElementNS("http://www.w3.org/2000/svg", "circle");
         hit.setAttribute("class", "point-hit");
         hit.setAttribute("cx", x(p.ts));
-        hit.setAttribute("cy", y(p.value));
+        hit.setAttribute("cy", overflow ? margin.top + 5 : y(p.value));
         hit.setAttribute("r", 11);
         hit.addEventListener("mouseenter", event => showTooltip(event, tooltipHtml(spec, p)));
         hit.addEventListener("mousemove", moveTooltip);
@@ -735,21 +746,63 @@ function renderRunsTable() {{
   }}
 }}
 
-function redrawWall() {{
-  const log = document.getElementById("wall-log-toggle").checked;
-  const clip = document.getElementById("wall-clip-toggle").checked ? 10 : null;
-  drawChart("wall-chart", "wall-legend", HISTORY.wall_ids, {{log, clip}});
-}}
-function redrawRss() {{
-  const log = document.getElementById("rss-log-toggle").checked;
-  const clip = document.getElementById("rss-clip-toggle").checked ? 10 : null;
-  drawChart("rss-chart", "rss-legend", HISTORY.rss_ids, {{log, clip}});
+const YMAX_PRESETS = [
+  {{label: "3×", value: 3}},
+  {{label: "10×", value: 10}},
+  {{label: "30×", value: 30}},
+  {{label: "100×", value: 100}},
+  {{label: "all", value: Infinity}},
+];
+const WINDOW_PRESETS = [
+  {{label: "10", value: 10}},
+  {{label: "25", value: 25}},
+  {{label: "50", value: 50}},
+  {{label: "all", value: Infinity}},
+];
+
+const chartState = {{
+  wall: {{yMaxIdx: 1, windowIdx: 2}},
+  rss:  {{yMaxIdx: 1, windowIdx: 2}},
+}};
+
+function renderPills(containerId, presets, activeIdx, onPick) {{
+  const el = document.getElementById(containerId);
+  el.innerHTML = "";
+  presets.forEach((preset, idx) => {{
+    const btn = document.createElement("button");
+    btn.className = "pill" + (idx === activeIdx ? " active" : "");
+    btn.textContent = preset.label;
+    btn.addEventListener("click", () => onPick(idx));
+    el.appendChild(btn);
+  }});
 }}
 
-document.getElementById("wall-log-toggle").addEventListener("change", redrawWall);
-document.getElementById("wall-clip-toggle").addEventListener("change", redrawWall);
-document.getElementById("rss-log-toggle").addEventListener("change", redrawRss);
-document.getElementById("rss-clip-toggle").addEventListener("change", redrawRss);
+function maxOfSeries(seriesIds) {{
+  let m = 0;
+  for (const id of seriesIds) {{
+    for (const p of (HISTORY.series[id] || [])) {{
+      if (Number.isFinite(p.value) && p.value > m) m = p.value;
+    }}
+  }}
+  return m;
+}}
+
+function redrawWall() {{
+  const ymax = YMAX_PRESETS[chartState.wall.yMaxIdx].value;
+  const win = WINDOW_PRESETS[chartState.wall.windowIdx].value;
+  const resolvedYMax = Number.isFinite(ymax) ? ymax : Math.max(maxOfSeries(HISTORY.wall_ids) * 1.05, 1.5);
+  drawChart("wall-chart", "wall-legend", HISTORY.wall_ids, {{yMax: resolvedYMax, windowN: Number.isFinite(win) ? win : Infinity}});
+  renderPills("wall-ymax-pills", YMAX_PRESETS, chartState.wall.yMaxIdx, idx => {{ chartState.wall.yMaxIdx = idx; redrawWall(); }});
+  renderPills("wall-window-pills", WINDOW_PRESETS, chartState.wall.windowIdx, idx => {{ chartState.wall.windowIdx = idx; redrawWall(); }});
+}}
+function redrawRss() {{
+  const ymax = YMAX_PRESETS[chartState.rss.yMaxIdx].value;
+  const win = WINDOW_PRESETS[chartState.rss.windowIdx].value;
+  const resolvedYMax = Number.isFinite(ymax) ? ymax : Math.max(maxOfSeries(HISTORY.rss_ids) * 1.05, 1.5);
+  drawChart("rss-chart", "rss-legend", HISTORY.rss_ids, {{yMax: resolvedYMax, windowN: Number.isFinite(win) ? win : Infinity}});
+  renderPills("rss-ymax-pills", YMAX_PRESETS, chartState.rss.yMaxIdx, idx => {{ chartState.rss.yMaxIdx = idx; redrawRss(); }});
+  renderPills("rss-window-pills", WINDOW_PRESETS, chartState.rss.windowIdx, idx => {{ chartState.rss.windowIdx = idx; redrawRss(); }});
+}}
 
 redrawWall();
 redrawRss();
