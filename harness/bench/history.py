@@ -54,10 +54,13 @@ WORKLOAD_COLORS = {
 }
 
 
-def load_ledger_rows() -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+def load_ledger_rows() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Returns (bench_rows, test_rows). Bench rows are kind=bench/target=rust-vs-reference;
+    test rows are kind=tests/target=official-suite."""
+    bench_rows: list[dict[str, Any]] = []
+    test_rows: list[dict[str, Any]] = []
     if not LEDGER.exists():
-        return rows
+        return bench_rows, test_rows
     for line in LEDGER.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
@@ -66,16 +69,13 @@ def load_ledger_rows() -> list[dict[str, Any]]:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if row.get("kind") != "bench":
-            continue
-        if row.get("target") != "rust-vs-reference":
-            continue
-        if row.get("metric") not in {"wall_ratio", "rss_ratio"}:
-            continue
-        if row.get("workload") not in WORKLOAD_COLORS:
-            continue
-        rows.append(row)
-    return rows
+        kind = row.get("kind")
+        if kind == "bench" and row.get("target") == "rust-vs-reference":
+            if row.get("metric") in {"wall_ratio", "rss_ratio"} and row.get("workload") in WORKLOAD_COLORS:
+                bench_rows.append(row)
+        elif kind == "tests" and row.get("target") == "official-suite":
+            test_rows.append(row)
+    return bench_rows, test_rows
 
 
 def parse_ts(ts: str) -> datetime:
@@ -114,9 +114,10 @@ def git_commit_info(commits: list[str]) -> dict[str, dict[str, str]]:
 
 
 def build_history() -> dict[str, Any]:
-    rows = load_ledger_rows()
+    rows, test_rows = load_ledger_rows()
     rows.sort(key=lambda r: r["ts"])
-    unique_commits = list(dict.fromkeys(r["commit"] for r in rows))
+    test_rows.sort(key=lambda r: r["ts"])
+    unique_commits = list(dict.fromkeys([r["commit"] for r in rows] + [r["commit"] for r in test_rows]))
     commit_info = git_commit_info(unique_commits)
 
     points: list[dict[str, Any]] = []
@@ -188,10 +189,34 @@ def build_history() -> dict[str, Any]:
         "n_points": len(points),
     }
 
+    test_points: list[dict[str, Any]] = []
+    for row in test_rows:
+        info = commit_info.get(row["commit"], {})
+        total = int(row.get("total", 0) or 0)
+        pass_count = int(row.get("value", 0) or 0)
+        pass_rate = (pass_count / total * 100.0) if total > 0 else 0.0
+        test_points.append({
+            "ts": parse_ts(row["ts"]).isoformat(),
+            "ts_raw": row["ts"],
+            "commit": row["commit"],
+            "commit_subject": info.get("subject", ""),
+            "pass_count": pass_count,
+            "total": total,
+            "fail": int(row.get("fail", 0) or 0),
+            "timeout": int(row.get("timeout", 0) or 0),
+            "runtime_s": int(row.get("runtime_s", 0) or 0),
+            "value": pass_rate,
+        })
+
+    latest_test = test_points[-1] if test_points else None
+
     signature = {
-        "n_points": len(points),
-        "latest_ts": points[-1]["ts_raw"] if points else "",
-        "latest_commit": points[-1]["commit"] if points else "",
+        "n_points": len(points) + len(test_points),
+        "latest_ts": max(
+            (points[-1]["ts_raw"] if points else ""),
+            (test_points[-1]["ts_raw"] if test_points else ""),
+        ),
+        "latest_commit": (test_points[-1]["commit"] if test_points else (points[-1]["commit"] if points else "")),
     }
 
     return {
@@ -205,6 +230,8 @@ def build_history() -> dict[str, Any]:
         "signature": signature,
         "workloads": WORKLOADS,
         "workload_colors": WORKLOAD_COLORS,
+        "test_points": test_points,
+        "latest_test": latest_test,
     }
 
 
@@ -250,15 +277,29 @@ def render_html(history: dict[str, Any]) -> str:
         <div class="subtle">{html.escape(worst_w)}</div>
       </div>
     """)
+    latest_test = history.get("latest_test")
+    if latest_test and latest_test["total"]:
+        pass_pct = latest_test["pass_count"] / latest_test["total"] * 100.0
+        card_html.append(f"""
+      <div class="metric-card">
+        <div class="eyebrow">Official test suite</div>
+        <div class="metric">{latest_test['pass_count']}/{latest_test['total']}</div>
+        <div class="subtle">{pass_pct:.1f}% pass · {len(history['test_points'])} runs recorded</div>
+      </div>
+    """)
 
     series_defs = {}
     for workload in WORKLOADS:
         color = WORKLOAD_COLORS[workload]
         series_defs[f"wall_ratio_{workload}"] = {"label": workload, "color": color, "metric": "wall_ratio"}
         series_defs[f"rss_ratio_{workload}"] = {"label": workload, "color": color, "metric": "rss_ratio"}
+    series_defs["tests_pass_rate"] = {"label": "official suite pass-rate", "color": "#0f8f68", "metric": "pass_rate"}
 
     wall_ids = [f"wall_ratio_{w}" for w in WORKLOADS]
     rss_ids = [f"rss_ratio_{w}" for w in WORKLOADS]
+
+    series_with_tests = dict(history["series"])
+    series_with_tests["tests_pass_rate"] = history["test_points"]
 
     payload = {
         "generated_at": history["generated_at"],
@@ -266,10 +307,12 @@ def render_html(history: dict[str, Any]) -> str:
         "commit_count": history["commit_count"],
         "signature": history["signature"],
         "points": history["points"],
-        "series": history["series"],
+        "series": series_with_tests,
         "series_defs": series_defs,
         "wall_ids": wall_ids,
         "rss_ids": rss_ids,
+        "test_ids": ["tests_pass_rate"],
+        "test_points": history["test_points"],
     }
     history_json = json.dumps(payload, separators=(",", ":"))
 
@@ -428,6 +471,19 @@ def render_html(history: dict[str, Any]) -> str:
   </section>
 
   <section class="panel">
+    <h2>Official test suite pass-rate</h2>
+    <p>Percentage of 44 official Lua 5.4 tests passing at each measured commit. Recorded by <code>harness/bench/measure-tests.sh</code>; each point is one full <code>harness/run_official_all.sh</code> run.</p>
+    <div class="control-row">
+      <span class="group-label">y-axis</span>
+      <span class="pill-group" id="tests-ymax-pills"></span>
+      <span class="group-label">window</span>
+      <span class="pill-group" id="tests-window-pills"></span>
+    </div>
+    <div class="chart-wrap"><svg id="tests-chart" role="img" aria-label="Official test suite pass-rate over time"></svg></div>
+    <div class="legend" id="tests-legend"></div>
+  </section>
+
+  <section class="panel">
     <h2>Latest per-workload status</h2>
     <table id="latest-table">
       <thead>
@@ -462,6 +518,11 @@ function fmtRatio(v) {{
   if (v >= 100) return v.toFixed(1) + "×";
   return v.toFixed(2) + "×";
 }}
+function fmtVal(v, unit) {{
+  if (v === null || v === undefined || Number.isNaN(v)) return "-";
+  if (unit === "%") return v.toFixed(1) + "%";
+  return fmtRatio(v);
+}}
 
 function shortTime(iso) {{
   if (!iso) return "";
@@ -476,11 +537,16 @@ function shortTime(iso) {{
 function shortCommit(c) {{ return (c || "").slice(0, 7); }}
 
 function tooltipHtml(spec, p) {{
+  const unit = spec.metric === "pass_rate" ? "%" : "×";
+  const extras = (spec.metric === "pass_rate")
+    ? `<div class="muted">pass=${{p.pass_count}}/${{p.total}} · fail=${{p.fail}} · timeout=${{p.timeout}} · runtime=${{p.runtime_s}}s</div>`
+    : "";
   return `
     <strong>${{spec.label}}</strong>
-    <div>${{fmtRatio(p.value)}} <span class="muted">(${{spec.metric}})</span></div>
+    <div>${{fmtVal(p.value, unit)}} <span class="muted">(${{spec.metric}})</span></div>
     <div class="muted">${{shortCommit(p.commit)}} · ${{shortTime(p.ts)}}</div>
     <div class="muted">${{p.commit_subject || ""}}</div>
+    ${{extras}}
   `;
 }}
 
@@ -572,7 +638,8 @@ function drawChart(svgId, legendId, seriesIds, opts = {{}}) {{
     text.setAttribute("text-anchor", "end");
     text.setAttribute("font-size", "11");
     text.setAttribute("fill", "#5e6878");
-    text.textContent = (tick >= 1000 ? tick.toLocaleString() : (tick >= 10 ? tick.toFixed(0) : tick.toFixed(2))) + "×";
+    const unit = opts.unit || "×";
+    text.textContent = (tick >= 1000 ? tick.toLocaleString() : (tick >= 10 ? tick.toFixed(0) : tick.toFixed(2))) + unit;
     svg.appendChild(text);
   }}
 
@@ -654,8 +721,10 @@ function drawChart(svgId, legendId, seriesIds, opts = {{}}) {{
     legend.appendChild(item);
   }}
 
-  if (yMin < 1 && 1 <= yMax) {{
-    const py = y(1.0);
+  const parityValue = opts.parityValue !== undefined ? opts.parityValue : 1.0;
+  const parityLabel = opts.parityLabel || `parity (${{parityValue.toFixed(2)}}${{opts.unit || "×"}})`;
+  if (parityValue !== null && parityValue >= yMin && parityValue <= yMax) {{
+    const py = y(parityValue);
     const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
     line.setAttribute("x1", margin.left);
     line.setAttribute("x2", width - margin.right);
@@ -672,12 +741,14 @@ function drawChart(svgId, legendId, seriesIds, opts = {{}}) {{
     label.setAttribute("font-size", "11");
     label.setAttribute("fill", "#0f8f68");
     label.setAttribute("font-weight", "600");
-    label.textContent = "parity (1.00×)";
+    label.textContent = parityLabel;
     svg.appendChild(label);
   }}
 
-  if (1.5 > yMin && 1.5 <= yMax) {{
-    const py = y(1.5);
+  const gateValue = opts.gateValue !== undefined ? opts.gateValue : 1.5;
+  const gateLabel = opts.gateLabel || `parity gate (${{gateValue ? gateValue.toFixed(2) : ""}}${{opts.unit || "×"}})`;
+  if (gateValue !== null && gateValue > yMin && gateValue <= yMax) {{
+    const py = y(gateValue);
     const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
     line.setAttribute("x1", margin.left);
     line.setAttribute("x2", width - margin.right);
@@ -693,7 +764,7 @@ function drawChart(svgId, legendId, seriesIds, opts = {{}}) {{
     label.setAttribute("text-anchor", "end");
     label.setAttribute("font-size", "10");
     label.setAttribute("fill", "#c16a1a");
-    label.textContent = "parity gate (1.50×)";
+    label.textContent = gateLabel;
     svg.appendChild(label);
   }}
 }}
@@ -760,9 +831,17 @@ const WINDOW_PRESETS = [
   {{label: "all", value: Infinity}},
 ];
 
+const TESTS_YMAX_PRESETS = [
+  {{label: "50%",  value: 50}},
+  {{label: "75%",  value: 75}},
+  {{label: "90%",  value: 90}},
+  {{label: "100%", value: 100}},
+];
+
 const chartState = {{
-  wall: {{yMaxIdx: 1, windowIdx: 2}},
-  rss:  {{yMaxIdx: 1, windowIdx: 2}},
+  wall:  {{yMaxIdx: 1, windowIdx: 2}},
+  rss:   {{yMaxIdx: 1, windowIdx: 2}},
+  tests: {{yMaxIdx: 3, windowIdx: 3}},
 }};
 
 function renderPills(containerId, presets, activeIdx, onPick) {{
@@ -803,9 +882,26 @@ function redrawRss() {{
   renderPills("rss-ymax-pills", YMAX_PRESETS, chartState.rss.yMaxIdx, idx => {{ chartState.rss.yMaxIdx = idx; redrawRss(); }});
   renderPills("rss-window-pills", WINDOW_PRESETS, chartState.rss.windowIdx, idx => {{ chartState.rss.windowIdx = idx; redrawRss(); }});
 }}
+function redrawTests() {{
+  const ymax = TESTS_YMAX_PRESETS[chartState.tests.yMaxIdx].value;
+  const win = WINDOW_PRESETS[chartState.tests.windowIdx].value;
+  drawChart("tests-chart", "tests-legend", HISTORY.test_ids, {{
+    yMax: ymax,
+    windowN: Number.isFinite(win) ? win : Infinity,
+    unit: "%",
+    parityValue: 100,
+    parityLabel: "all tests pass (100%)",
+    gateValue: null,
+  }});
+  renderPills("tests-ymax-pills", TESTS_YMAX_PRESETS, chartState.tests.yMaxIdx, idx => {{ chartState.tests.yMaxIdx = idx; redrawTests(); }});
+  renderPills("tests-window-pills", WINDOW_PRESETS, chartState.tests.windowIdx, idx => {{ chartState.tests.windowIdx = idx; redrawTests(); }});
+}}
 
 redrawWall();
 redrawRss();
+if (HISTORY.test_ids && HISTORY.test_points && HISTORY.test_points.length) {{
+  redrawTests();
+}}
 renderLatestTable();
 renderRunsTable();
 
