@@ -77,6 +77,7 @@ pub trait InstructionExt {
 }
 
 impl InstructionExt for Instruction {
+    #[inline]
     fn opcode(&self) -> OpCode {
         match self.raw() & 0x7F {
             0  => OpCode::Move,
@@ -165,26 +166,30 @@ impl InstructionExt for Instruction {
             n  => unreachable!("invalid opcode 0x{:02x} in instruction word 0x{:08x}", n, self.raw()),
         }
     }
-    fn arg_a(&self) -> i32 { ((self.raw() >> 7) & 0xFF) as i32 }
-    fn arg_b(&self) -> i32 { ((self.raw() >> 16) & 0xFF) as i32 }
-    fn arg_c(&self) -> i32 { ((self.raw() >> 24) & 0xFF) as i32 }
-    fn arg_k(&self) -> i32 { ((self.raw() >> 15) & 0x1) as i32 }
-    fn arg_ax(&self) -> i32 { (self.raw() >> 7) as i32 }
-    fn arg_bx(&self) -> i32 { (self.raw() >> 15) as i32 }
-    fn arg_s_b(&self) -> i32 { self.arg_b() - 0x7F }
-    fn arg_s_c(&self) -> i32 { self.arg_c() - 0x7F }
-    fn arg_s_j(&self) -> i32 { self.arg_ax() - 0xFFFFFF }
-    fn arg_s_bx(&self) -> i32 { self.arg_bx() - 0xFFFF }
-    fn test_k(&self) -> bool { (self.raw() & (1 << 15)) != 0 }
+    #[inline] fn arg_a(&self) -> i32 { ((self.raw() >> 7) & 0xFF) as i32 }
+    #[inline] fn arg_b(&self) -> i32 { ((self.raw() >> 16) & 0xFF) as i32 }
+    #[inline] fn arg_c(&self) -> i32 { ((self.raw() >> 24) & 0xFF) as i32 }
+    #[inline] fn arg_k(&self) -> i32 { ((self.raw() >> 15) & 0x1) as i32 }
+    #[inline] fn arg_ax(&self) -> i32 { (self.raw() >> 7) as i32 }
+    #[inline] fn arg_bx(&self) -> i32 { (self.raw() >> 15) as i32 }
+    #[inline] fn arg_s_b(&self) -> i32 { self.arg_b() - 0x7F }
+    #[inline] fn arg_s_c(&self) -> i32 { self.arg_c() - 0x7F }
+    #[inline] fn arg_s_j(&self) -> i32 { self.arg_ax() - 0xFFFFFF }
+    #[inline] fn arg_s_bx(&self) -> i32 { self.arg_bx() - 0xFFFF }
+    #[inline] fn test_k(&self) -> bool { (self.raw() & (1 << 15)) != 0 }
+    #[inline]
     fn test_a_mode(&self) -> bool {
         (op_mode_byte(self.opcode()) & (1 << 3)) != 0
     }
+    #[inline]
     fn is_mm_mode(&self) -> bool {
         (op_mode_byte(self.opcode()) & (1 << 7)) != 0
     }
+    #[inline]
     fn is_vararg_prep(&self) -> bool {
         matches!(self.opcode(), OpCode::VarArgPrep)
     }
+    #[inline]
     fn is_in_top(&self) -> bool {
         (op_mode_byte(self.opcode()) & (1 << 5)) != 0 && self.arg_b() == 0
     }
