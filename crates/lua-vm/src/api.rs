@@ -704,6 +704,20 @@ impl LuaState {
         set_i(self, idx, n)
     }
 
+    /// Get `t[n]` where `t` is a pre-resolved `LuaValue`, bypassing stack-index
+    /// resolution. Use this in tight loops that operate on the same table
+    /// repeatedly to avoid the `index_to_value` call per iteration.
+    pub fn table_get_i_value(&mut self, t: &LuaValue, n: i64) -> Result<LuaType, LuaError> {
+        get_i_value(self, t, n)
+    }
+
+    /// Set `t[n] = stack_top` (then pop) where `t` is a pre-resolved `LuaValue`,
+    /// bypassing stack-index resolution. Use this in tight loops that operate on
+    /// the same table repeatedly to avoid the `index_to_value` call per iteration.
+    pub fn table_set_i_value(&mut self, t: &LuaValue, n: i64) -> Result<(), LuaError> {
+        set_i_value(self, t, n)
+    }
+
     pub fn create_table(&mut self, narr: i32, nrec: i32) -> Result<(), LuaError> {
         create_table(self, narr, nrec)
     }
@@ -1356,6 +1370,19 @@ pub fn get_i(state: &mut LuaState, idx: i32, n: i64) -> Result<LuaType, LuaError
     Ok(state.get_at(top - 1).base_type())
 }
 
+/// Variant of `get_i` that accepts a pre-resolved table value instead of a
+/// stack index. Callers that invoke `get_i` repeatedly on the same table
+/// (e.g. the shift loops in `table.remove` / `table.insert`) should resolve
+/// the table once and use this function to avoid calling `index_to_value`
+/// on every iteration.
+pub fn get_i_value(state: &mut LuaState, t: &LuaValue, n: i64) -> Result<LuaType, LuaError> {
+    let key = LuaValue::Int(n);
+    let result = state.table_get_with_tm(t, &key)?;
+    state.push(result);
+    let top = state.top_idx();
+    Ok(state.get_at(top - 1).base_type())
+}
+
 // C: l_sinline int finishrawget (lua_State *L, const TValue *val)
 fn finish_raw_get(state: &mut LuaState, val: Option<LuaValue>) -> LuaType {
     // C: if (isempty(val)) setnilvalue(s2v(L->top.p)); else setobj2s(...)
@@ -1521,6 +1548,20 @@ pub fn set_i(state: &mut LuaState, idx: i32, n: i64) -> Result<(), LuaError> {
     let key = LuaValue::Int(n);
     state.table_set_with_tm(&t, key, val)?;
     // C: L->top.p--;
+    state.pop();
+    Ok(())
+}
+
+/// Variant of `set_i` that accepts a pre-resolved table value instead of a
+/// stack index. Callers that invoke `set_i` repeatedly on the same table
+/// (e.g. the shift loops in `table.remove` / `table.insert`) should resolve
+/// the table once and use this function to avoid calling `index_to_value`
+/// on every iteration.
+pub fn set_i_value(state: &mut LuaState, t: &LuaValue, n: i64) -> Result<(), LuaError> {
+    let top = state.top_idx();
+    let val = state.get_at(top - 1);
+    let key = LuaValue::Int(n);
+    state.table_set_with_tm(t, key, val)?;
     state.pop();
     Ok(())
 }

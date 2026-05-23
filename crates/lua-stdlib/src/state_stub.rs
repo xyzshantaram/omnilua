@@ -241,6 +241,8 @@ pub trait LuaStateStubExt {
 
     fn table_get_i(&mut self, idx: i32, n: i64) -> Result<LuaType, LuaError> { todo!("phase-b-reconcile: table_get_i") }
     fn table_set_i(&mut self, idx: i32, n: i64) -> Result<(), LuaError> { todo!("phase-b-reconcile: table_set_i") }
+    fn table_get_i_value(&mut self, t: &LuaValue, n: i64) -> Result<LuaType, LuaError> { todo!("phase-b-reconcile: table_get_i_value") }
+    fn table_set_i_value(&mut self, t: &LuaValue, n: i64) -> Result<(), LuaError> { todo!("phase-b-reconcile: table_set_i_value") }
     fn get_table(&mut self, idx: i32) -> Result<LuaType, LuaError> { todo!("phase-b-reconcile: get_table") }
     fn raw_geti(&mut self, idx: i32, n: i64) -> Result<LuaType, LuaError> { todo!("phase-b-reconcile: raw_geti") }
     fn raw_seti(&mut self, idx: i32, n: i64) -> Result<(), LuaError> { todo!("phase-b-reconcile: raw_seti") }
@@ -495,6 +497,14 @@ impl LuaStateStubExt for LuaState {
 
     fn table_get_i(&mut self, idx: i32, n: i64) -> Result<LuaType, LuaError> {
         lua_vm::api::get_i(self, idx, n)
+    }
+
+    fn table_get_i_value(&mut self, t: &LuaValue, n: i64) -> Result<LuaType, LuaError> {
+        lua_vm::api::get_i_value(self, t, n)
+    }
+
+    fn table_set_i_value(&mut self, t: &LuaValue, n: i64) -> Result<(), LuaError> {
+        lua_vm::api::set_i_value(self, t, n)
     }
 
     fn compare_lt(&mut self, idx1: i32, idx2: i32) -> Result<bool, LuaError> {
