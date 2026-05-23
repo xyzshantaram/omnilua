@@ -132,8 +132,10 @@ pub enum OpCode {
     ExtraArg = 82,
 }
 
-/// Number of distinct opcodes (matches C-Lua's `NUM_OPCODES`). Used as the
-/// dispatch-table bound in `InstructionExt::opcode`.
+/// Number of distinct opcodes (matches C-Lua's `NUM_OPCODES`). Held for
+/// downstream debug/dump callers that count opcodes by name; the dispatch
+/// hot path in `InstructionExt::opcode` does its own per-arm match.
+#[allow(dead_code)]
 const NUM_OPCODES: u8 = 83;
 
 impl OpCode {
@@ -173,45 +175,102 @@ pub trait InstructionExt {
     fn is_in_top(&self) -> bool;
 }
 
-/// One entry per opcode (indexed by `instruction & 0x7F`). Mirrors the
-/// `enum OpCode` discriminants 0..=82 exactly. Used by `opcode()` so the
-/// hot dispatch tick is a single bounded array load + 7-bit mask, with no
-/// 83-arm jump table emitted at the call site.
-///
-/// Keeping the lookup table in sync with `OpCode` is enforced at runtime
-/// by the bounds check below; the slot order also matches `lopcodes.h`.
-static OPCODE_TABLE: [OpCode; NUM_OPCODES as usize] = [
-    OpCode::Move,        OpCode::LoadI,       OpCode::LoadF,       OpCode::LoadK,
-    OpCode::LoadKX,      OpCode::LoadFalse,   OpCode::LFalseSkip,  OpCode::LoadTrue,
-    OpCode::LoadNil,     OpCode::GetUpVal,    OpCode::SetUpVal,    OpCode::GetTabUp,
-    OpCode::GetTable,    OpCode::GetI,        OpCode::GetField,    OpCode::SetTabUp,
-    OpCode::SetTable,    OpCode::SetI,        OpCode::SetField,    OpCode::NewTable,
-    OpCode::Self_,       OpCode::AddI,        OpCode::AddK,        OpCode::SubK,
-    OpCode::MulK,        OpCode::ModK,        OpCode::PowK,        OpCode::DivK,
-    OpCode::IDivK,       OpCode::BAndK,       OpCode::BOrK,        OpCode::BXOrK,
-    OpCode::ShrI,        OpCode::ShlI,        OpCode::Add,         OpCode::Sub,
-    OpCode::Mul,         OpCode::Mod,         OpCode::Pow,         OpCode::Div,
-    OpCode::IDiv,        OpCode::BAnd,        OpCode::BOr,         OpCode::BXOr,
-    OpCode::Shl,         OpCode::Shr,         OpCode::MmBin,       OpCode::MmBinI,
-    OpCode::MmBinK,      OpCode::Unm,         OpCode::BNot,        OpCode::Not,
-    OpCode::Len,         OpCode::Concat,      OpCode::Close,       OpCode::Tbc,
-    OpCode::Jmp,         OpCode::Eq,          OpCode::Lt,          OpCode::Le,
-    OpCode::EqK,         OpCode::EqI,         OpCode::LtI,         OpCode::LeI,
-    OpCode::GtI,         OpCode::GeI,         OpCode::Test,        OpCode::TestSet,
-    OpCode::Call,        OpCode::TailCall,    OpCode::Return,      OpCode::Return0,
-    OpCode::Return1,     OpCode::ForLoop,     OpCode::ForPrep,     OpCode::TForPrep,
-    OpCode::TForCall,    OpCode::TForLoop,    OpCode::SetList,     OpCode::Closure,
-    OpCode::VarArg,      OpCode::VarArgPrep,  OpCode::ExtraArg,
-];
-
 impl InstructionExt for Instruction {
+    /// C: `GET_OPCODE(i) = (OpCode)((i) >> POS_OP & MASK1(SIZE_OP,0))`.
+    ///
+    /// The 83-arm match looks expensive, but because `OpCode` is
+    /// `#[repr(u8)]` with explicit discriminants 0..=82 matching each match
+    /// arm's integer key exactly, LLVM compiles this to a single bounds
+    /// check + identity cast — no jump table, no memory indirection. The
+    /// previous array-lookup form forced an extra `OPCODE_TABLE` byte load
+    /// per dispatch tick that LLVM could not see through.
     #[inline(always)]
     fn opcode(&self) -> OpCode {
-        let idx = (self.raw() & 0x7F) as usize;
-        if idx < NUM_OPCODES as usize {
-            OPCODE_TABLE[idx]
-        } else {
-            unreachable!("invalid opcode {} in instruction word 0x{:08x}", idx, self.raw())
+        match (self.raw() & 0x7F) as u8 {
+            0 => OpCode::Move,
+            1 => OpCode::LoadI,
+            2 => OpCode::LoadF,
+            3 => OpCode::LoadK,
+            4 => OpCode::LoadKX,
+            5 => OpCode::LoadFalse,
+            6 => OpCode::LFalseSkip,
+            7 => OpCode::LoadTrue,
+            8 => OpCode::LoadNil,
+            9 => OpCode::GetUpVal,
+            10 => OpCode::SetUpVal,
+            11 => OpCode::GetTabUp,
+            12 => OpCode::GetTable,
+            13 => OpCode::GetI,
+            14 => OpCode::GetField,
+            15 => OpCode::SetTabUp,
+            16 => OpCode::SetTable,
+            17 => OpCode::SetI,
+            18 => OpCode::SetField,
+            19 => OpCode::NewTable,
+            20 => OpCode::Self_,
+            21 => OpCode::AddI,
+            22 => OpCode::AddK,
+            23 => OpCode::SubK,
+            24 => OpCode::MulK,
+            25 => OpCode::ModK,
+            26 => OpCode::PowK,
+            27 => OpCode::DivK,
+            28 => OpCode::IDivK,
+            29 => OpCode::BAndK,
+            30 => OpCode::BOrK,
+            31 => OpCode::BXOrK,
+            32 => OpCode::ShrI,
+            33 => OpCode::ShlI,
+            34 => OpCode::Add,
+            35 => OpCode::Sub,
+            36 => OpCode::Mul,
+            37 => OpCode::Mod,
+            38 => OpCode::Pow,
+            39 => OpCode::Div,
+            40 => OpCode::IDiv,
+            41 => OpCode::BAnd,
+            42 => OpCode::BOr,
+            43 => OpCode::BXOr,
+            44 => OpCode::Shl,
+            45 => OpCode::Shr,
+            46 => OpCode::MmBin,
+            47 => OpCode::MmBinI,
+            48 => OpCode::MmBinK,
+            49 => OpCode::Unm,
+            50 => OpCode::BNot,
+            51 => OpCode::Not,
+            52 => OpCode::Len,
+            53 => OpCode::Concat,
+            54 => OpCode::Close,
+            55 => OpCode::Tbc,
+            56 => OpCode::Jmp,
+            57 => OpCode::Eq,
+            58 => OpCode::Lt,
+            59 => OpCode::Le,
+            60 => OpCode::EqK,
+            61 => OpCode::EqI,
+            62 => OpCode::LtI,
+            63 => OpCode::LeI,
+            64 => OpCode::GtI,
+            65 => OpCode::GeI,
+            66 => OpCode::Test,
+            67 => OpCode::TestSet,
+            68 => OpCode::Call,
+            69 => OpCode::TailCall,
+            70 => OpCode::Return,
+            71 => OpCode::Return0,
+            72 => OpCode::Return1,
+            73 => OpCode::ForLoop,
+            74 => OpCode::ForPrep,
+            75 => OpCode::TForPrep,
+            76 => OpCode::TForCall,
+            77 => OpCode::TForLoop,
+            78 => OpCode::SetList,
+            79 => OpCode::Closure,
+            80 => OpCode::VarArg,
+            81 => OpCode::VarArgPrep,
+            82 => OpCode::ExtraArg,
+            _ => OpCode::ExtraArg,
         }
     }
     #[inline] fn arg_a(&self) -> i32 { ((self.raw() >> 7) & 0xFF) as i32 }
