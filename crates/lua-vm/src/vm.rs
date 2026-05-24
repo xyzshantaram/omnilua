@@ -2093,24 +2093,30 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         let ra = base + i.arg_a();
                         let rb = base + i.arg_b();
                         let rc = base + i.arg_c();
-                        if let Some((i1, i2)) = state.get_int_pair_at(rb, rc) {
+                        let ra_u = ra.0 as usize;
+                        let rb_v = state.stack[rb.0 as usize].val;
+                        let rc_v = state.stack[rc.0 as usize].val;
+                        if let (LuaValue::Int(i1), LuaValue::Int(i2)) = (rb_v, rc_v) {
                             pc += 1;
-                            state.set_at(ra, LuaValue::Int(intop_add(i1, i2)));
-                        } else if let Some((n1, n2)) = state.get_num_pair_at(rb, rc) {
+                            state.stack[ra_u].val = LuaValue::Int(intop_add(i1, i2));
+                        } else if let (Some(n1), Some(n2)) = (number_value(rb_v), number_value(rc_v)) {
                             pc += 1;
-                            state.set_at(ra, LuaValue::Float(n1 + n2));
+                            state.stack[ra_u].val = LuaValue::Float(n1 + n2);
                         }
                     }
                     OpCode::Sub => {
                         let ra = base + i.arg_a();
                         let rb = base + i.arg_b();
                         let rc = base + i.arg_c();
-                        if let Some((i1, i2)) = state.get_int_pair_at(rb, rc) {
+                        let ra_u = ra.0 as usize;
+                        let rb_v = state.stack[rb.0 as usize].val;
+                        let rc_v = state.stack[rc.0 as usize].val;
+                        if let (LuaValue::Int(i1), LuaValue::Int(i2)) = (rb_v, rc_v) {
                             pc += 1;
-                            state.set_at(ra, LuaValue::Int(intop_sub(i1, i2)));
-                        } else if let Some((n1, n2)) = state.get_num_pair_at(rb, rc) {
+                            state.stack[ra_u].val = LuaValue::Int(intop_sub(i1, i2));
+                        } else if let (Some(n1), Some(n2)) = (number_value(rb_v), number_value(rc_v)) {
                             pc += 1;
-                            state.set_at(ra, LuaValue::Float(n1 - n2));
+                            state.stack[ra_u].val = LuaValue::Float(n1 - n2);
                         }
                     }
                     OpCode::Mul => {
@@ -2896,6 +2902,15 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
 }
 
 // ─── Local opcode dispatch helpers ───────────────────────────────────────────
+
+#[inline(always)]
+fn number_value(v: LuaValue) -> Option<f64> {
+    match v {
+        LuaValue::Float(f) => Some(f),
+        LuaValue::Int(i) => Some(i as f64),
+        _ => None,
+    }
+}
 
 /// C: `op_arith_aux` — try both-int fast path then float fallback.
 /// Increments `pc` on success (the `pc++` in the C macros).
