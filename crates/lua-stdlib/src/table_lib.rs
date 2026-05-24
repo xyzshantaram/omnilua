@@ -5,7 +5,7 @@
 //!
 //! C source: `reference/lua-5.4.7/src/ltablib.c` (430 lines, 14 functions)
 
-use lua_types::{LuaError, LuaType, LuaValue};
+use lua_types::{GcRef, LuaError, LuaTable, LuaType, LuaValue};
 use crate::state_stub::{LuaState, LuaStateStubExt as _, lua_CFunction, upvalue_index, CompareOp, LuaDebug};
 
 // ─── Operation flags ──────────────────────────────────────────────────────────
@@ -108,6 +108,25 @@ fn aux_getn(state: &mut LuaState, n: i32, w: u32) -> Result<i64, LuaError> {
     state.length_at(n)
 }
 
+#[inline]
+fn plain_table_at(state: &mut LuaState, idx: i32) -> Option<GcRef<LuaTable>> {
+    match state.value_at(idx) {
+        LuaValue::Table(tbl) if tbl.metatable().is_none() => Some(tbl),
+        _ => None,
+    }
+}
+
+#[inline]
+fn raw_set_int(
+    state: &mut LuaState,
+    tbl: GcRef<LuaTable>,
+    key: i64,
+    value: LuaValue,
+) -> Result<(), LuaError> {
+    state.gc_barrier_back(LuaValue::Table(tbl), value);
+    tbl.try_raw_set_int(key, value)
+}
+
 // ─── table.insert ─────────────────────────────────────────────────────────────
 
 /// C: `tinsert(L)` — implements `table.insert(t [, pos,] v)`.
@@ -141,10 +160,19 @@ pub fn insert(state: &mut LuaState) -> Result<usize, LuaError> {
     let mut e = aux_getn(state, 1, TAB_RW)?;
     // C: luaL_intop(+, e, 1) — wrapping unsigned add then re-interpret as signed
     e = (e as u64).wrapping_add(1) as i64;
+    let plain_table = plain_table_at(state, 1);
 
     let pos: i64 = match state.get_top() {
         // C: case 2 — insert new element at the end
-        2 => e,
+        2 => {
+            if let Some(tbl) = plain_table {
+                let value = state.value_at(2);
+                raw_set_int(state, tbl, e, value)?;
+                state.pop_n(1);
+                return Ok(0);
+            }
+            e
+        }
         // C: case 3 — explicit position argument
         3 => {
             let pos = state.check_arg_integer(2)?;
@@ -152,6 +180,18 @@ pub fn insert(state: &mut LuaState) -> Result<usize, LuaError> {
             // Checks 1 <= pos <= e (wrapping subtraction catches pos <= 0)
             if !((pos as u64).wrapping_sub(1) < (e as u64)) {
                 return Err(LuaError::arg_error(2, "position out of bounds"));
+            }
+            if let Some(tbl) = plain_table {
+                let value = state.value_at(3);
+                let mut i = e;
+                while i > pos {
+                    let shifted = tbl.get_int(i - 1);
+                    raw_set_int(state, tbl, i, shifted)?;
+                    i -= 1;
+                }
+                raw_set_int(state, tbl, pos, value)?;
+                state.pop_n(1);
+                return Ok(0);
             }
             // Cache the table once to avoid re-resolving stack slot 1 on every
             // iteration of the shift loop. C's lua_geti is a single pointer
@@ -212,6 +252,17 @@ pub fn remove(state: &mut LuaState) -> Result<usize, LuaError> {
     // iteration of the shift loop. C's lua_geti is a single pointer
     // arithmetic operation; our index_to_value is a function call with
     // branches, so this saves ~2N index resolutions for shift count N.
+    if let Some(tbl) = plain_table_at(state, 1) {
+        let result = tbl.get_int(pos);
+        state.push(result);
+        while pos < size {
+            let shifted = tbl.get_int(pos + 1);
+            raw_set_int(state, tbl, pos, shifted)?;
+            pos += 1;
+        }
+        raw_set_int(state, tbl, pos, LuaValue::Nil)?;
+        return Ok(1);
+    }
     let tbl = state.value_at(1);
     state.table_get_i_value(&tbl, pos)?;   // push element to be returned
     while pos < size {
