@@ -2129,7 +2129,10 @@ pub fn gc(state: &mut LuaState, args: GcArgs) -> i32 {
                 let mut g = state.global_mut();
                 crate::state::reclaim_dead_long_strings(&mut *g);
             }
-            return (state.global().total_bytes() >> 10) as i32;
+            let g = state.global();
+            let long_string_bytes: usize = g.gc_tracked_long_strings.iter().map(|(_, sz)| sz).sum();
+            let total = g.heap.bytes_used() + long_string_bytes;
+            return (total >> 10) as i32;
         }
         // C: case LUA_GCCOUNTB: res = cast_int(gettotalbytes(g) & 0x3ff);
         GcArgs::CountB => {
@@ -2137,7 +2140,10 @@ pub fn gc(state: &mut LuaState, args: GcArgs) -> i32 {
                 let mut g = state.global_mut();
                 crate::state::reclaim_dead_long_strings(&mut *g);
             }
-            return (state.global().total_bytes() & 0x3ff) as i32;
+            let g = state.global();
+            let long_string_bytes: usize = g.gc_tracked_long_strings.iter().map(|(_, sz)| sz).sum();
+            let total = g.heap.bytes_used() + long_string_bytes;
+            return (total & 0x3ff) as i32;
         }
         // C: case LUA_GCSTEP: ...
         GcArgs::Step { data } => {

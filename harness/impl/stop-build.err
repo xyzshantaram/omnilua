@@ -356,51 +356,45 @@ warning: constant `L_MAX_LEN_NUM` is never used
    |       ^^^^^^^^^^^^^
 
 warning: constant `CIST_CLSRET` is never used
-   --> crates/lua-vm/src/state.rs:100:18
+   --> crates/lua-vm/src/state.rs:105:18
     |
-100 | pub(crate) const CIST_CLSRET: u16 = 1 << 9;
+105 | pub(crate) const CIST_CLSRET: u16 = 1 << 9;
     |                  ^^^^^^^^^^^
 
 warning: constant `LUA_RIDX_MAINTHREAD` is never used
-   --> crates/lua-vm/src/state.rs:105:18
+   --> crates/lua-vm/src/state.rs:110:18
     |
-105 | pub(crate) const LUA_RIDX_MAINTHREAD: i64 = 1;
+110 | pub(crate) const LUA_RIDX_MAINTHREAD: i64 = 1;
     |                  ^^^^^^^^^^^^^^^^^^^
 
 warning: constant `LUA_RIDX_GLOBALS` is never used
-   --> crates/lua-vm/src/state.rs:106:18
+   --> crates/lua-vm/src/state.rs:111:18
     |
-106 | pub(crate) const LUA_RIDX_GLOBALS: i64 = 2;
+111 | pub(crate) const LUA_RIDX_GLOBALS: i64 = 2;
     |                  ^^^^^^^^^^^^^^^^
 
 warning: constant `LUA_RIDX_LAST` is never used
-   --> crates/lua-vm/src/state.rs:108:18
+   --> crates/lua-vm/src/state.rs:113:18
     |
-108 | pub(crate) const LUA_RIDX_LAST: usize = 2;
+113 | pub(crate) const LUA_RIDX_LAST: usize = 2;
     |                  ^^^^^^^^^^^^^
 
 warning: constant `LUA_EXTRASPACE` is never used
-   --> crates/lua-vm/src/state.rs:115:7
+   --> crates/lua-vm/src/state.rs:120:7
     |
-115 | const LUA_EXTRASPACE: usize = std::mem::size_of::<*mut ()>();
+120 | const LUA_EXTRASPACE: usize = std::mem::size_of::<*mut ()>();
     |       ^^^^^^^^^^^^^^
 
-warning: function `inc_c_stack` is never used
-    --> crates/lua-vm/src/state.rs:3398:15
-     |
-3398 | pub(crate) fn inc_c_stack(state: &mut LuaState) -> Result<(), LuaError> {
-     |               ^^^^^^^^^^^
-
 warning: function `free_thread` is never used
-    --> crates/lua-vm/src/state.rs:3767:15
+    --> crates/lua-vm/src/state.rs:3772:15
      |
-3767 | pub(crate) fn free_thread(caller: &mut LuaState, thread: &mut LuaState) {
+3772 | pub(crate) fn free_thread(caller: &mut LuaState, thread: &mut LuaState) {
      |               ^^^^^^^^^^^
 
 warning: function `warn_error` is never used
-    --> crates/lua-vm/src/state.rs:4184:15
+    --> crates/lua-vm/src/state.rs:4189:15
      |
-4184 | pub(crate) fn warn_error(state: &mut LuaState, where_: &[u8]) {
+4189 | pub(crate) fn warn_error(state: &mut LuaState, where_: &[u8]) {
      |               ^^^^^^^^^^
 
 warning: type alias `LocalGcRef` is never used
@@ -486,9 +480,9 @@ help: refactor your code, or use `std::ptr::fn_addr_eq` to suppress the lint
      |
 
 warning: structure field `nCcalls` should have a snake case name
-    --> crates/lua-vm/src/state.rs:1372:9
+    --> crates/lua-vm/src/state.rs:1377:9
      |
-1372 |     pub nCcalls: u32,
+1377 |     pub nCcalls: u32,
      |         ^^^^^^^ help: convert the identifier to snake case: `n_ccalls`
      |
      = note: `#[warn(non_snake_case)]` (part of `#[warn(nonstandard_style)]`) on by default

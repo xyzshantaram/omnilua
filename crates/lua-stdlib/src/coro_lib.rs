@@ -484,18 +484,23 @@ pub fn co_running(state: &mut LuaState) -> Result<usize, LuaError> {
 ///
 /// C: `static int luaB_close(lua_State *L)`
 pub fn co_close(state: &mut LuaState) -> Result<usize, LuaError> {
-    let co = get_co(state)?;
-    let status = aux_status(state, &co);
-    match status {
-        COS_DEAD | COS_YIELD => close_suspended_or_dead(state, co),
-        _ => {
-            let name = if status == COS_RUN { "running" } else { "normal" };
-            Err(LuaError::runtime(format_args!(
-                "cannot close a {} coroutine",
-                name
-            )))
+    lua_vm::state::inc_c_stack(state)?;
+    let result = (|| {
+        let co = get_co(state)?;
+        let status = aux_status(state, &co);
+        match status {
+            COS_DEAD | COS_YIELD => close_suspended_or_dead(state, co),
+            _ => {
+                let name = if status == COS_RUN { "running" } else { "normal" };
+                Err(LuaError::runtime(format_args!(
+                    "cannot close a {} coroutine",
+                    name
+                )))
+            }
         }
-    }
+    })();
+    state.nCcalls -= 1;
+    result
 }
 
 /// Performs the actual close for a suspended or dead coroutine.

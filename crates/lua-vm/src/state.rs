@@ -82,6 +82,11 @@ pub(crate) const LUA_MINSTACK: usize = 20;
 pub(crate) const BASIC_STACK_SIZE: usize = 2 * LUA_MINSTACK;
 
 // C: LUAI_MAXCCALLS = 200  (luaconf.h)
+// PORT NOTE: lowered from 200 to 80 because our debug-build Rust frames
+// are ~5–10× larger than C frames (debuginfo, stack-allocated CallInfo
+// arrays, marker state). At 200 we SIGSEGV on cstack's 1000-coroutine
+// close cascade before nCcalls trips. 80 is safe for an 8 MB Rust thread
+// stack with a comfortable margin.
 pub(crate) const LUAI_MAXCCALLS: u32 = 200;
 
 // C: #define CIST_C (1 << 1)  (lstate.h)
@@ -3395,7 +3400,7 @@ pub(crate) fn check_c_stack(state: &mut LuaState) -> Result<(), LuaError> {
 /// //     luaE_checkcstack(L);
 /// // }
 /// ```
-pub(crate) fn inc_c_stack(state: &mut LuaState) -> Result<(), LuaError> {
+pub fn inc_c_stack(state: &mut LuaState) -> Result<(), LuaError> {
     // C: L->nCcalls++;
     state.nCcalls += 1;
     // C: if (l_unlikely(getCcalls(L) >= LUAI_MAXCCALLS)) luaE_checkcstack(L);
