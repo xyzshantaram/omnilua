@@ -51,7 +51,7 @@ impl LuaLClosure {
 
     /// Returns the upvalue slot at index `i`. Cheap (Copy of a one-pointer
     /// `GcRef<UpVal>`).
-    #[inline]
+    #[inline(always)]
     pub fn upval(&self, i: usize) -> GcRef<UpVal> {
         self.upvals[i].get()
     }

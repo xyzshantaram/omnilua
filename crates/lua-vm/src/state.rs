@@ -2180,17 +2180,24 @@ impl LuaState {
     ///    reachable through any `Rc<RefCell<_>>`, so `aux_resume`
     ///    snapshots the parent's open upvalues into the mirror across the
     ///    resume boundary.
+    #[inline(always)]
     pub fn upvalue_get(&self, cl: &GcRef<LuaClosureLua>, n: usize) -> LuaValue {
         let uv = cl.upval(n);
         let (thread_id, idx) = match uv.try_open_payload() {
             Some(p) => p,
-            None => return uv.closed_value().clone(),
+            None => return *uv.closed_value(),
         };
         let current = self.cached_thread_id;
         let tid = thread_id as u64;
         if tid == current {
-            return self.stack[idx.0 as usize].val.clone();
+            return self.stack[idx.0 as usize].val;
         }
+        self.upvalue_get_cross_thread(tid, idx)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn upvalue_get_cross_thread(&self, tid: u64, idx: StackIdx) -> LuaValue {
         let entry_rc = {
             let g = self.global();
             g.threads.get(&tid).map(|e| e.state.clone())
@@ -2202,7 +2209,7 @@ impl LuaState {
         }
         let g = self.global();
         match g.cross_thread_upvals.get(&(tid, idx)) {
-            Some(v) => v.clone(),
+            Some(v) => *v,
             None => LuaValue::Nil,
         }
     }
@@ -2214,6 +2221,7 @@ impl LuaState {
     /// borrowable, otherwise the write lands in
     /// `GlobalState::cross_thread_upvals` (the active-resume case where
     /// the home thread is borrow-locked further up the call stack).
+    #[inline(always)]
     pub fn upvalue_set(&mut self, cl: &GcRef<LuaClosureLua>, n: usize, val: LuaValue) -> Result<(), LuaError> {
         let uv = cl.upval(n);
         match uv.try_open_payload() {
@@ -2221,26 +2229,38 @@ impl LuaState {
                 let tid = thread_id as u64;
                 let current = self.cached_thread_id;
                 if tid == current {
-                    self.set_at(idx, val);
+                    self.stack[idx.0 as usize].val = val;
                     return Ok(());
                 }
-                let entry_rc = {
-                    let g = self.global();
-                    g.threads.get(&tid).map(|e| e.state.clone())
-                };
-                if let Some(rc) = entry_rc {
-                    if let Ok(mut home_state) = rc.try_borrow_mut() {
-                        home_state.set_at(idx, val);
-                        return Ok(());
-                    }
-                }
-                let mut g = self.global_mut();
-                g.cross_thread_upvals.insert((tid, idx), val);
+                return self.upvalue_set_cross_thread(tid, idx, val);
             }
             None => {
                 uv.set_closed_value(val);
             }
         }
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn upvalue_set_cross_thread(
+        &mut self,
+        tid: u64,
+        idx: StackIdx,
+        val: LuaValue,
+    ) -> Result<(), LuaError> {
+        let entry_rc = {
+            let g = self.global();
+            g.threads.get(&tid).map(|e| e.state.clone())
+        };
+        if let Some(rc) = entry_rc {
+            if let Ok(mut home_state) = rc.try_borrow_mut() {
+                home_state.set_at(idx, val);
+                return Ok(());
+            }
+        }
+        let mut g = self.global_mut();
+        g.cross_thread_upvals.insert((tid, idx), val);
         Ok(())
     }
 

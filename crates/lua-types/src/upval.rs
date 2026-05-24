@@ -74,7 +74,7 @@ impl UpVal {
     /// Zero-`RefCell` fast path used by `upvalue_get` / `upvalue_set`.
     /// Returns `Some((thread_id, idx))` when the upvalue is still open,
     /// `None` otherwise.
-    #[inline]
+    #[inline(always)]
     pub fn try_open_payload(&self) -> Option<(usize, StackIdx)> {
         let tid = self.open_thread_id.get();
         if tid < 0 {
@@ -86,7 +86,7 @@ impl UpVal {
 
     /// Borrows the closed-side value. Callers must have confirmed the
     /// upvalue is closed (`try_open_payload` returned `None`).
-    #[inline]
+    #[inline(always)]
     pub fn closed_value(&self) -> Ref<'_, LuaValue> { self.closed_value.borrow() }
 
     pub fn close_with(&self, v: LuaValue) {
