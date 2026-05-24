@@ -315,39 +315,95 @@ impl InstructionExt for Instruction {
 /// PORT NOTE: lua-types does not yet expose the canonical `OP_MODES` table; this
 /// is a local stand-in keyed off the vm.rs `OpCode` stub so the four mode
 /// predicates above can answer correctly until the real table lands.
+const OP_MODE_BYTES: [u8; NUM_OPCODES as usize] = [
+    0x08, // Move
+    0x0a, // LoadI
+    0x0a, // LoadF
+    0x09, // LoadK
+    0x09, // LoadKX
+    0x08, // LoadFalse
+    0x08, // LFalseSkip
+    0x08, // LoadTrue
+    0x08, // LoadNil
+    0x08, // GetUpVal
+    0x00, // SetUpVal
+    0x08, // GetTabUp
+    0x08, // GetTable
+    0x08, // GetI
+    0x08, // GetField
+    0x00, // SetTabUp
+    0x00, // SetTable
+    0x00, // SetI
+    0x00, // SetField
+    0x08, // NewTable
+    0x08, // Self_
+    0x08, // AddI
+    0x08, // AddK
+    0x08, // SubK
+    0x08, // MulK
+    0x08, // ModK
+    0x08, // PowK
+    0x08, // DivK
+    0x08, // IDivK
+    0x08, // BAndK
+    0x08, // BOrK
+    0x08, // BXOrK
+    0x08, // ShrI
+    0x08, // ShlI
+    0x08, // Add
+    0x08, // Sub
+    0x08, // Mul
+    0x08, // Mod
+    0x08, // Pow
+    0x08, // Div
+    0x08, // IDiv
+    0x08, // BAnd
+    0x08, // BOr
+    0x08, // BXOr
+    0x08, // Shl
+    0x08, // Shr
+    0x80, // MmBin
+    0x80, // MmBinI
+    0x80, // MmBinK
+    0x08, // Unm
+    0x08, // BNot
+    0x08, // Not
+    0x08, // Len
+    0x08, // Concat
+    0x00, // Close
+    0x00, // Tbc
+    0x04, // Jmp
+    0x10, // Eq
+    0x10, // Lt
+    0x10, // Le
+    0x10, // EqK
+    0x10, // EqI
+    0x10, // LtI
+    0x10, // LeI
+    0x10, // GtI
+    0x10, // GeI
+    0x10, // Test
+    0x18, // TestSet
+    0x68, // Call
+    0x68, // TailCall
+    0x20, // Return
+    0x00, // Return0
+    0x00, // Return1
+    0x09, // ForLoop
+    0x09, // ForPrep
+    0x01, // TForPrep
+    0x00, // TForCall
+    0x09, // TForLoop
+    0x20, // SetList
+    0x09, // Closure
+    0x48, // VarArg
+    0x28, // VarArgPrep
+    0x03, // ExtraArg
+];
+
+#[inline(always)]
 fn op_mode_byte(op: OpCode) -> u8 {
-    use OpCode::*;
-    match op {
-        Move => 0x08,
-        LoadI | LoadF => 0x0a,
-        LoadK | LoadKX => 0x09,
-        LoadFalse | LFalseSkip | LoadTrue | LoadNil => 0x08,
-        GetUpVal => 0x08,
-        SetUpVal => 0x00,
-        GetTabUp | GetTable | GetI | GetField => 0x08,
-        SetTabUp | SetTable | SetI | SetField => 0x00,
-        NewTable | Self_ => 0x08,
-        AddI | AddK | SubK | MulK | ModK | PowK | DivK | IDivK
-            | BAndK | BOrK | BXOrK | ShrI | ShlI => 0x08,
-        Add | Sub | Mul | Mod | Pow | Div | IDiv
-            | BAnd | BOr | BXOr | Shl | Shr => 0x08,
-        MmBin | MmBinI | MmBinK => 0x80,
-        Unm | BNot | Not | Len | Concat => 0x08,
-        Close | Tbc => 0x00,
-        Jmp => 0x04,
-        Eq | Lt | Le | EqK | EqI | LtI | LeI | GtI | GeI | Test => 0x10,
-        TestSet => 0x18,
-        Call | TailCall => 0x68,
-        Return => 0x20,
-        Return0 | Return1 => 0x00,
-        ForLoop | ForPrep | TForLoop | Closure => 0x09,
-        TForPrep => 0x01,
-        TForCall => 0x00,
-        SetList => 0x20,
-        VarArg => 0x48,
-        VarArgPrep => 0x28,
-        ExtraArg => 0x03,
-    }
+    OP_MODE_BYTES[op as usize]
 }
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -1543,6 +1599,8 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                 }
                 let i: Instruction = state.proto_code(&cl, pc);
                 pc += 1;
+                let op = i.opcode();
+                let op_mode = op_mode_byte(op);
 
                 debug_assert!(base == state.ci_base(ci));
 
@@ -1553,12 +1611,12 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                 // registers from being traced as live GC roots after their
                 // expression has finished. CALL/RETURN/VARARG instructions
                 // with B == 0 are IT-mode and intentionally preserve `top`.
-                if !i.is_in_top() {
+                if (op_mode & (1 << 5)) == 0 || i.arg_b() != 0 {
                     state.set_top(base);
                 }
 
                 // C: vmdispatch(GET_OPCODE(i))
-                match i.opcode() {
+                match op {
                     // ── OP_MOVE ──────────────────────────────────────────────
                     // C: StkId ra = RA(i); setobjs2s(L, ra, RB(i));
                     OpCode::Move => {
