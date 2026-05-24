@@ -316,6 +316,14 @@ official suites stayed 44/44, and the matrix moved overall 1.39x -> 1.33x
 (`fibonacci` 2.26x -> 2.10x). If a hot C macro is an assertion/check macro,
 first determine whether the side effect exists in the upstream release build.
 
+The same principle applies to eager cleanup added by the port. Upstream
+`prepCallInfo` does not clear a new Lua frame's reserved register tail; stack
+cleanup is paid later by GC/thread traversal machinery. The Rust port was
+clearing that range on every Lua call. `97b3c4c` removed the per-call clear
+after dev and release official suites stayed 44/44, moving overall 1.31x ->
+1.25x and `fibonacci` 2.07x -> 1.93x. Treat "make stale slots tidy now" as a
+performance-sensitive semantic claim, not a free safety improvement.
+
 ### Pattern 6: Wall-clock sampling beats hypothesizing
 
 Every meaningful win in this session came from a `/usr/bin/sample` profile

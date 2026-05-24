@@ -265,6 +265,16 @@ official tests at 44/44 and moving the matrix overall from 1.39x to 1.33x
 effects, check whether the macro is compiled out before preserving those side
 effects in release Rust.
 
+Also audit "hygiene" work added by the port. Rust ports often clear or nil-fill
+reserved slots eagerly to make ownership and tracing feel tidy, but upstream C
+may deliberately defer that cleanup. C-Lua's `prepCallInfo` links the next
+`CallInfo` frame without clearing the reserved register tail; dead stack slots
+are cleaned during thread traversal / stack shrinking. The Rust port initially
+cleared that tail on every Lua call. Commit `97b3c4c` removed the per-call clear
+after dev/release official suites stayed 44/44, moving the matrix overall from
+1.31x to 1.25x and `fibonacci` from 2.07x to 1.93x. Rule: before adding
+hot-path cleanup for GC neatness, find where upstream actually pays that cost.
+
 **The negative-result variant: clones aren't always the cost.** Example
 (lua, da9401e): we suspected `LuaValue::Clone` in the arith opcodes
 was a real cost — every `OP_ADD` cloned two operands to satisfy the
