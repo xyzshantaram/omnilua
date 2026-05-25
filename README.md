@@ -7,6 +7,7 @@ interpreter. It runs ordinary Lua programs with no C runtime dependency, and it
 passes **44 / 44** of the upstream Lua test suite — the same `.lua` files the C
 implementation is validated against.
 
+[![CI](https://github.com/ianm199/lua-rs-port/actions/workflows/ci.yml/badge.svg)](https://github.com/ianm199/lua-rs-port/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/lua-cli.svg?label=crates.io%2Flua-cli)](https://crates.io/crates/lua-cli)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![upstream tests](https://img.shields.io/badge/upstream%20suite-44%2F44-0f8f68.svg)](#conformance)
@@ -120,24 +121,36 @@ published rather than reduced to one headline number. Method and policy are in
 
 ## Safety model
 
-`lua-rs` exposes a safe public surface over a small, audited unsafe core. Most
-crates in the workspace compile under `#![forbid(unsafe_code)]` (the workspace
-default). The remaining `unsafe` is explicitly budgeted, per-crate ceilings
-enforced by a CI-style gate:
+`lua-rs` is a mostly-safe runtime wrapped around a small, explicit unsafe
+kernel — **not** "completely safe Rust," but not unsafe-everywhere either. Most
+of the workspace compiles under `#![forbid(unsafe_code)]` (the default), and the
+VM, parser, lexer, bytecode compiler, standard library, and coroutine layer are
+all budgeted at **zero** unsafe. Per-crate ceilings are enforced by a gate:
 
 ```bash
-.claude/hooks/unsafe-budget.sh
+.claude/hooks/unsafe-budget.sh   # ceilings live in harness/unsafe-budgets.toml
 ```
 
-The budgeted unsafe lives in:
+All of the project's real `unsafe` lives in two places:
 
-- **`lua-gc`** — the garbage collector's heap and tracing internals.
-- **`lua-cli`** — the optional `libloading`-backed dynamic-library backend (FFI
-  is inherently unsafe; each block carries a `// SAFETY:` justification).
+- **The GC core — `crates/lua-gc` (13 budgeted sites).** This is the trusted
+  kernel: raw-pointer object identity, intrusive heap walking, gray-list
+  traversal, sweep cursors, and `Box::from_raw` reclamation. Its soundness rests
+  on one invariant — collection only runs at safepoints where every live
+  `Gc<T>` handle is reachable through the traced root graph. This is the part to
+  treat seriously: if that invariant is wrong, the bugs can be serious.
+- **Dynamic library loading — `crates/lua-cli` (5 budgeted sites).**
+  `libloading` is inherently unsafe — it opens arbitrary symbols from shared
+  objects. This unsafe is narrow and only activated when loading dynamic
+  modules; each block carries a `// SAFETY:` justification.
 
-This is **not** "completely safe Rust," and the README will not claim that. It
-is a safe surface over a contained, documented unsafe core. Details in
-[docs/LUA_SYSTEM_DEEP_DIVE.md](docs/LUA_SYSTEM_DEEP_DIVE.md) and
+This split is a deliberate trade-off. `lua-rs` optimizes for Lua **ecosystem and
+CLI compatibility** — a full CLI surface, `require`/`package`, LuaRocks pure-Lua
+workflows, and dynamic module loading. Pure-Rust, embedding-focused Lua
+implementations can be safer still, but typically target a narrower, sandboxed
+host surface; our small unsafe core is what buys the broader compatibility.
+
+Details in [docs/LUA_SYSTEM_DEEP_DIVE.md](docs/LUA_SYSTEM_DEEP_DIVE.md) and
 [docs/PUBLISH_READINESS.md](docs/PUBLISH_READINESS.md).
 
 ## How it was built
@@ -160,10 +173,19 @@ mark a test passing — anti-sycophancy by construction.
 
 ## Roadmap
 
-- **LuaRocks support (in progress).** The LuaRocks 3.11.1 CLI boots under
-  `lua-rs` and prints its version/config output; `luarocks install <rock>` does
-  not work yet (fetch/digest/install-path work remains, plus an exit-teardown
-  fix). Plan: [docs/PHASE_G_LUAROCKS_PLAN.md](docs/PHASE_G_LUAROCKS_PLAN.md).
+- **LuaRocks support for pure-Lua rocks (in progress).** `lua-rs` can run
+  LuaRocks 3.11.1 well enough to search, install, list, show, and use pure-Lua
+  rocks such as `inspect`. Native C rocks remain out of scope until there is
+  either targeted Rust-native module coverage or a PUC-Rio Lua C API/ABI layer.
+  Plain-English explainer: [docs/LUAROCKS_SIGNIFICANCE.md](docs/LUAROCKS_SIGNIFICANCE.md).
+  Technical plan: [docs/PHASE_G_LUAROCKS_PLAN.md](docs/PHASE_G_LUAROCKS_PLAN.md).
+- **Performance parity with PUC-Rio Lua.** Close the remaining wall-time gap
+  (~1.27× geomean today) toward parity with reference C-Lua, tracked commit by
+  commit on the [live dashboard](https://ianm199.github.io/lua-rs-port/harness/bench/history/).
+- **A testbed for runtime research.** Use the safe-Rust substrate to prototype
+  and measure new garbage-collection strategies and other language/runtime
+  features against a real conformance suite and benchmark harness — changes are
+  validated by the oracle, not by intuition.
 - **CLI surface.** REPL, stdin execution, and a polished `--help`/`--version`.
 - **Embedding API.** A Rust-native embedding surface; a C API/ABI story is a
   longer-term, separate effort. See [docs/FUTURE_GOALS.md](docs/FUTURE_GOALS.md).
