@@ -18,8 +18,8 @@ lua-rs -e 'print("hello")'
 
 - Passes the full upstream Lua 5.4.7 test suite (44/44).
 - A standalone binary: no `liblua`, no C interpreter, no C toolchain to build it.
-- Mostly safe Rust. The only `unsafe` is a small, audited core in the garbage
-  collector and the optional dynamic-library loader.
+- Mostly safe Rust, with unsafe isolated to audited GC, dynamic-loading, and
+  WASM pointer-ABI boundaries.
 - Competitive with reference C (~1.3× geomean wall time), benchmarked per commit.
 
 ## Usage
@@ -49,10 +49,12 @@ ABI compatibility, and stock Lua C modules that expect `liblua` won't load.
 
 ## Safety
 
-Most crates build under `#![forbid(unsafe_code)]`. The only `unsafe` is in the
-garbage collector (`lua-gc`) and the optional dynamic-library loader (`lua-cli`);
-both are budgeted and audited. It is not 100% safe Rust yet. See
-[docs/LUA_SYSTEM_DEEP_DIVE.md](docs/LUA_SYSTEM_DEEP_DIVE.md).
+Most crates build under `#![forbid(unsafe_code)]`. The trusted unsafe surface is
+budgeted in `lua-gc` for the collector, `lua-cli` for optional dynamic-library
+loading, and the dedicated `lua-wasm` / `lua-wasm-smoke` crates for the
+WebAssembly linear-memory pointer ABI. The core VM, stdlib, parser, runtime
+helper, and package wrapper stay outside that unsafe surface. It is not 100%
+safe Rust yet. See [docs/LUA_SYSTEM_DEEP_DIVE.md](docs/LUA_SYSTEM_DEEP_DIVE.md).
 
 ## Performance
 
@@ -60,6 +62,34 @@ both are budgeted and audited. It is not 100% safe Rust yet. See
 latest commit the geomean wall time is ~1.27× C and peak memory ~1.96× C, with
 some workloads faster than C. It is competitive with C, not faster, and is not
 LuaJIT. [Live dashboard.](https://ianm199.github.io/lua-rs/harness/bench/history/)
+
+## WebAssembly
+
+The interpreter core and stdlib crates build for bare
+`wasm32-unknown-unknown`, and the repo includes runtime smoke tests that
+instantiate the generated `.wasm` with Node's `WebAssembly` API and a headless
+browser:
+
+```bash
+RUSTFLAGS='-Awarnings' cargo build --target wasm32-unknown-unknown -p lua-wasm --release
+node harness/wasm/runtime-smoke.mjs
+node harness/wasm/browser-smoke.mjs   # requires Chrome/Chromium, or set LUA_RS_BROWSER
+```
+
+This currently verifies JS-provided Lua source execution, pure Lua execution,
+JS-provided host imports for stdout/stdin/env/time/read-only Lua module loading,
+JS-backed `io.open` read/write/seek/setvbuf handles, JS-backed errno
+propagation for file read failures, stateful `lua.exec(...)` calls plus reset,
+Lua-level failures for unsupported temp-file capabilities, and last-error
+reporting back to JS. The native `lua-rs` CLI is not a bare-WASM binary; it
+depends on terminal/filesystem/process functionality. The current Rust
+embedding helper is `lua-rs-runtime::{LuaRuntime, HostHooks}`, and
+`packages/lua-rs-wasm` exposes a browser-compatible
+`loadLuaRs(...).lua.exec(...)` wrapper over the WASM ABI. Its `prepack` script
+builds and includes `dist/lua_wasm.wasm` for npm packaging. Publishing that npm
+package and adding WASI support are separate future work. See
+[harness/wasm/README.md](harness/wasm/README.md) for the runnable host-callback
+smoke.
 
 ## LuaRocks
 
@@ -87,8 +117,9 @@ LUA_PATH="/tmp/rocks/share/lua/5.4/?.lua;;" lua-rs -e 'print(require("inspect")(
 - Get to full safety: drive the remaining `unsafe` (in the garbage collector and
   the dynamic-library loader) to zero, so the whole runtime is safe Rust.
 - Reach performance parity with reference Lua 5.4.
-- A Rust embedding API: run Lua from Rust as a crate, with no C toolchain. See
-  [docs/FUTURE_GOALS.md](docs/FUTURE_GOALS.md).
+- A polished Rust embedding API: `lua-rs-runtime` now has the first thin helper
+  for running chunks with host hooks; closure-based browser/app embedding is the
+  next layer. See [docs/FUTURE_GOALS.md](docs/FUTURE_GOALS.md).
 
 ## Project layout
 
@@ -100,7 +131,10 @@ crates/
   lua-gc                         # garbage collector
   lua-stdlib                     # standard library
   lua-coro                       # coroutines
+  lua-rs-runtime                 # embedding helper and host-hook setup
+  lua-wasm                       # bare wasm32 embedding artifact
   lua-cli                        # the `lua-rs` binary
+  lua-wasm-smoke                 # bare wasm32 runtime smoke harness
 harness/                         # test and benchmark scripts
 reference/                       # pinned upstream Lua 5.4.7 (used to diff against)
 ```
@@ -111,6 +145,13 @@ reference/                       # pinned upstream Lua 5.4.7 (used to diff again
 cargo build --bin lua-rs
 TEST_TIMEOUT_S=90 ./harness/run_official_all.sh                # full suite (44/44)
 ./harness/run_one_test.sh reference/lua-c/testes/strings.lua   # one test
+RUSTFLAGS='-Awarnings' cargo build --target wasm32-unknown-unknown -p lua-wasm --release
+node harness/wasm/runtime-smoke.mjs
+node harness/wasm/browser-smoke.mjs
+npm run build:wasm --prefix packages/lua-rs-wasm
+npm test --prefix packages/lua-rs-wasm
+npm run test:install --prefix packages/lua-rs-wasm
+./harness/check_wasm_package.sh
 ```
 
 ## License
