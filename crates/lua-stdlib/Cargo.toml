@@ -8,8 +8,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
 
 [dependencies]
 lua-types.workspace = true

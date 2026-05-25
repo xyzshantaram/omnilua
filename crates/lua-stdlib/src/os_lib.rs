@@ -828,7 +828,7 @@ pub(crate) fn os_setlocale(state: &mut LuaState) -> Result<usize, LuaError> {
         Some(_) => None,             // any other locale: unsupported in this build
     };
     match result_locale {
-        Some(s) => { state.push_string(s); }
+        Some(s) => { state.push_string(s)?; }
         None => state.push(LuaValue::Nil),
     }
     Ok(1)

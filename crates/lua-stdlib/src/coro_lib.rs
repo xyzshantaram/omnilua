@@ -326,11 +326,11 @@ pub fn co_resume(state: &mut LuaState) -> Result<usize, LuaError> {
     let r = aux_resume(state, co, narg);
     if r < 0 {
         state.push(LuaValue::Bool(false));
-        state.insert(-2);
+        state.insert(-2)?;
         Ok(2)
     } else {
         state.push(LuaValue::Bool(true));
-        state.insert(-(r + 1));
+        state.insert(-(r + 1))?;
         Ok((r + 1) as usize)
     }
 }

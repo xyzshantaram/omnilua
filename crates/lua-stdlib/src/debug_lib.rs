@@ -162,7 +162,7 @@ fn treat_stack_option(
     fname: &[u8],
 ) -> Result<(), LuaError> {
     if target_is_self {
-        state.rotate(-2, 1);
+        state.rotate(-2, 1)?;
     } else {
         // TODO(port): moving a value from another thread's stack (lua_xmove)
         // requires simultaneous `&mut LuaState` for both threads. Not expressible
@@ -188,7 +188,7 @@ fn move_stack_option_from_target(
 /// `debug.getregistry()` — return the Lua registry table.
 ///
 pub(crate) fn get_registry(state: &mut LuaState) -> Result<usize, LuaError> {
-    state.push_registry();
+    state.push_registry()?;
     Ok(1)
 }
 
@@ -223,7 +223,7 @@ pub(crate) fn set_metatable(state: &mut LuaState) -> Result<usize, LuaError> {
 pub(crate) fn get_uservalue(state: &mut LuaState) -> Result<usize, LuaError> {
     let n = state.opt_arg_integer(2, 1)? as i32;
     if state.type_at(1) != LuaType::UserData {
-        state.push_fail();
+        state.push_fail()?;
         return Ok(1);
     }
     let ty = state.get_iuservalue(1, n)?;
@@ -243,7 +243,7 @@ pub(crate) fn set_uservalue(state: &mut LuaState) -> Result<usize, LuaError> {
     state.check_arg_any(2)?;
     lua_vm::api::set_top(state, 2)?;
     if !state.set_iuservalue(1, n)? {
-        state.push_fail();
+        state.push_fail()?;
     }
     Ok(1)
 }
@@ -802,7 +802,7 @@ pub(crate) fn get_hook(state: &mut LuaState) -> Result<usize, LuaError> {
     };
 
     if !hook_is_set {
-        state.push_fail();
+        state.push_fail()?;
         return Ok(1);
     }
 
@@ -814,15 +814,15 @@ pub(crate) fn get_hook(state: &mut LuaState) -> Result<usize, LuaError> {
         state.get_registry_field(HOOKKEY)?;
         check_cross_thread_stack(state, target_is_self, 1)?;
         if target_is_self {
-            state.push_thread();
+            state.push_thread()?;
         } else {
             let key_thread = other_thread
                 .expect("other_thread is Some when target_is_self is false")
                 .clone();
             state.push(lua_types::value::LuaValue::Thread(key_thread));
         }
-        state.raw_get(-2);
-        state.remove(-2);
+        state.raw_get(-2)?;
+        state.remove(-2)?;
     }
 
     let smask = unmake_mask(mask);

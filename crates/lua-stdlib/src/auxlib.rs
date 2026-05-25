@@ -132,7 +132,7 @@ fn find_field(
             } else if find_field(state, objidx, level - 1)? {
                 // stack: lib_name, lib_table, field_name (top)
                 state.push_string(b".")?; // place '.' between the two names
-                state.replace(-3); // in the slot occupied by table
+                state.replace(-3)?; // in the slot occupied by table
                 state.concat(3)?; // lib_name.field_name
                 return Ok(true);
             }

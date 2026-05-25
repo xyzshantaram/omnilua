@@ -323,7 +323,7 @@ pub fn tmove(state: &mut LuaState) -> Result<usize, LuaError> {
         }
     }
     // TODO(port): state.push_value_at → lua_pushvalue; verify method name
-    state.push_value_at(tt);
+    state.push_value_at(tt)?;
     Ok(1)
 }
 
@@ -423,7 +423,7 @@ pub fn pack(state: &mut LuaState) -> Result<usize, LuaError> {
     let n = state.get_top();
     // TODO(port): state.create_table(narr, nrec) → lua_createtable; verify method name
     state.create_table(n, 1)?;
-    state.insert(1);
+    state.insert(1)?;
     // table_set_i pops the top; args shift from n+1..=2 down to 1..=n as we pop
     for i in (1..=n).rev() {
         state.table_set_i(1, i as i64)?;
@@ -545,9 +545,9 @@ fn sort_comp(state: &mut LuaState, a: i32, b: i32) -> Result<bool, LuaError> {
         return state.compare(a, b, CompareOp::Lt);
     }
     // User comparator at stack position 2.
-    state.push_value_at(2);       // push function
-    state.push_value_at(a - 1);   // push copy of a (compensate for function push)
-    state.push_value_at(b - 2);   // push copy of b (compensate for function + a copy)
+    state.push_value_at(2)?;       // push function
+    state.push_value_at(a - 1)?;   // push copy of a (compensate for function push)
+    state.push_value_at(b - 2)?;   // push copy of b (compensate for function + a copy)
     state.call(2, 1)?;
     // TODO(port): state.to_boolean(-1) → lua_toboolean (never fails); verify method name
     let res = state.to_boolean(-1);
@@ -737,7 +737,7 @@ fn aux_sort(state: &mut LuaState, mut lo: IdxT, mut up: IdxT, mut rnd: u32) -> R
         //   set2(p, up-1):     table[p] = a[up-1], table[up-1] = a[p]_copy;
         //                      stack: a[p] (-1)  ← pivot for partition
         state.table_get_i(1, p as i64)?;
-        state.push_value_at(-1); // duplicate: two copies of pivot on stack
+        state.push_value_at(-1)?; // duplicate: two copies of pivot on stack
         state.table_get_i(1, (up - 1) as i64)?;
         set2(state, p, up - 1)?;
         // One copy of the pivot value remains at the stack top for partition.

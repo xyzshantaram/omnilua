@@ -352,10 +352,10 @@ fn file_result(
             s.extend_from_slice(name);
             s.extend_from_slice(b": ");
             s.extend_from_slice(msg.as_bytes());
-            state.push_string(&s);
+            state.push_string(&s)?;
         }
         None => {
-            state.push_string(msg.as_bytes());
+            state.push_string(msg.as_bytes())?;
         }
     }
     let errno_code = os_err.raw_os_error().unwrap_or(0) as i64;
@@ -376,7 +376,7 @@ fn exec_result(state: &mut LuaState, stat: i32) -> Result<usize, LuaError> {
     } else {
         state.push(LuaValue::Bool(false));
         // TODO(port): distinguish exit vs signal via POSIX macros
-        state.push_string(b"exit");
+        state.push_string(b"exit")?;
         state.push(LuaValue::Int(stat as i64));
         Ok(3)
     }
@@ -514,7 +514,7 @@ fn io_noclose(state: &mut LuaState) -> Result<usize, LuaError> {
     let p_rc = get_lstream(state)?;
     p_rc.borrow_mut().close_fn = Some(io_noclose); // reinstall to keep the handle alive
     state.push(LuaValue::Bool(false));
-    state.push_string(b"cannot close standard file");
+    state.push_string(b"cannot close standard file")?;
     Ok(2)
 }
 
@@ -543,9 +543,9 @@ pub fn io_type(state: &mut LuaState) -> Result<usize, LuaError> {
                 None => true, // unknown userdata with FILE* metatable: treat as closed
             };
             if is_closed {
-                state.push_string(b"closed file");
+                state.push_string(b"closed file")?;
             } else {
-                state.push_string(b"file");
+                state.push_string(b"file")?;
             }
         }
     }
@@ -559,10 +559,10 @@ fn f_tostring(state: &mut LuaState) -> Result<usize, LuaError> {
     let p_rc = get_lstream(state)?;
     let closed = p_rc.borrow().is_closed();
     if closed {
-        state.push_string(b"file (closed)");
+        state.push_string(b"file (closed)")?;
     } else {
         // TODO(port): pointer-address representation for the file handle
-        state.push_string(b"file (0x?)");
+        state.push_string(b"file (0x?)")?;
     }
     Ok(1)
 }
@@ -768,7 +768,7 @@ fn g_iofile(state: &mut LuaState, key: &[u8], mode: &[u8]) -> Result<usize, LuaE
             opencheck(state, &filename, mode)?;
         } else {
             let _ = tofile(state)?;
-            state.push_value_at(1);
+            state.push_value_at(1)?;
         }
         state.registry_set(key)?;
     }
@@ -1246,7 +1246,7 @@ pub fn f_write(state: &mut LuaState) -> Result<usize, LuaError> {
     // Step 3: on success return the file handle (arg 1); on failure use file_result.
     match result {
         Ok(()) => {
-            state.push_value_at(1);
+            state.push_value_at(1)?;
             Ok(1)
         }
         Err(e) => file_result(state, false, None, e),
@@ -1407,7 +1407,7 @@ pub fn io_lines(state: &mut LuaState) -> Result<usize, LuaError> {
     }
     let toclose = if state.type_at(1) == LuaType::Nil {
         state.registry_get(IO_INPUT_KEY)?;
-        state.replace(1);
+        state.replace(1)?;
         let _ = tofile(state)?;
         false
     } else {
@@ -1422,7 +1422,7 @@ pub fn io_lines(state: &mut LuaState) -> Result<usize, LuaError> {
     if toclose {
         state.push(LuaValue::Nil); // state
         state.push(LuaValue::Nil); // control
-        state.push_value_at(1);    // file as to-be-closed variable (4th result)
+        state.push_value_at(1)?;    // file as to-be-closed variable (4th result)
         Ok(4)
     } else {
         Ok(1)
@@ -1515,7 +1515,7 @@ fn create_std_file(
         p.close_fn = Some(io_noclose);
     }
     if let Some(key) = registry_key {
-        state.push_value_at(-1);
+        state.push_value_at(-1)?;
         state.registry_set(key)?;
     }
     state.set_field(-2, field_name)?;

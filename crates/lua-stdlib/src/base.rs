@@ -175,7 +175,7 @@ fn load_aux(state: &mut LuaState, status_ok: bool, envidx: i32) -> Result<usize,
         Ok(1)
     } else {
         state.push(LuaValue::Nil);
-        state.insert(-2);
+        state.insert(-2)?;
         Ok(2)
     }
 }
@@ -676,7 +676,7 @@ pub(crate) fn assert_fn(state: &mut LuaState) -> Result<usize, LuaError> {
         return Ok(state.top() as usize);
     }
     state.check_arg_any(1)?;
-    state.remove(1);
+    state.remove(1)?;
     state.push_string(b"assertion failed!")?;
     lua_vm::api::set_top(state, 1)?;
     error_fn(state)
@@ -724,7 +724,7 @@ pub(crate) fn pcall_fn(state: &mut LuaState) -> Result<usize, LuaError> {
     // Stack before: [f, a1, …, aN]
     // Stack after:  [true, f, a1, …, aN]
     state.push(LuaValue::Bool(true));
-    state.insert(1);
+    state.insert(1)?;
     // nargs = gettop - 2 (subtract the sentinel `true` and the function).
     let nargs = state.top() as i32 - 2;
     let yieldable = state.is_yieldable();
@@ -762,7 +762,7 @@ pub(crate) fn xpcall_fn(state: &mut LuaState) -> Result<usize, LuaError> {
     // Stack after rotate:  [f, err, true, f, a1, …, aN]
     state.push(LuaValue::Bool(true));
     state.push_copy(1)?;
-    state.rotate(3, 2);
+    state.rotate(3, 2)?;
     // errfunc is at stack index 2; extra=2 means finishpcall skips 2 values.
     let yieldable = state.is_yieldable();
     let ok = match state.protected_call_k(n - 2, LUA_MULTRET, 2, 2, Some(finish_pcall_k)) {

@@ -293,7 +293,7 @@ fn decode_dynlib_id(p: *mut std::ffi::c_void) -> DynLibId {
 /// Return `registry["LUA_NOENV"]` as a boolean.
 ///
 fn noenv(state: &mut LuaState) -> bool {
-    state.get_field_registry(b"LUA_NOENV");
+    let _ = state.get_field_registry(b"LUA_NOENV");
     let b = state.to_boolean(-1);
     state.pop_n(1);
     b
@@ -378,8 +378,8 @@ fn setpath(
 /// Return the library handle stored at `registry._CLIBS[path]`, or `None`.
 ///
 fn checkclib(state: &mut LuaState, path: &[u8]) -> Option<DynLibId> {
-    state.get_field_registry(CLIBS);
-    state.get_field(-1, path);
+    let _ = state.get_field_registry(CLIBS);
+    let _ = state.get_field(-1, path);
     let handle = state.to_light_userdata(-1).map(decode_dynlib_id);
     state.pop_n(2);
     handle
@@ -388,9 +388,9 @@ fn checkclib(state: &mut LuaState, path: &[u8]) -> Option<DynLibId> {
 /// Register a library handle in the CLIBS table (both by path and sequentially).
 ///
 fn addtoclib(state: &mut LuaState, path: &[u8], plib: DynLibId) -> Result<(), LuaError> {
-    state.get_field_registry(CLIBS);
+    state.get_field_registry(CLIBS)?;
     state.push(LuaValue::LightUserData(encode_dynlib_id(plib)));
-    state.push_value(-1);
+    state.push_value(-1)?;
     state.set_field(-3, path)?;
     let n = state.len_at(-2);
     state.raw_seti(-2, n + 1)?;
@@ -489,7 +489,7 @@ pub fn ll_loadlib(state: &mut LuaState) -> Result<usize, LuaError> {
     };
     // PORT NOTE: luaL_pushfail pushes `false` in Lua 5.4 (changed from nil).
     state.push(LuaValue::Bool(false));
-    state.insert(-2);
+    state.insert(-2)?;
     //
     // PORT NOTE: the `LIB_FAIL` tag is chosen at run time. The CLI backend
     // reports `LuaError::File` for a missing library → `"absent"` (matching
@@ -636,7 +636,7 @@ pub fn ll_searchpath(state: &mut LuaState) -> Result<usize, LuaError> {
         return Ok(1);
     }
     state.push(LuaValue::Bool(false));
-    state.insert(-2);
+    state.insert(-2)?;
     Ok(2)
 }
 
@@ -847,7 +847,7 @@ fn searcher_croot(state: &mut LuaState) -> Result<usize, LuaError> {
 ///
 fn searcher_preload(state: &mut LuaState) -> Result<usize, LuaError> {
     let name = state.check_arg_string(1)?.to_vec();
-    state.get_field_registry(b"_PRELOAD");
+    state.get_field_registry(b"_PRELOAD")?;
     let ty = state.get_field(-1, &name)?;
     if ty == LuaType::Nil {
         let mut msg = b"no field package.preload['".to_vec();
@@ -968,13 +968,13 @@ pub fn ll_require(state: &mut LuaState) -> Result<usize, LuaError> {
     findloader(state, &name)?;
 
     // Swaps loader and loaderdata: [..., loaderdata, loader]
-    state.rotate(-2, 1);
+    state.rotate(-2, 1)?;
 
-    state.push_value(1);
+    state.push_value(1)?;
 
     // PORT NOTE: After the rotate, loaderdata is 3 from top (-3). In C this is
     // at absolute index 4 (but C uses the pre-rotate layout). TODO(port): verify.
-    state.push_value(-3);
+    state.push_value(-3)?;
 
     state.call(2, 1)?;
 
@@ -987,11 +987,11 @@ pub fn ll_require(state: &mut LuaState) -> Result<usize, LuaError> {
     let ty = state.get_field(2, &name)?;
     if ty == LuaType::Nil {
         state.push(LuaValue::Bool(true));
-        state.copy_value(-1, -2);
+        state.copy_value(-1, -2)?;
         state.set_field(2, &name)?;
     }
 
-    state.rotate(-2, 1);
+    state.rotate(-2, 1)?;
 
     Ok(2)
 }
@@ -1010,10 +1010,10 @@ fn createsearcherstable(state: &mut LuaState) -> Result<(), LuaError> {
         searcher_croot,
     ];
 
-    state.create_table(searchers.len() as i32, 0);
+    state.create_table(searchers.len() as i32, 0)?;
 
     for (i, &f) in searchers.iter().enumerate() {
-        state.push_value(-2);
+        state.push_value(-2)?;
         // TODO(port): push_c_closure takes the function and n upvalues from the
         //             stack. The package table upvalue must be correctly associated
         //             with each searcher closure so that findfile can access it
@@ -1030,7 +1030,7 @@ fn createsearcherstable(state: &mut LuaState) -> Result<(), LuaError> {
 ///
 fn createclibstable(state: &mut LuaState) -> Result<(), LuaError> {
     state.get_subtable_registry(CLIBS)?;
-    state.create_table(0, 1);
+    state.create_table(0, 1)?;
     // TODO(phase-b): LuaClosure::LightC currently typed fn() -> i32 in lua-types; use push_c_function until widened.
     state.push_c_function(gctm)?;
     state.set_field(-2, b"__gc")?;
@@ -1081,8 +1081,8 @@ pub fn luaopen_package(state: &mut LuaState) -> Result<usize, LuaError> {
     state.get_subtable_registry(b"_PRELOAD")?;
     state.set_field(-2, b"preload")?;
 
-    state.push_globals();
-    state.push_value(-2);
+    state.push_globals()?;
+    state.push_value(-2)?;
     state.set_funcs_with_upvalues(
         &[(b"require" as &[u8], ll_require as fn(&mut LuaState) -> Result<usize, LuaError>)],
         1,
