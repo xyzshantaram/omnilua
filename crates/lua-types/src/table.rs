@@ -648,17 +648,10 @@ impl TableInner {
             }
             let idx = lf - 1;
             self.lastfree = Some(idx);
-            if self.node[idx].key_is_nil() && !self.node_has_chain_link(idx) {
+            if self.node[idx].key_is_nil() {
                 return Some(idx);
             }
         }
-    }
-
-    fn node_has_chain_link(&self, idx: usize) -> bool {
-        if self.node[idx].next != 0 {
-            return true;
-        }
-        self.find_chain_predecessor(idx).is_some()
     }
 
     fn find_chain_predecessor(&self, idx: usize) -> Option<usize> {
