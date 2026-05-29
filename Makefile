@@ -4,6 +4,7 @@
 #   make rust          workspace unit/integration tests + embedding doctests
 #   make conformance   official Lua 5.4 suite against the lua-rs binary
 #   make perf          benchmark vs reference C Lua (measurement, not a gate)
+#   make scaling       flag superlinear (O(n^2)) behavior in hot operations
 #   make build         debug lua-rs binary
 #   make setup         bootstrap the conformance test directory
 #
@@ -14,7 +15,7 @@ CARGO ?= cargo
 TEST_TIMEOUT_S ?= 90
 export TEST_TIMEOUT_S
 
-.PHONY: help test build setup rust conformance perf clean
+.PHONY: help test build setup rust conformance perf scaling clean
 
 help:
 	@grep -E '^#   make ' Makefile | sed 's/^#   /  /'
@@ -43,6 +44,10 @@ perf:
 	@[ -x reference/lua-5.4.7/src/lua ] || $(MAKE) -C reference/lua-5.4.7 guess
 	$(CARGO) build --release --bin lua-rs
 	bash harness/bench/compare.sh
+
+scaling:
+	$(CARGO) build --release --bin lua-rs
+	python3 harness/bench/scaling-check.py
 
 clean:
 	$(CARGO) clean
