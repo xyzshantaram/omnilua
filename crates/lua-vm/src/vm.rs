@@ -140,13 +140,28 @@ pub enum OpCode {
     VarArg = 80,
     VarArgPrep = 81,
     ExtraArg = 82,
+    /// Lua 5.5 `global name = expr` guard. Reads register A (the current value
+    /// of the global), and if it is non-nil raises `global '<name>' already
+    /// defined`. Bx encodes the name: 0 means "?", otherwise Bx-1 is the index
+    /// into the constant table of the name string. Mirrors upstream
+    /// `OP_ERRNNIL` (`ldebug.c:luaG_errnnil`). 5.5-only; no other version emits
+    /// it. Appended after `ExtraArg` so existing opcode indices are unchanged.
+    ErrNNil = 83,
+    /// Lua 5.5 named-varargs (`function f(...t)`) support. Packs all extra
+    /// varargs of the current frame into a fresh table stored in register A,
+    /// with `table.pack` semantics: a 1-based sequence of all extra args plus
+    /// an integer `.n` field counting them (including nil holes). Emitted once
+    /// at function entry (right after `VarArgPrep`) when a vararg name is bound.
+    /// 5.5-only; no other version's parser emits it. Appended after `ErrNNil`
+    /// so existing opcode indices are unchanged.
+    VarArgPack = 84,
 }
 
 /// Number of distinct opcodes (matches C-Lua's `NUM_OPCODES`). Held for
 /// downstream debug/dump callers that count opcodes by name; the dispatch
 /// hot path in `InstructionExt::opcode` does its own per-arm match.
 #[allow(dead_code)]
-const NUM_OPCODES: u8 = 83;
+const NUM_OPCODES: u8 = 85;
 
 impl OpCode {
     /// Legacy alias retained because the prior duplicate enum variant
@@ -250,6 +265,8 @@ impl OpCode {
             80 => Some(Self::VarArg),
             81 => Some(Self::VarArgPrep),
             82 => Some(Self::ExtraArg),
+            83 => Some(Self::ErrNNil),
+            84 => Some(Self::VarArgPack),
             _ => None,
         }
     }
@@ -371,6 +388,8 @@ impl InstructionExt for Instruction {
             80 => OpCode::VarArg,
             81 => OpCode::VarArgPrep,
             82 => OpCode::ExtraArg,
+            83 => OpCode::ErrNNil,
+            84 => OpCode::VarArgPack,
             _ => OpCode::ExtraArg,
         }
     }
@@ -499,6 +518,8 @@ const OP_MODE_BYTES: [u8; NUM_OPCODES as usize] = [
     0x48, // VarArg
     0x28, // VarArgPrep
     0x03, // ExtraArg
+    0x01, // ErrNNil (iABx, no A-write, no test)
+    0x08, // VarArgPack (iABC, sets register A)
 ];
 
 #[inline(always)]
@@ -2751,6 +2772,60 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                     // ── OP_EXTRAARG ────────────────────────────────────────────
                     OpCode::ExtraArg => {
                         debug_assert!(false, "OP_EXTRAARG executed directly");
+                    }
+                    // ── OP_ERRNNIL (Lua 5.5 global-already-defined guard) ──────
+                    //    luaG_errnnil: if the global's current value is non-nil,
+                    //    raise `global '<name>' already defined`. Bx == 0 → "?",
+                    //    else Bx-1 indexes the constant table for the name.
+                    OpCode::ErrNNil => {
+                        let ra = base + i.arg_a();
+                        if !matches!(state.get_at(ra), LuaValue::Nil) {
+                            let bx = i.arg_bx();
+                            let name: Vec<u8> = if bx == 0 {
+                                b"?".to_vec()
+                            } else {
+                                match state.proto_const(&cl, (bx - 1) as usize) {
+                                    LuaValue::Str(s) => s.as_bytes().to_vec(),
+                                    _ => b"?".to_vec(),
+                                }
+                            };
+                            let mut msg = Vec::with_capacity(name.len() + 24);
+                            msg.extend_from_slice(b"global '");
+                            msg.extend_from_slice(&name);
+                            msg.extend_from_slice(b"' already defined");
+                            state.set_ci_savedpc(ci, pc);
+                            return Err(crate::debug::prefixed_runtime_pub(state, msg));
+                        }
+                    }
+                    // ── OP_VARARGPACK (Lua 5.5 named varargs) ──────────────────
+                    //    Pack the current frame's extra varargs into a fresh
+                    //    table stored in register A. Mirrors `table.pack(...)`:
+                    //    a 1-based sequence of all extra args plus an integer
+                    //    `.n` field counting them (nil holes included). The
+                    //    extra args were moved by VARARGPREP to the slots just
+                    //    below `ci->func`, i.e. `ci_func - nextra .. ci_func-1`.
+                    OpCode::VarArgPack => {
+                        let ra = base + i.arg_a();
+                        let nextra = state.ci_nextraargs(ci);
+                        let ci_func: StackIdx = state.ci_base(ci) - 1;
+                        let t = if nextra > 0 {
+                            state.new_table_with_sizes(nextra as u32, 1)?
+                        } else {
+                            state.new_table()
+                        };
+                        for k in 0..nextra {
+                            let src: StackIdx = ci_func - nextra as i32 + k as i32;
+                            let val = state.get_at(src);
+                            t.raw_set_int(state, (k + 1) as i64, val)?;
+                        }
+                        let n_key = state.intern_str(b"n")?;
+                        t.raw_set(state, LuaValue::Str(n_key), LuaValue::Int(nextra as i64))?;
+                        state.set_at(ra, LuaValue::Table(t));
+                        state.set_ci_savedpc(ci, pc);
+                        state.gc_cond_step();
+                        if state.hookmask != 0 {
+                            trap = state.ci_trap(ci);
+                        }
                     }
                 } // end match opcode
             } // end 'dispatch loop

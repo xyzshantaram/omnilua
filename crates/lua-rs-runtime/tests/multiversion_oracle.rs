@@ -91,6 +91,64 @@ fn v55_global_initializer_stored() {
 }
 
 #[test]
+fn v55_global_already_defined_guard() {
+    // Div.1: `global name = expr` raises `global '<name>' already defined` at
+    // runtime when the global currently holds a non-nil value. Pinned against
+    // lua5.5.0 (specs/followup/5.5-lang.md).
+
+    // Re-declare-with-initializer when already non-nil → error.
+    err_contains(
+        LuaVersion::V55,
+        "global x = 1; global x = 2",
+        "global 'x' already defined",
+    );
+    // The non-nil value can arrive via a plain assignment, not just an init.
+    err_contains(
+        LuaVersion::V55,
+        "global x; x = 5; global x = 9",
+        "global 'x' already defined",
+    );
+    // `false` is non-nil, so it also triggers the guard (strict nil check).
+    err_contains(
+        LuaVersion::V55,
+        "global x = false; global x = 1",
+        "global 'x' already defined",
+    );
+    // A nested-block re-init still checks the live value.
+    err_contains(
+        LuaVersion::V55,
+        "global x = 1; do global x = 2 end",
+        "global 'x' already defined",
+    );
+    // In a multi-name decl, the guard fires for whichever name is already
+    // defined (checked top-down, matching upstream `initglobal`).
+    err_contains(
+        LuaVersion::V55,
+        "global a = 1; global b = 2; global a, b = 3, 4",
+        "global 'b' already defined",
+    );
+
+    // Nil'd out first → the re-init is allowed (proves it is a live-value
+    // check, not compile-time redeclaration tracking).
+    eq(LuaVersion::V55, "global x = 1; x = nil; global x = 2; return x", "2");
+    // A no-initializer re-declaration never checks.
+    eq(LuaVersion::V55, "global x; global x; return x", "nil");
+    // Plain assignments after the first init never check.
+    eq(LuaVersion::V55, "global x = 1; x = 2; x = 3; return x", "3");
+    // The RHS is evaluated before the guard fires (upstream order); the value
+    // here keeps the global nil, so the second init is fine.
+    eq(LuaVersion::V55, "global x = nil; global x = 2; return x", "2");
+}
+
+#[test]
+fn v55_global_guard_inert_pre_55() {
+    // `global` is a plain identifier on 5.4/5.3, so none of the guard paths
+    // exist there — repeated assignment to a `global`-named variable is fine.
+    eq(LuaVersion::V54, "global = 1; global = 2; return global", "2");
+    eq(LuaVersion::V53, "global = 1; global = 2; return global", "2");
+}
+
+#[test]
 fn v55_const_global_rejects_assignment() {
     err_contains(
         LuaVersion::V55,
@@ -104,6 +162,87 @@ fn v55_global_is_a_valid_identifier() {
     // F8: `global` is contextual, not reserved (LUA_COMPAT_GLOBAL). No panic.
     eq(LuaVersion::V55, "local global = 5; return global", "5");
     eq(LuaVersion::V55, "global = 7; return global", "7");
+}
+
+#[test]
+fn v55_global_prefixed_const_namelist() {
+    // 5.5 `global <const> a, b` — a leading attribute applies to the whole name
+    // list (it is NOT tied to `*`). Each name may still carry its own attribute.
+    // Captured from lua5.5.0.
+    eq(LuaVersion::V55, "global<const> a, b = 1, 2; return a + b", "3");
+    eq(LuaVersion::V55, "global <const> a = 5; return a", "5");
+    err_contains(
+        LuaVersion::V55,
+        "global <const> a = 1; a = 2",
+        "attempt to assign to const variable 'a'",
+    );
+}
+
+#[test]
+fn v55_global_function_form() {
+    // 5.5 `global function NAME body` (lparser.c globalfunc). Captured from
+    // lua5.5.0.
+    eq(
+        LuaVersion::V55,
+        "global function f() return 7 end; return f()",
+        "7",
+    );
+    eq(
+        LuaVersion::V55,
+        "global function fact(x) if x==0 then return 1 else return x*fact(x-1) end end; return fact(5)",
+        "120",
+    );
+    err_contains(
+        LuaVersion::V55,
+        "global function f() end; global function f() end",
+        "global 'f' already defined",
+    );
+}
+
+#[test]
+fn v55_global_wildcard_coexists_with_named_decl() {
+    // 5.5 `global *` enables global-by-default for the scope; a later
+    // `global name` does NOT void it (the `*` declaration coexists). Without
+    // this, `assert` below would be "not declared". Captured from lua5.5.0.
+    eq(
+        LuaVersion::V55,
+        "global *\nglobal fact = false\nfact = 3\nreturn assert(fact)",
+        "3",
+    );
+}
+
+#[test]
+fn v55_local_prefixed_attribute() {
+    // 5.5 allows a PREFIXED attribute on a local: `local <const> a, b`.
+    // 5.4 rejects the prefix form (attribute only postfix). Captured from
+    // lua5.5.0 / lua5.4.7.
+    eq(LuaVersion::V55, "local <const> a, b = 1, 2; return a + b", "3");
+    eq(LuaVersion::V55, "local<const> x = 5; return x", "5");
+    err_contains(
+        LuaVersion::V55,
+        "local <const> x = 5; x = 6",
+        "attempt to assign to const variable 'x'",
+    );
+    // 5.4: prefixed attribute is a syntax error (postfix only).
+    err_contains(LuaVersion::V54, "local <const> x = 5", "<name> expected");
+}
+
+#[test]
+fn v55_attribute_message_text() {
+    // Div.3 / Div.4 message text, captured from lua5.5.0 (and the local form is
+    // shared with 5.4). Location prefix present, no spurious `near`.
+    err_contains(LuaVersion::V55, "local x <foo> = 1", "unknown attribute 'foo'");
+    err_contains(LuaVersion::V54, "local x <foo> = 1", "unknown attribute 'foo'");
+    err_contains(
+        LuaVersion::V55,
+        "global x <foo> = 1",
+        "unknown attribute 'foo'",
+    );
+    err_contains(
+        LuaVersion::V55,
+        "global x <close> = setmetatable({},{})",
+        "global variables cannot be to-be-closed",
+    );
 }
 
 #[test]
@@ -135,6 +274,36 @@ fn v55_float_tostring_round_trips() {
 #[test]
 fn v55_table_create_present() {
     eq(LuaVersion::V55, "return type(table.create)", "function");
+}
+
+/// 5.5 named varargs `function f(...t)` bind the trailing varargs into a fresh
+/// packed table (`table.pack` semantics: 1-based sequence plus an integer `.n`
+/// counting all args incl. nil holes). `...` keeps working inside the body.
+/// Every expected value captured from lua5.5.0 (`specs/followup/5.5-lang.md`,
+/// Div.2a).
+#[test]
+fn v55_named_varargs() {
+    eq(LuaVersion::V55, "local function f(...t) return #t end return f(1,2,3)", "3");
+    eq(LuaVersion::V55, "local function f(...t) return t.n end return f(1,nil,3)", "3");
+    eq(LuaVersion::V55, "local function f(...t) return t.n end return f()", "0");
+    eq(LuaVersion::V55, "local function f(a,...t) return t[2] end return f(0,10,20)", "20");
+    // `...` is still usable alongside the named form.
+    eq(LuaVersion::V55, "local function f(...t) return ... end return select('#', f(1,2,3))", "3");
+    // Fresh table per call.
+    eq(LuaVersion::V55, "local function f(...t) return t end return f(1)==f(1)", "false");
+    // The table is mutable.
+    eq(LuaVersion::V55, "local function f(...t) t[1]=99; return t[1] end return f(1,2)", "99");
+    // No attribute allowed on `...t`.
+    err_contains(LuaVersion::V55, "local function f(...t <const>) return t end", "')' expected");
+}
+
+/// Named-vararg syntax is 5.5-only; on 5.4/5.3 a name after `...` stays a parse
+/// error matching the reference (`')' expected near 't'`).
+#[test]
+fn named_varargs_rejected_pre_55() {
+    for v in [LuaVersion::V53, LuaVersion::V54] {
+        err_contains(v, "local function f(...t) return t end", "')' expected near 't'");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -569,5 +738,130 @@ fn v_table_concat_invalid_value_type_name() {
         // list that the old `{:?}` Debug-format on `&[u8]` produced.)
         let e = run(v, "return table.concat({ {} })").unwrap_err();
         assert!(!e.contains("116, 97"), "v{v:?} concat leaked byte-array: {e}");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 5.5 stdlib roster deltas (utf8.offset arity, collectgarbage option set + param)
+// specs/followup/5.5-stdlib-err.md items 1, 2, 3.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn v55_utf8_offset_returns_end_position() {
+    // 5.5 returns (start, end) byte positions; the end is inclusive.
+    eq(LuaVersion::V55,
+        "local a,b = utf8.offset('aébc', 2); return a .. ',' .. b", "2,3");
+    eq(LuaVersion::V55,
+        "local a,b = utf8.offset('héllo', 3); return a .. ',' .. b", "4,4");
+    // arity is 2 on the success branch.
+    eq(LuaVersion::V55,
+        "return select('#', utf8.offset('héllo', 3))", "2");
+    // one-byte char: end == start.
+    eq(LuaVersion::V55,
+        "local a,b = utf8.offset('abc', 2); return a .. ',' .. b", "2,2");
+    // not-found / out-of-range: arity stays 1 (only nil).
+    eq(LuaVersion::V55,
+        "return select('#', utf8.offset('abc', 99))", "1");
+}
+
+#[test]
+fn v54_utf8_offset_arity_unchanged() {
+    // Regression guard: 5.4/5.3 return only the start position (arity 1).
+    for v in [LuaVersion::V53, LuaVersion::V54] {
+        eq(v, "return select('#', utf8.offset('aébc', 2))", "1");
+        eq(v, "return utf8.offset('aébc', 2)", "2");
+    }
+}
+
+#[test]
+fn v55_collectgarbage_drops_setpause_setstepmul() {
+    // 5.5 removed setpause/setstepmul; they are now invalid options.
+    err_contains(LuaVersion::V55,
+        "return collectgarbage('setpause', 100)", "invalid option");
+    err_contains(LuaVersion::V55,
+        "return collectgarbage('setstepmul', 100)", "invalid option");
+}
+
+#[test]
+fn v54_collectgarbage_keeps_setpause_setstepmul() {
+    // Regression guard: 5.4/5.3 still accept setpause/setstepmul.
+    for v in [LuaVersion::V53, LuaVersion::V54] {
+        eq(v, "local ok = pcall(collectgarbage, 'setpause', 100); return ok", "true");
+        eq(v, "local ok = pcall(collectgarbage, 'setstepmul', 100); return ok", "true");
+    }
+}
+
+#[test]
+fn v55_collectgarbage_param_surface() {
+    // param read returns an integer.
+    eq(LuaVersion::V55,
+        "return math.type(collectgarbage('param', 'pause'))", "integer");
+    // invalid param name errors via luaL_checkoption.
+    err_contains(LuaVersion::V55,
+        "return collectgarbage('param', 'bogus')", "invalid option");
+    // write returns the OLD value, then read returns the value just written
+    // (round-trip on the faithful-shape backing store).
+    eq(LuaVersion::V55,
+        "collectgarbage('param', 'stepmul', 333); return collectgarbage('param', 'stepmul')",
+        "333");
+    // arity is 1.
+    eq(LuaVersion::V55,
+        "return select('#', collectgarbage('param', 'pause'))", "1");
+}
+
+#[test]
+fn v54_collectgarbage_param_not_an_option() {
+    // Regression guard: 'param' is NOT a valid collectgarbage option on 5.4/5.3.
+    for v in [LuaVersion::V53, LuaVersion::V54] {
+        err_contains(v,
+            "return collectgarbage('param', 'pause')", "invalid option");
+    }
+}
+
+#[test]
+fn v55_version_string() {
+    eq(LuaVersion::V55, "return _VERSION", "Lua 5.5");
+    eq(LuaVersion::V54, "return _VERSION", "Lua 5.4");
+    eq(LuaVersion::V53, "return _VERSION", "Lua 5.3");
+}
+
+#[test]
+fn v55_error_nil_becomes_no_error_object() {
+    // 5.5's luaG_errormsg converts a nil error object to the literal string
+    // "<no error object>" after the message handler runs (ldebug.c). The `run`
+    // wrapper pcalls the chunk and returns `tostring(error_object)`, so on 5.5
+    // the propagated object is the string and on 5.3/5.4 it stays nil.
+    // error(nil): explicit nil object.
+    err_contains(LuaVersion::V55,
+        "error(nil)", "<no error object>");
+    // error() with no argument: object defaults to nil.
+    err_contains(LuaVersion::V55,
+        "error()", "<no error object>");
+    // nested pcall still sees the converted string.
+    eq(LuaVersion::V55,
+        "local ok, e = pcall(function() error(nil) end); return type(e) .. ':' .. tostring(e)",
+        "string:<no error object>");
+    // xpcall whose handler returns nil also settles to the string (the
+    // conversion runs on the handler result, matching upstream ordering).
+    eq(LuaVersion::V55,
+        "local ok, e = xpcall(function() error('x') end, function() return nil end); \
+         return type(e) .. ':' .. tostring(e)",
+        "string:<no error object>");
+}
+
+#[test]
+fn v53_v54_error_nil_stays_nil() {
+    // Regression guard: 5.3/5.4 leave a nil error object as nil (no conversion).
+    for v in [LuaVersion::V53, LuaVersion::V54] {
+        eq(v,
+            "local ok, e = pcall(function() error(nil) end); return type(e) .. ':' .. tostring(e)",
+            "nil:nil");
+        eq(v,
+            "local ok, e = pcall(function() error() end); return type(e) .. ':' .. tostring(e)",
+            "nil:nil");
+        // A real string error object is untouched (sanity: conversion is nil-only).
+        eq(v,
+            "local ok, e = pcall(function() error('boom') end); return (e:gsub('^.*: ', ''))",
+            "boom");
     }
 }

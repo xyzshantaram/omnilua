@@ -270,6 +270,9 @@ pub struct BlockCnt {
     /// e.g. `do global x end` does not leak strict mode past the block.
     pub saved_global_strict: bool,
     pub saved_declared_globals: usize,
+    /// Lua 5.5: the `global *` wildcard flag saved on block entry and restored
+    /// on exit, so a `global *` is scoped to its enclosing block.
+    pub saved_global_wildcard: bool,
 }
 
 // ── FuncState ───────────────────────────────────────────────────────────────
@@ -432,6 +435,14 @@ pub struct LexState {
     /// flips it back to `false`. Only ever set on the 5.5 path (the lexer emits
     /// `TK_GLOBAL` only there), so pre-5.5 versions are unaffected.
     pub global_strict: bool,
+    /// Lua 5.5: whether a `global *` (the wildcard declaration) is in effect for
+    /// the current scope. When `true`, every free name is a global regardless of
+    /// [`Self::global_strict`] — the wildcard suppresses the "not declared"
+    /// error. Upstream represents `*` as a `new_varkind(ls, NULL, ...)` entry
+    /// that coexists with named `global` declarations; a later `global name`
+    /// does NOT void an active `*`. Block-scoped (saved/restored like
+    /// [`Self::declared_globals`]).
+    pub global_wildcard: bool,
     /// Names declared via `global`, each paired with whether it was declared
     /// `<const>` (read-only). Consulted by name resolution under
     /// [`Self::global_strict`].
@@ -1747,6 +1758,43 @@ fn cg_free_reg_if_temp(fs: &mut FuncState, reg: i32) {
 /// free any temp held by `e`, reserve the next register, then call
 /// `cg_exp_to_reg` to place the value (handling `Jmp` and pending
 /// `e.t` / `e.f` jump-lists through the shared `exp2reg` path).
+/// Emit the Lua 5.5 `global name = expr` already-defined guard for one global.
+///
+/// Mirrors upstream `checkglobal`/`luaK_codecheckglobal` (`lcode.c`): read the
+/// global's current value into a temporary register and emit `OP_ERRNNIL`,
+/// which raises `global '<name>' already defined` at runtime if that value is
+/// non-nil. `target` is the `_ENV[name]` lvalue; it is cloned so the caller's
+/// copy is left intact for the subsequent store. The temporary is freed
+/// immediately so the store's `freereg - 1` source slot is undisturbed.
+///
+/// Bx encodes the name like upstream: `0` means the name index is unavailable
+/// (renders as `?`), otherwise `Bx - 1` is the constant-table index of the
+/// name string. The error reports `line`, the initializer's line number.
+fn cg_check_global(
+    fs: &mut FuncState,
+    line: i32,
+    target: &ExprDesc,
+    name: GcRef<LuaString>,
+) -> Result<(), LuaError> {
+    let k = add_k_string(fs, name);
+    let bx = if (k as u32) >= lua_code::opcodes::MAXARG_BX {
+        0
+    } else {
+        (k + 1) as u32
+    };
+    let mut probe = target.clone();
+    cg_exp_to_next_reg(fs, line, &mut probe)?;
+    let reg = probe.u.info;
+    let inst = lua_code::opcodes::Instruction::abx(
+        lua_code::opcodes::OpCode::ErrNNil,
+        reg as u32,
+        bx,
+    );
+    emit_inst(fs, line, inst);
+    cg_free_reg(fs, reg);
+    Ok(())
+}
+
 fn cg_exp_to_next_reg(
     fs: &mut FuncState,
     line: i32,
@@ -1768,7 +1816,13 @@ fn cg_set_returns(fs: &mut FuncState, e: &mut ExprDesc, nresults: i32) {
         debug_assert_eq!(e.k, ExprKind::VarArg);
         lc.set_arg_c((nresults + 1) as u32);
         lc.set_arg_a(fs.freereg as u32);
+        // Upstream `luaK_setreturns` reserves the slot via `luaK_reserveregs`,
+        // which also grows `maxstacksize`. A bare `freereg += 1` left the high
+        // watermark stale and tripped the `maxstacksize >= freereg` invariant
+        // whenever the VARARG sat above register 0 (e.g. a 5.5 named-vararg
+        // local occupying a lower slot).
         fs.freereg += 1;
+        bump_maxstack(fs, fs.freereg);
     }
     fs.f.code[pc_idx] = lua_types::opcode::Instruction::new(lc.0);
 }
@@ -2300,12 +2354,19 @@ fn singlevar(ls: &mut LexState, state: &mut LuaState, var: &mut ExprDesc) -> Res
             }
             match declared_const {
                 None => {
-                    let msg = format!(
-                        "variable '{}' not declared",
-                        String::from_utf8_lossy(varname.as_bytes())
-                    );
-                    // Semantic error (C's luaK_semerror): no "near <token>" suffix.
-                    return Err(lua_lex::lex_error(&mut ls.lex, msg.as_bytes(), 0));
+                    // An active `global *` (wildcard) in scope makes every free
+                    // name a valid global, so the "not declared" error only
+                    // fires in strict scopes without a wildcard.
+                    if ls.global_wildcard {
+                        false
+                    } else {
+                        let msg = format!(
+                            "variable '{}' not declared",
+                            String::from_utf8_lossy(varname.as_bytes())
+                        );
+                        // Semantic error (C's luaK_semerror): no "near <token>" suffix.
+                        return Err(lua_lex::lex_error(&mut ls.lex, msg.as_bytes(), 0));
+                    }
                 }
                 Some(c) => c,
             }
@@ -2704,6 +2765,7 @@ fn enter_block(ls: &mut LexState, isloop: bool) {
     let firstgoto = ls.dyd.gt.len() as i32;
     let saved_global_strict = ls.global_strict;
     let saved_declared_globals = ls.declared_globals.len();
+    let saved_global_wildcard = ls.global_wildcard;
     let insidetbc = ls.fs.as_ref()
         .and_then(|f| f.bl.as_ref())
         .map_or(false, |b| b.insidetbc);
@@ -2719,6 +2781,7 @@ fn enter_block(ls: &mut LexState, isloop: bool) {
         insidetbc,
         saved_global_strict,
         saved_declared_globals,
+        saved_global_wildcard,
     });
     fs.bl = Some(new_bl);
     debug_assert!(fs.freereg as i32 == {
@@ -2759,12 +2822,13 @@ fn leave_block(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> 
     // entry, so an explicit `global` decl (and the strict mode it triggers) is
     // confined to its enclosing block.
     {
-        let (sgs, sdg) = {
+        let (sgs, sdg, sgw) = {
             let bl = ls.fs.as_ref().unwrap().bl.as_ref().unwrap();
-            (bl.saved_global_strict, bl.saved_declared_globals)
+            (bl.saved_global_strict, bl.saved_declared_globals, bl.saved_global_wildcard)
         };
         ls.global_strict = sgs;
         ls.declared_globals.truncate(sdg);
+        ls.global_wildcard = sgw;
     }
 
     let stklevel = reg_level(ls, ls.fs.as_ref().unwrap(), bl_nactvar as i32);
@@ -3121,6 +3185,14 @@ fn setvararg(fs: &mut FuncState, _state: &mut LuaState, nparams: i32) -> Result<
 fn parlist(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
     let mut nparams: i32 = 0;
     let mut isvararg = false;
+    // Lua 5.5 named-varargs: `function f(...t)` binds the trailing varargs
+    // into a fresh packed table `t` (table.pack semantics). `vararg_name`
+    // holds that name once seen; it is declared as an ordinary local after the
+    // fixed parameters so the body can index it. Only valid on 5.5; on
+    // 5.4/5.3 a name after `...` stays a parse error (the `TK_NAME` branch is
+    // never reached because the loop breaks on `...`).
+    let is_v55 = state.global().lua_version == lua_types::LuaVersion::V55;
+    let mut has_vararg_name = false;
     if ls.t.token != b')' as TokenKind {
         loop {
             match ls.t.token {
@@ -3132,6 +3204,16 @@ fn parlist(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
                 TK_DOTS => {
                     lex_next(ls, state)?;
                     isvararg = true;
+                    // 5.5 named varargs: a NAME after `...` is the vararg-table
+                    // parameter. Push it as a local here (mirroring upstream's
+                    // `new_varkind(..., RDKVAVAR)`); it is activated by the
+                    // separate `adjust_local_vars(1)` below, and materialized at
+                    // function entry by VARARGPACK.
+                    if is_v55 && ls.t.token == TK_NAME {
+                        let name = str_check_name(ls, state)?;
+                        new_local_var(ls, state, name)?;
+                        has_vararg_name = true;
+                    }
                 }
                 _ => {
                     return Err(LuaError::syntax(format_args!("<name> or '...' expected")));
@@ -3148,8 +3230,28 @@ fn parlist(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
     if isvararg {
         setvararg(ls.fs.as_mut().unwrap(), state, numparams as i32)?;
     }
+    if has_vararg_name {
+        adjust_local_vars(ls, state, 1)?;
+    }
+    // Reserve registers for parameters (plus the vararg-table parameter, if
+    // present), in one call as upstream does (`luaK_reserveregs(fs, nactvar)`).
     let nactvar = ls.fs.as_ref().unwrap().nactvar as i32;
     reserve_regs(ls.fs.as_mut().unwrap(), nactvar)?;
+    // Materialize the named-vararg table into its register: VARARGPACK packs
+    // all extra args (table.pack semantics) into a fresh table at the vararg
+    // local's slot, which is the topmost active local.
+    if has_vararg_name {
+        let reg = nvarstack(ls, ls.fs.as_ref().unwrap()) - 1;
+        let inst = lua_code::opcodes::Instruction::abck(
+            lua_code::opcodes::OpCode::VarArgPack,
+            reg as u32,
+            0,
+            0,
+            0,
+        );
+        let line = ls.fs.as_ref().unwrap().previousline;
+        emit_inst(ls.fs.as_mut().unwrap(), line, inst);
+    }
     Ok(())
 }
 
@@ -4006,9 +4108,13 @@ fn version_has_attributes(state: &LuaState) -> bool {
 /// unconsumed so the surrounding statement reports it as an unexpected symbol,
 /// exactly as the 5.3 parser does. Versions are gated on
 /// [`lua_types::LuaVersion`], read from the state set at construction.
-fn getlocalattribute(ls: &mut LexState, state: &mut LuaState) -> Result<VarKind, LuaError> {
+fn getlocalattribute(
+    ls: &mut LexState,
+    state: &mut LuaState,
+    df: VarKind,
+) -> Result<VarKind, LuaError> {
     if !version_has_attributes(state) {
-        return Ok(VarKind::Reg);
+        return Ok(df);
     }
     if test_next(ls, state, b'<' as TokenKind)? {
         let attr_name = str_check_name(ls, state)?;
@@ -4019,13 +4125,14 @@ fn getlocalattribute(ls: &mut LexState, state: &mut LuaState) -> Result<VarKind,
         } else if bytes == b"close" {
             return Ok(VarKind::ToBeClosed);
         } else {
-            let name_str = String::from_utf8_lossy(bytes);
-            return Err(LuaError::syntax(format_args!(
-                "unknown attribute '{}'", name_str
-            )));
+            let msg = format!(
+                "unknown attribute '{}'",
+                String::from_utf8_lossy(bytes)
+            );
+            return Err(lua_lex::sem_error(&mut ls.lex, msg.as_bytes()));
         }
     }
-    Ok(VarKind::Reg)
+    Ok(df)
 }
 
 fn checktoclose(ls: &mut LexState, _state: &mut LuaState, level: i32) -> Result<(), LuaError> {
@@ -4087,20 +4194,99 @@ fn checktoclose(ls: &mut LexState, _state: &mut LuaState, level: i32) -> Result<
 ///  6. The `LUA_COMPAT_GLOBAL` axis (default on upstream): un-reserves `global`
 ///     as a keyword and recognizes the statement only contextually. We model
 ///     the strict (compat-off) behavior; a per-state compat flag is future work.
+/// Parses an optional `<const>` attribute on a global declaration, returning
+/// whether the declaration is `const`. When no `<...>` attribute is present,
+/// returns the default `df`.
+///
+/// Mirrors upstream `getglobalattribute` (`lparser.c:1862`): only `<const>` is
+/// legal for a global; `<close>` is the dedicated semantic error
+/// `global variables cannot be to-be-closed`, and any other attribute name is
+/// `unknown attribute '<name>'`. Both are emitted via [`lua_lex::sem_error`]
+/// (location prefix, no `near` suffix) per upstream `luaK_semerror`.
+fn get_global_attribute(
+    ls: &mut LexState,
+    state: &mut LuaState,
+    df: bool,
+) -> Result<bool, LuaError> {
+    if !test_next(ls, state, b'<' as TokenKind)? {
+        return Ok(df);
+    }
+    let attr = str_check_name(ls, state)?;
+    check_next(ls, state, b'>' as TokenKind)?;
+    match attr.as_bytes() {
+        b"const" => Ok(true),
+        b"close" => Err(lua_lex::sem_error(
+            &mut ls.lex,
+            b"global variables cannot be to-be-closed",
+        )),
+        other => {
+            let msg = format!(
+                "unknown attribute '{}'",
+                String::from_utf8_lossy(other)
+            );
+            Err(lua_lex::sem_error(&mut ls.lex, msg.as_bytes()))
+        }
+    }
+}
+
 fn globalstat(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
     lex_next(ls, state)?; // skip 'global'
 
-    // `global [<const>] '*'` — the collective form re-enables global-by-default
-    // for the rest of the scope (voids any earlier strict-mode declaration).
-    if test_next(ls, state, b'<' as TokenKind)? {
-        let _attr = str_check_name(ls, state)?;
-        check_next(ls, state, b'>' as TokenKind)?;
-        check_next(ls, state, b'*' as TokenKind)?;
-        ls.global_strict = false;
+    // `global function NAME body` — the global-function declaration form
+    // (upstream `globalstatfunc`/`globalfunc`, `lparser.c:1962`/`1947`).
+    // Declares NAME as a regular global, compiles the body, runs the same
+    // already-defined guard as `global NAME = expr`, then stores the closure.
+    if ls.t.token == TK_FUNCTION {
+        let line = ls.linenumber;
+        lex_next(ls, state)?; // skip 'function'
+        let name = str_check_name(ls, state)?;
+        ls.declared_globals.push((name.clone(), false));
+        // Build the `_ENV[name]` lvalue (IndexUp; no register cost).
+        let envn = ls.envn.clone().expect("envn must be set when resolving globals");
+        let mut target = ExprDesc::default();
+        let mut fs_box = ls.fs.take();
+        let r = singlevaraux(ls, fs_box.as_deref_mut(), &envn, &mut target, true);
+        ls.fs = fs_box;
+        r?;
+        let lline = ls.lastline;
+        {
+            let fs = ls.fs.as_mut().unwrap();
+            cg_exp_to_any_reg_up(fs, lline, &mut target)?;
+            let mut key = ExprDesc::default();
+            codestring(&mut key, name.clone());
+            cg_indexed(fs, lline, &mut target, &mut key)?;
+        }
+        let mut b = ExprDesc::default();
+        body(ls, state, &mut b, false, line)?;
+        {
+            let fs = ls.fs.as_mut().unwrap();
+            cg_check_global(fs, line, &target, name)?;
+            cg_storevar(fs, line, &target, &mut b)?;
+        }
+        ls.global_strict = true;
         return Ok(());
     }
+
+    // Mirror upstream `globalstat` (`lparser.c:1931`): parse the optional
+    // prefixed attribute FIRST (the default kind for the whole declaration),
+    // then branch on `*` (collective form) vs a name list.
+    //
+    //   globalstat -> (GLOBAL) attrib '*'
+    //   globalstat -> (GLOBAL) attrib NAME attrib {',' NAME attrib}
+    //
+    // The leading `<const>` is NOT tied to `*`; `global <const> a, b` is a
+    // const name list (each name defaults to the prefixed attribute and may
+    // still carry its own per-name attribute).
+    let defkind = get_global_attribute(ls, state, false)?;
+
+    // `global [attrib] '*'` — the collective form enables global-by-default for
+    // the rest of the scope. Upstream keeps `*` as a declaration entry that
+    // coexists with named `global` decls (a later `global name` does NOT void
+    // it), so a wildcard flag (not merely clearing strict) models it: with the
+    // wildcard active, every free name resolves as a global.
     if test_next(ls, state, b'*' as TokenKind)? {
         ls.global_strict = false;
+        ls.global_wildcard = true;
         return Ok(());
     }
 
@@ -4110,27 +4296,7 @@ fn globalstat(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
     let mut names: Vec<GcRef<LuaString>> = Vec::new();
     loop {
         let name = str_check_name(ls, state)?;
-        let mut is_const = false;
-        if test_next(ls, state, b'<' as TokenKind)? {
-            let attr = str_check_name(ls, state)?;
-            check_next(ls, state, b'>' as TokenKind)?;
-            match attr.as_bytes() {
-                b"const" => is_const = true,
-                b"close" => {
-                    return Err(lua_lex::syntax_error(
-                        &mut ls.lex,
-                        b"<close> is not allowed for a global declaration",
-                    ));
-                }
-                other => {
-                    let msg = format!(
-                        "unknown attribute '{}'",
-                        String::from_utf8_lossy(other)
-                    );
-                    return Err(lua_lex::syntax_error(&mut ls.lex, msg.as_bytes()));
-                }
-            }
-        }
+        let is_const = get_global_attribute(ls, state, defkind)?;
         ls.declared_globals.push((name.clone(), is_const));
         names.push(name);
         if !test_next(ls, state, b',' as TokenKind)? {
@@ -4144,6 +4310,9 @@ fn globalstat(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
     // each target from the top register down. (Initializers were previously
     // parsed and dropped.)
     if test_next(ls, state, b'=' as TokenKind)? {
+        // The Lua 5.5 already-defined guard reports the error at the line of the
+        // initializer (upstream `globalnames` passes `ls->linenumber` here).
+        let init_line = ls.linenumber;
         let mut targets: Vec<ExprDesc> = Vec::with_capacity(names.len());
         for name in &names {
             let envn = ls.envn.clone().expect("envn must be set when resolving globals");
@@ -4164,7 +4333,17 @@ fn globalstat(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
         let mut e = ExprDesc::default();
         let nexps = explist(ls, state, &mut e)?;
         adjust_assign(ls, state, nvars, nexps, &mut e)?;
-        for target in targets.iter().rev() {
+        // Mirror upstream `initglobal`: after the RHS is evaluated, for each
+        // declared name emit `checkglobal` (the `OP_ERRNNIL` guard) immediately
+        // before its store. The guard reads the global's *current* runtime value
+        // and raises `global '<name>' already defined` if it is non-nil. Only
+        // Lua 5.5 declares `global`; pre-5.5 never reaches this path.
+        for (i, target) in targets.iter().enumerate().rev() {
+            let name = names[i].clone();
+            {
+                let fs = ls.fs.as_mut().unwrap();
+                cg_check_global(fs, init_line, target, name)?;
+            }
             let line = ls.lastline;
             let fs = ls.fs.as_mut().unwrap();
             let freereg = fs.freereg as i32 - 1;
@@ -4181,10 +4360,21 @@ fn localstat(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
     let mut toclose: i32 = -1;
     let mut nvars: i32 = 0;
     let mut vidx: i32;
+    // Lua 5.5 (`localstat` in `lparser.c:1818`) accepts a PREFIXED attribute
+    // applied as the default for every variable in the list — e.g.
+    // `local <const> a, b`. On 5.4/5.3 no prefixed attribute exists, so a `<`
+    // before the first name stays the reference error `<name> expected near
+    // '<'`; gate the prefix parse on 5.5.
+    use lua_types::LuaVersion;
+    let defkind = if matches!(state.global().lua_version, LuaVersion::V55) {
+        getlocalattribute(ls, state, VarKind::Reg)?
+    } else {
+        VarKind::Reg
+    };
     loop {
         let name = str_check_name(ls, state)?;
         vidx = new_local_var(ls, state, name)?;
-        let kind = getlocalattribute(ls, state)?;
+        let kind = getlocalattribute(ls, state, defkind)?;
         get_local_var_desc_mut(ls, ls.fs.as_ref().unwrap().firstlocal, vidx).kind = kind;
         if kind == VarKind::ToBeClosed {
             if toclose != -1 {
@@ -4386,7 +4576,10 @@ fn statement(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
                     .map_or(false, |s| s.as_bytes() == b"global")
                 && {
                     let nxt = lex_lookahead(ls, state)?;
-                    nxt == TK_NAME || nxt == b'*' as TokenKind || nxt == b'<' as TokenKind
+                    nxt == TK_NAME
+                        || nxt == b'*' as TokenKind
+                        || nxt == b'<' as TokenKind
+                        || nxt == TK_FUNCTION
                 };
             if is_global_decl {
                 globalstat(ls, state)?;
@@ -4481,6 +4674,7 @@ pub fn parse(
         lex: lex_ls,
         recursion_depth: 0,
         global_strict: false,
+        global_wildcard: false,
         declared_globals: Vec::new(),
     };
     //   `mainfunc`; it does NOT pre-read the first token. `mainfunc` itself
