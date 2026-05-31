@@ -177,21 +177,64 @@ fn load_aux(state: &mut LuaState, status_ok: bool, envidx: i32) -> Result<usize,
 
 // ── print ─────────────────────────────────────────────────────────────────────
 
-/// Converts each argument to a string with `tostring()` semantics, separates
-/// them with tabs, writes them to standard output, and finishes with a newline.
+/// Converts each argument to a string, separates them with tabs, writes them to
+/// standard output, and finishes with a newline.
+///
+/// The conversion mechanism is a genuine cross-version split:
+///
+/// - Lua 5.1/5.2/5.3 `luaB_print` fetch the **global** `tostring` and *call* it
+///   on each argument. Redefining global `tostring` therefore changes `print`,
+///   a `nil` global makes `print` raise `attempt to call a nil value`, and a
+///   result that is neither a string nor a coercible number raises
+///   `'tostring' must return a string to 'print'`.
+/// - Lua 5.4/5.5 `luaB_print` use `luaL_tolstring` directly: it honors the
+///   `__tostring` / `__name` metafields but ignores the global `tostring`.
 ///
 pub(crate) fn print_fn(state: &mut LuaState) -> Result<usize, LuaError> {
+    let calls_global_tostring = matches!(
+        state.global().lua_version,
+        lua_types::LuaVersion::V51 | lua_types::LuaVersion::V52 | lua_types::LuaVersion::V53
+    );
+    if calls_global_tostring {
+        return print_via_global_tostring(state);
+    }
     let n = state.top();
     for i in 1..=n {
         // luaL_tolstring converts via tostring() metamethod, pushes result,
         // returns a pointer. In Rust we get a GcRef and use its bytes.
-        // TODO(port): to_display_string method needs implementing on LuaState.
         let display_ref = state.to_display_string(i)?;
         if i > 1 {
-            // TODO(port): I/O should go through the state's output abstraction.
             state.write_output(b"\t")?;
         }
         let bytes = display_ref.clone();
+        state.write_output(&bytes)?;
+        state.pop_n(1);
+    }
+    state.write_output(b"\n")?;
+    Ok(0)
+}
+
+/// Faithful port of the Lua 5.1/5.2/5.3 `luaB_print`: fetch the global
+/// `tostring` once, then call it on each argument.
+///
+fn print_via_global_tostring(state: &mut LuaState) -> Result<usize, LuaError> {
+    let n = state.top();
+    lua_vm::api::get_global(state, b"tostring")?;
+    for i in 1..=n {
+        state.push_copy(-1)?;
+        state.push_copy(i)?;
+        state.call(1, 1)?;
+        // lua_tolstring returns NULL for anything that is neither a string nor a
+        // coercible number; the reference raises in that case.
+        if !matches!(state.type_at(-1), LuaType::String | LuaType::Number) {
+            return Err(state.where_error(1, b"'tostring' must return a string to 'print'"));
+        }
+        let bytes = state
+            .to_lua_string_bytes(-1)
+            .expect("string/number coerces to bytes");
+        if i > 1 {
+            state.write_output(b"\t")?;
+        }
         state.write_output(&bytes)?;
         state.pop_n(1);
     }

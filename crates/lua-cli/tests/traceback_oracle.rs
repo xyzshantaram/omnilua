@@ -605,3 +605,66 @@ fn argerror_funcname_first_line_matches_reference() {
         }
     }
 }
+
+/// Item E (shared-core): on 5.1/5.2/5.3 `print` calls the *global* `tostring`,
+/// so a nil global raises "attempt to call a nil value" and a non-string return
+/// raises "'tostring' must return a string to 'print'" (with the `luaL_where`
+/// location prefix on the CLI message line). On 5.4/5.5 `print` uses
+/// `luaL_tolstring` directly and ignores the global, so the same code runs
+/// cleanly. Spawn test diffing the first stderr line and exit code against the
+/// reference for each version.
+#[test]
+fn print_global_tostring_matches_reference_per_version() {
+    // (program, 5.3-errors?) — on 5.4/5.5 each program is expected to succeed.
+    let cases: &[(&str, bool)] = &[
+        ("tostring=nil; print(1)", true),
+        ("tostring=function(x) return {} end; print(1)", true),
+        ("tostring=function(x) return 'X'..x end; print(7)", false),
+        ("tostring=function(x) return 42 end; print(1)", false),
+        ("tostring=nil; print()", false),
+    ];
+    for &v in VERSIONS {
+        for &(prog, errs_on_53) in cases {
+            let out = lua_rs()
+                .env("LUA_RS_VERSION", v)
+                .arg("-e")
+                .arg(prog)
+                .output()
+                .expect("spawn lua-rs -e");
+            let expect_err = v == "5.3" && errs_on_53;
+            assert_eq!(
+                out.status.code(),
+                Some(if expect_err { 1 } else { 0 }),
+                "[print-tostring/{v}] `{prog}` exit code unexpected\n  stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+
+            if let Some(refbin) = reference_binary(v) {
+                let rout = Command::new(&refbin)
+                    .arg("-e")
+                    .arg(prog)
+                    .output()
+                    .expect("spawn reference");
+                // Drop the leading "<progname>: " token (binary path differs).
+                let strip = |b: &[u8]| -> String {
+                    let s = String::from_utf8_lossy(b);
+                    let first = s.lines().next().unwrap_or("");
+                    match first.split_once(": ") {
+                        Some((_prog, rest)) => rest.to_string(),
+                        None => first.to_string(),
+                    }
+                };
+                assert_eq!(
+                    strip(&out.stderr),
+                    strip(&rout.stderr),
+                    "[print-tostring/{v}] `{prog}` first stderr line must match reference"
+                );
+                assert_eq!(
+                    out.status.code(),
+                    rout.status.code(),
+                    "[print-tostring/{v}] `{prog}` exit code must match reference"
+                );
+            }
+        }
+    }
+}

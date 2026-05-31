@@ -1048,3 +1048,69 @@ fn v54_v55_utf8_escape_caps_at_7fffffff() {
         err_contains(v, r#"return #"\u{80000000}""#, "UTF-8 value too large");
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Shared-core item E: `print` and the global `tostring`.
+//
+// 5.1/5.2/5.3 `luaB_print` fetch the *global* `tostring` and call it on each
+// argument, so a `nil` global makes `print` raise "attempt to call a nil
+// value", a custom global `tostring` is honored, and a result that is neither
+// a string nor a coercible number raises "'tostring' must return a string to
+// 'print'". 5.4/5.5 `luaB_print` use `luaL_tolstring` directly and ignore the
+// global `tostring` entirely. Reproduced against the reference binaries via
+// `specs/oracle/diff_one.sh`.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn v53_print_calls_global_tostring() {
+    // A nil global `tostring` makes print raise when it has an argument. The
+    // mutation is local to the inner chunk's `pcall`; restoring it keeps the
+    // wrapper's own `tostring(result)` (and other tests) unaffected.
+    err_contains(
+        LuaVersion::V53,
+        "local s = tostring; tostring = nil; local ok, e = pcall(print, 1); tostring = s; error(e, 0)",
+        "attempt to call a nil value",
+    );
+    // A custom global `tostring` is honored (no error, runs to completion).
+    eq(
+        LuaVersion::V53,
+        "local s = tostring; tostring = function(x) return 'X' .. x end; print(7); tostring = s; return 'ok'",
+        "ok",
+    );
+    // A result that is neither a string nor a coercible number raises.
+    err_contains(
+        LuaVersion::V53,
+        "local s = tostring; tostring = function(x) return {} end; local ok, e = pcall(print, 1); tostring = s; error(e, 0)",
+        "'tostring' must return a string to 'print'",
+    );
+    // A number return is coercible and accepted (mirrors C `lua_tolstring`).
+    eq(
+        LuaVersion::V53,
+        "local s = tostring; tostring = function(x) return 42 end; print(1); tostring = s; return 'ok'",
+        "ok",
+    );
+    // No arguments: the nil global is never called, so no error.
+    eq(
+        LuaVersion::V53,
+        "local s = tostring; tostring = nil; print(); tostring = s; return 'ok'",
+        "ok",
+    );
+}
+
+#[test]
+fn v54_v55_print_ignores_global_tostring() {
+    // Guard the unaffected versions: print uses luaL_tolstring directly, so a
+    // nil or non-string-returning global `tostring` does NOT affect print.
+    for v in [LuaVersion::V54, LuaVersion::V55] {
+        eq(
+            v,
+            "local s = tostring; tostring = nil; print(1); tostring = s; return 'ok'",
+            "ok",
+        );
+        eq(
+            v,
+            "local s = tostring; tostring = function(x) return {} end; print(1); tostring = s; return 'ok'",
+            "ok",
+        );
+    }
+}
