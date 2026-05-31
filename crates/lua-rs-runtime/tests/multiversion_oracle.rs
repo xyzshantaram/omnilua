@@ -195,6 +195,36 @@ fn v55_table_create_present() {
     eq(LuaVersion::V55, "return type(table.create)", "function");
 }
 
+/// 5.5 named varargs `function f(...t)` bind the trailing varargs into a fresh
+/// packed table (`table.pack` semantics: 1-based sequence plus an integer `.n`
+/// counting all args incl. nil holes). `...` keeps working inside the body.
+/// Every expected value captured from lua5.5.0 (`specs/followup/5.5-lang.md`,
+/// Div.2a).
+#[test]
+fn v55_named_varargs() {
+    eq(LuaVersion::V55, "local function f(...t) return #t end return f(1,2,3)", "3");
+    eq(LuaVersion::V55, "local function f(...t) return t.n end return f(1,nil,3)", "3");
+    eq(LuaVersion::V55, "local function f(...t) return t.n end return f()", "0");
+    eq(LuaVersion::V55, "local function f(a,...t) return t[2] end return f(0,10,20)", "20");
+    // `...` is still usable alongside the named form.
+    eq(LuaVersion::V55, "local function f(...t) return ... end return select('#', f(1,2,3))", "3");
+    // Fresh table per call.
+    eq(LuaVersion::V55, "local function f(...t) return t end return f(1)==f(1)", "false");
+    // The table is mutable.
+    eq(LuaVersion::V55, "local function f(...t) t[1]=99; return t[1] end return f(1,2)", "99");
+    // No attribute allowed on `...t`.
+    err_contains(LuaVersion::V55, "local function f(...t <const>) return t end", "')' expected");
+}
+
+/// Named-vararg syntax is 5.5-only; on 5.4/5.3 a name after `...` stays a parse
+/// error matching the reference (`')' expected near 't'`).
+#[test]
+fn named_varargs_rejected_pre_55() {
+    for v in [LuaVersion::V53, LuaVersion::V54] {
+        err_contains(v, "local function f(...t) return t end", "')' expected near 't'");
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // 5.3 behavioral deltas
 // ─────────────────────────────────────────────────────────────────────────

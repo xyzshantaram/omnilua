@@ -147,13 +147,21 @@ pub enum OpCode {
     /// `OP_ERRNNIL` (`ldebug.c:luaG_errnnil`). 5.5-only; no other version emits
     /// it. Appended after `ExtraArg` so existing opcode indices are unchanged.
     ErrNNil = 83,
+    /// Lua 5.5 named-varargs (`function f(...t)`) support. Packs all extra
+    /// varargs of the current frame into a fresh table stored in register A,
+    /// with `table.pack` semantics: a 1-based sequence of all extra args plus
+    /// an integer `.n` field counting them (including nil holes). Emitted once
+    /// at function entry (right after `VarArgPrep`) when a vararg name is bound.
+    /// 5.5-only; no other version's parser emits it. Appended after `ErrNNil`
+    /// so existing opcode indices are unchanged.
+    VarArgPack = 84,
 }
 
 /// Number of distinct opcodes (matches C-Lua's `NUM_OPCODES`). Held for
 /// downstream debug/dump callers that count opcodes by name; the dispatch
 /// hot path in `InstructionExt::opcode` does its own per-arm match.
 #[allow(dead_code)]
-const NUM_OPCODES: u8 = 84;
+const NUM_OPCODES: u8 = 85;
 
 impl OpCode {
     /// Legacy alias retained because the prior duplicate enum variant
@@ -258,6 +266,7 @@ impl OpCode {
             81 => Some(Self::VarArgPrep),
             82 => Some(Self::ExtraArg),
             83 => Some(Self::ErrNNil),
+            84 => Some(Self::VarArgPack),
             _ => None,
         }
     }
@@ -380,6 +389,7 @@ impl InstructionExt for Instruction {
             81 => OpCode::VarArgPrep,
             82 => OpCode::ExtraArg,
             83 => OpCode::ErrNNil,
+            84 => OpCode::VarArgPack,
             _ => OpCode::ExtraArg,
         }
     }
@@ -509,6 +519,7 @@ const OP_MODE_BYTES: [u8; NUM_OPCODES as usize] = [
     0x28, // VarArgPrep
     0x03, // ExtraArg
     0x01, // ErrNNil (iABx, no A-write, no test)
+    0x08, // VarArgPack (iABC, sets register A)
 ];
 
 #[inline(always)]
@@ -2784,6 +2795,36 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                             msg.extend_from_slice(b"' already defined");
                             state.set_ci_savedpc(ci, pc);
                             return Err(crate::debug::prefixed_runtime_pub(state, msg));
+                        }
+                    }
+                    // ── OP_VARARGPACK (Lua 5.5 named varargs) ──────────────────
+                    //    Pack the current frame's extra varargs into a fresh
+                    //    table stored in register A. Mirrors `table.pack(...)`:
+                    //    a 1-based sequence of all extra args plus an integer
+                    //    `.n` field counting them (nil holes included). The
+                    //    extra args were moved by VARARGPREP to the slots just
+                    //    below `ci->func`, i.e. `ci_func - nextra .. ci_func-1`.
+                    OpCode::VarArgPack => {
+                        let ra = base + i.arg_a();
+                        let nextra = state.ci_nextraargs(ci);
+                        let ci_func: StackIdx = state.ci_base(ci) - 1;
+                        let t = if nextra > 0 {
+                            state.new_table_with_sizes(nextra as u32, 1)?
+                        } else {
+                            state.new_table()
+                        };
+                        for k in 0..nextra {
+                            let src: StackIdx = ci_func - nextra as i32 + k as i32;
+                            let val = state.get_at(src);
+                            t.raw_set_int(state, (k + 1) as i64, val)?;
+                        }
+                        let n_key = state.intern_str(b"n")?;
+                        t.raw_set(state, LuaValue::Str(n_key), LuaValue::Int(nextra as i64))?;
+                        state.set_at(ra, LuaValue::Table(t));
+                        state.set_ci_savedpc(ci, pc);
+                        state.gc_cond_step();
+                        if state.hookmask != 0 {
+                            trap = state.ci_trap(ci);
                         }
                     }
                 } // end match opcode

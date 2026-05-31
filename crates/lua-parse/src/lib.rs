@@ -1805,7 +1805,13 @@ fn cg_set_returns(fs: &mut FuncState, e: &mut ExprDesc, nresults: i32) {
         debug_assert_eq!(e.k, ExprKind::VarArg);
         lc.set_arg_c((nresults + 1) as u32);
         lc.set_arg_a(fs.freereg as u32);
+        // Upstream `luaK_setreturns` reserves the slot via `luaK_reserveregs`,
+        // which also grows `maxstacksize`. A bare `freereg += 1` left the high
+        // watermark stale and tripped the `maxstacksize >= freereg` invariant
+        // whenever the VARARG sat above register 0 (e.g. a 5.5 named-vararg
+        // local occupying a lower slot).
         fs.freereg += 1;
+        bump_maxstack(fs, fs.freereg);
     }
     fs.f.code[pc_idx] = lua_types::opcode::Instruction::new(lc.0);
 }
@@ -3158,6 +3164,14 @@ fn setvararg(fs: &mut FuncState, _state: &mut LuaState, nparams: i32) -> Result<
 fn parlist(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
     let mut nparams: i32 = 0;
     let mut isvararg = false;
+    // Lua 5.5 named-varargs: `function f(...t)` binds the trailing varargs
+    // into a fresh packed table `t` (table.pack semantics). `vararg_name`
+    // holds that name once seen; it is declared as an ordinary local after the
+    // fixed parameters so the body can index it. Only valid on 5.5; on
+    // 5.4/5.3 a name after `...` stays a parse error (the `TK_NAME` branch is
+    // never reached because the loop breaks on `...`).
+    let is_v55 = state.global().lua_version == lua_types::LuaVersion::V55;
+    let mut has_vararg_name = false;
     if ls.t.token != b')' as TokenKind {
         loop {
             match ls.t.token {
@@ -3169,6 +3183,16 @@ fn parlist(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
                 TK_DOTS => {
                     lex_next(ls, state)?;
                     isvararg = true;
+                    // 5.5 named varargs: a NAME after `...` is the vararg-table
+                    // parameter. Push it as a local here (mirroring upstream's
+                    // `new_varkind(..., RDKVAVAR)`); it is activated by the
+                    // separate `adjust_local_vars(1)` below, and materialized at
+                    // function entry by VARARGPACK.
+                    if is_v55 && ls.t.token == TK_NAME {
+                        let name = str_check_name(ls, state)?;
+                        new_local_var(ls, state, name)?;
+                        has_vararg_name = true;
+                    }
                 }
                 _ => {
                     return Err(LuaError::syntax(format_args!("<name> or '...' expected")));
@@ -3185,8 +3209,28 @@ fn parlist(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
     if isvararg {
         setvararg(ls.fs.as_mut().unwrap(), state, numparams as i32)?;
     }
+    if has_vararg_name {
+        adjust_local_vars(ls, state, 1)?;
+    }
+    // Reserve registers for parameters (plus the vararg-table parameter, if
+    // present), in one call as upstream does (`luaK_reserveregs(fs, nactvar)`).
     let nactvar = ls.fs.as_ref().unwrap().nactvar as i32;
     reserve_regs(ls.fs.as_mut().unwrap(), nactvar)?;
+    // Materialize the named-vararg table into its register: VARARGPACK packs
+    // all extra args (table.pack semantics) into a fresh table at the vararg
+    // local's slot, which is the topmost active local.
+    if has_vararg_name {
+        let reg = nvarstack(ls, ls.fs.as_ref().unwrap()) - 1;
+        let inst = lua_code::opcodes::Instruction::abck(
+            lua_code::opcodes::OpCode::VarArgPack,
+            reg as u32,
+            0,
+            0,
+            0,
+        );
+        let line = ls.fs.as_ref().unwrap().previousline;
+        emit_inst(ls.fs.as_mut().unwrap(), line, inst);
+    }
     Ok(())
 }
 
