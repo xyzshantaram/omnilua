@@ -1700,13 +1700,18 @@ const FMT_FLAGS_C: &[u8] = b"-";
 /// Mirrors C `checkformat` in lstrlib.c: consumes flags, then up to 2 width digits,
 /// then (if allowed) `.` + up to 2 precision digits, then asserts we are at the
 /// conversion character. Returns `Err("invalid conversion specification")` on failure.
-fn check_conv_spec(form: &[u8], flags: &[u8], allow_precision: bool) -> Result<(), LuaError> {
+fn check_conv_spec(
+    state: &mut LuaState,
+    form: &[u8],
+    flags: &[u8],
+    allow_precision: bool,
+) -> Result<(), LuaError> {
     let mut i = 1usize; // skip '%'
     while i < form.len() && flags.contains(&form[i]) {
         i += 1;
     }
     if i < form.len() && form[i] == b'0' {
-        return Err(LuaError::runtime(format_args!("invalid conversion specification")));
+        return Err(invalid_conv_spec(state, form));
     }
     if i < form.len() && form[i].is_ascii_digit() {
         i += 1;
@@ -1724,9 +1729,27 @@ fn check_conv_spec(form: &[u8], flags: &[u8], allow_precision: bool) -> Result<(
         }
     }
     if i != form.len() - 1 {
-        return Err(LuaError::runtime(format_args!("invalid conversion specification")));
+        return Err(invalid_conv_spec(state, form));
     }
     Ok(())
+}
+
+/// Build the version-appropriate "invalid conversion specification" error,
+/// prefixed with the calling location like reference `luaL_error`.
+///
+/// Lua 5.3 `scanformat` raises `invalid format (width or precision too long)`
+/// with no offending spec; Lua 5.4/5.5 `checkformat` raises
+/// `invalid conversion specification: '<form>'`.
+fn invalid_conv_spec(state: &mut LuaState, form: &[u8]) -> LuaError {
+    let msg: Vec<u8> = if state.global().lua_version == lua_types::LuaVersion::V53 {
+        b"invalid format (width or precision too long)".to_vec()
+    } else {
+        let mut m = b"invalid conversion specification: '".to_vec();
+        m.extend_from_slice(form);
+        m.push(b'\'');
+        m
+    };
+    lua_vm::debug::c_api_runtime(state, msg)
 }
 
 /// Parsed printf-style format specifier (flags, width, precision).
@@ -2025,7 +2048,7 @@ pub fn str_format(state: &mut LuaState) -> Result<usize, LuaError> {
         // Parse a format specifier
         arg += 1;
         if arg > top {
-            return Err(LuaError::arg_error(arg, "no value"));
+            return Err(lua_vm::debug::arg_error_impl(state, arg, b"no value"));
         }
 
         // Collect flags, width, precision
@@ -2049,7 +2072,8 @@ pub fn str_format(state: &mut LuaState) -> Result<usize, LuaError> {
         }
 
         if i >= fmt_bytes.len() {
-            return Err(LuaError::runtime(format_args!("invalid conversion specification")));
+            let form: Vec<u8> = fmt_bytes[spec_start..].to_vec();
+            return Err(invalid_conv_spec(state, &form));
         }
 
         let conv = fmt_bytes[i];
@@ -2060,50 +2084,50 @@ pub fn str_format(state: &mut LuaState) -> Result<usize, LuaError> {
 
         // Must check before parse_fmt_spec to avoid overflow on huge widths.
         if spec_slice.len() + 1 >= 22 {
-            return Err(LuaError::runtime(format_args!("invalid format (too long)")));
+            return Err(lua_vm::debug::c_api_runtime(state, b"invalid format (too long)".to_vec()));
         }
 
         let spec = parse_fmt_spec(spec_slice);
 
         match conv {
             b'c' => {
-                check_conv_spec(form, FMT_FLAGS_C, false)?;
+                check_conv_spec(state, form, FMT_FLAGS_C, false)?;
                 let n = state.check_arg_integer(arg)?;
                 let body = vec![n as u8];
                 pad_str(&mut buf, &body, &spec);
             }
             b'd' | b'i' => {
-                check_conv_spec(form, FMT_FLAGS_I, true)?;
+                check_conv_spec(state, form, FMT_FLAGS_I, true)?;
                 let n = state.check_arg_integer(arg)?;
                 let (sign, digits) = signed_int_parts(n, &spec);
                 pad_int(&mut buf, &sign, &digits, &spec);
             }
             b'u' => {
-                check_conv_spec(form, FMT_FLAGS_U, true)?;
+                check_conv_spec(state, form, FMT_FLAGS_U, true)?;
                 let n = state.check_arg_integer(arg)? as u64;
                 let (prefix, digits) = unsigned_int_parts(n, 10, false, &spec);
                 pad_int(&mut buf, &prefix, &digits, &spec);
             }
             b'o' => {
-                check_conv_spec(form, FMT_FLAGS_X, true)?;
+                check_conv_spec(state, form, FMT_FLAGS_X, true)?;
                 let n = state.check_arg_integer(arg)? as u64;
                 let (prefix, digits) = unsigned_int_parts(n, 8, false, &spec);
                 pad_int(&mut buf, &prefix, &digits, &spec);
             }
             b'x' => {
-                check_conv_spec(form, FMT_FLAGS_X, true)?;
+                check_conv_spec(state, form, FMT_FLAGS_X, true)?;
                 let n = state.check_arg_integer(arg)? as u64;
                 let (prefix, digits) = unsigned_int_parts(n, 16, false, &spec);
                 pad_int(&mut buf, &prefix, &digits, &spec);
             }
             b'X' => {
-                check_conv_spec(form, FMT_FLAGS_X, true)?;
+                check_conv_spec(state, form, FMT_FLAGS_X, true)?;
                 let n = state.check_arg_integer(arg)? as u64;
                 let (prefix, digits) = unsigned_int_parts(n, 16, true, &spec);
                 pad_int(&mut buf, &prefix, &digits, &spec);
             }
             b'a' | b'A' => {
-                check_conv_spec(form, FMT_FLAGS_F, true)?;
+                check_conv_spec(state, form, FMT_FLAGS_F, true)?;
                 let n = state.check_arg_number(arg)?;
                 let body = format_hex_float(n, spec.precision);
                 let body: Vec<u8> = if conv == b'A' {
@@ -2133,7 +2157,7 @@ pub fn str_format(state: &mut LuaState) -> Result<usize, LuaError> {
                 pad_int(&mut buf, &sign, &digits, &no_prec_spec);
             }
             b'f' | b'e' | b'E' | b'g' | b'G' => {
-                check_conv_spec(form, FMT_FLAGS_F, true)?;
+                check_conv_spec(state, form, FMT_FLAGS_F, true)?;
                 let n = state.check_arg_number(arg)?;
                 let body = format_float(n, conv, &spec);
                 let (sign, digits): (Vec<u8>, Vec<u8>) = if !body.is_empty() && (body[0] == b'-' || body[0] == b'+') {
@@ -2157,7 +2181,7 @@ pub fn str_format(state: &mut LuaState) -> Result<usize, LuaError> {
                 pad_int(&mut buf, &sign, &digits, &no_prec_spec);
             }
             b'p' => {
-                check_conv_spec(form, FMT_FLAGS_C, false)?;
+                check_conv_spec(state, form, FMT_FLAGS_C, false)?;
                 let s: Vec<u8> = match lua_vm::api::to_pointer(state, arg) {
                     Some(p) => format!("0x{:x}", p).into_bytes(),
                     None => b"(null)".to_vec(),
@@ -2173,7 +2197,7 @@ pub fn str_format(state: &mut LuaState) -> Result<usize, LuaError> {
                 addliteral(state, &mut buf, arg)?;
             }
             b's' => {
-                check_conv_spec(form, FMT_FLAGS_C, true)?;
+                check_conv_spec(state, form, FMT_FLAGS_C, true)?;
                 let s = state.to_display_string(arg)?;
                 let has_modifiers = spec.width != 0 || spec.precision.is_some();
                 if has_modifiers && s.contains(&0u8) {
@@ -2186,9 +2210,17 @@ pub fn str_format(state: &mut LuaState) -> Result<usize, LuaError> {
                 state.pop_n(1);
             }
             _ => {
-                return Err(LuaError::runtime(format_args!(
-                    "invalid conversion '%{}' to 'format'", conv as char
-                )));
+                let verb: &[u8] = if state.global().lua_version == lua_types::LuaVersion::V53 {
+                    b"option"
+                } else {
+                    b"conversion"
+                };
+                let mut msg = b"invalid ".to_vec();
+                msg.extend_from_slice(verb);
+                msg.extend_from_slice(b" '");
+                msg.extend_from_slice(form);
+                msg.extend_from_slice(b"' to 'format'");
+                return Err(lua_vm::debug::c_api_runtime(state, msg));
             }
         }
     }

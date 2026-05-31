@@ -547,3 +547,61 @@ fn string_unpack_c0_pos_zero_is_53_only_error() {
         }
     }
 }
+
+/// Item B (shared-core): luaL_argerror / luaL_checkoption callsites must carry
+/// the `luaL_where` location prefix, the `to '<fn>'` qualifier, and the
+/// offending value. The location prefix only shows on the CLI message line
+/// (the in-process wrapper has no pmain frame), so this is a spawn test that
+/// diffs the full first stderr line against the reference for each version.
+#[test]
+fn argerror_funcname_first_line_matches_reference() {
+    let cases = [
+        r#"collectgarbage("bogusopt")"#,
+        r#"utf8.offset("abc", 0, 0)"#,
+        r#"string.format("%200d", 1)"#,
+        r#"string.format("%y", 1)"#,
+        r#"tonumber("x", 1)"#,
+        r#"table.insert({}, 5, 5)"#,
+        r#"math.random(5, 2)"#,
+        r#"string.rep("x", 1.5)"#,
+    ];
+    for &v in VERSIONS {
+        let Some(refbin) = reference_binary(v) else {
+            continue;
+        };
+        for prog in cases {
+            let out = lua_rs()
+                .env("LUA_RS_VERSION", v)
+                .arg("-e")
+                .arg(prog)
+                .output()
+                .expect("spawn lua-rs -e");
+            let rout = Command::new(&refbin)
+                .arg("-e")
+                .arg(prog)
+                .output()
+                .expect("spawn reference");
+
+            // Drop the leading "<progname>: " token (binary path differs).
+            let strip = |b: &[u8]| -> String {
+                let s = String::from_utf8_lossy(b);
+                let first = s.lines().next().unwrap_or("");
+                match first.split_once(": ") {
+                    Some((_prog, rest)) => rest.to_string(),
+                    None => first.to_string(),
+                }
+            };
+            let ours = strip(&out.stderr);
+            let theirs = strip(&rout.stderr);
+            assert_eq!(
+                ours, theirs,
+                "[argerror/{v}] `{prog}` first error line must match reference\n  ours: {ours}\n  ref : {theirs}"
+            );
+            assert_eq!(
+                out.status.code(),
+                rout.status.code(),
+                "[argerror/{v}] `{prog}` exit code must match reference"
+            );
+        }
+    }
+}

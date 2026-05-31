@@ -257,7 +257,7 @@ pub(crate) fn tonumber_fn(state: &mut LuaState) -> Result<usize, LuaError> {
             .map(|b| b.to_vec())
             .unwrap_or_default();
         if !(2..=36).contains(&base) {
-            return Err(LuaError::arg_error(2, "base out of range"));
+            return Err(lua_vm::debug::arg_error_impl(state, 2, b"base out of range"));
         }
         if let Some((consumed, n)) = b_str2int(&bytes, base as u32) {
             if consumed == bytes.len() {
@@ -513,7 +513,7 @@ pub(crate) fn collectgarbage_fn(state: &mut LuaState) -> Result<usize, LuaError>
 pub(crate) fn type_fn(state: &mut LuaState) -> Result<usize, LuaError> {
     let t = state.type_at(1);
     if t == LuaType::None {
-        return Err(LuaError::arg_error(1, "value expected"));
+        return Err(lua_vm::debug::arg_error_impl(state, 1, b"value expected"));
     }
     // Clone the bytes before the push to avoid borrow conflict with state.
     let name: Vec<u8> = state.type_name(t).to_vec();
@@ -733,7 +733,7 @@ pub(crate) fn select_fn(state: &mut LuaState) -> Result<usize, LuaError> {
         i = n;
     }
     if i < 1 {
-        return Err(LuaError::arg_error(1, "index out of range"));
+        return Err(lua_vm::debug::arg_error_impl(state, 1, b"index out of range"));
     }
     // The values at stack positions [i+1 .. n] are already in place; the
     // runtime picks up the top (n - i) of them as results.

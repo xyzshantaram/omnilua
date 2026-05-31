@@ -793,6 +793,54 @@ fn v_argerror_no_value() {
 }
 
 #[test]
+fn v_argerror_funcname_value_crossversion() {
+    // Item B (shared-core): luaL_argerror / luaL_checkoption callsites that used
+    // the state-less constructor lost the `to '<fn>'` qualifier and the offending
+    // value. They must now carry both on every affected version.
+    for v in [LuaVersion::V53, LuaVersion::V54, LuaVersion::V55] {
+        // collectgarbage invalid option: funcname + offending value.
+        err_contains(v, "return collectgarbage('bogusopt')", "to 'collectgarbage'");
+        err_contains(v, "return collectgarbage('bogusopt')", "invalid option 'bogusopt'");
+        // tonumber base out of range: funcname.
+        err_contains(v, "return tonumber('x', 1)", "to 'tonumber'");
+        err_contains(v, "return tonumber('x', 1)", "base out of range");
+        // table.insert position out of bounds.
+        err_contains(v, "return table.insert({}, 5, 5)", "to 'insert'");
+        err_contains(v, "return table.insert({}, 5, 5)", "position out of bounds");
+        // math.random empty interval.
+        err_contains(v, "return math.random(5, 2)", "to 'random'");
+        err_contains(v, "return math.random(5, 2)", "interval is empty");
+        // no-integer-representation now routes through the faithful path.
+        err_contains(v, "return string.rep('x', 1.5)", "to 'rep'");
+        err_contains(v, "return string.rep('x', 1.5)", "number has no integer representation");
+    }
+}
+
+#[test]
+fn v_argerror_perversion_wording() {
+    // Item B per-version wording splits.
+    // utf8.offset: 5.3 says "out of range"; 5.4/5.5 say "out of bounds".
+    err_contains(LuaVersion::V53, "return utf8.offset('abc', 0, 0)", "position out of range");
+    err_contains(LuaVersion::V54, "return utf8.offset('abc', 0, 0)", "position out of bounds");
+    err_contains(LuaVersion::V55, "return utf8.offset('abc', 0, 0)", "position out of bounds");
+    for v in [LuaVersion::V53, LuaVersion::V54, LuaVersion::V55] {
+        err_contains(v, "return utf8.offset('abc', 0, 0)", "to 'offset'");
+    }
+    // string.format width: 5.3 uses the old scanformat message; 5.4/5.5 the
+    // checkformat message including the offending spec.
+    err_contains(LuaVersion::V53, "return string.format('%200d', 1)",
+        "invalid format (width or precision too long)");
+    err_contains(LuaVersion::V54, "return string.format('%200d', 1)",
+        "invalid conversion specification: '%200d'");
+    err_contains(LuaVersion::V55, "return string.format('%200d', 1)",
+        "invalid conversion specification: '%200d'");
+    // string.format unknown conversion: 5.3 "invalid option", 5.4/5.5 "invalid conversion".
+    err_contains(LuaVersion::V53, "return string.format('%y', 1)", "invalid option '%y' to 'format'");
+    err_contains(LuaVersion::V54, "return string.format('%y', 1)", "invalid conversion '%y' to 'format'");
+    err_contains(LuaVersion::V55, "return string.format('%y', 1)", "invalid conversion '%y' to 'format'");
+}
+
+#[test]
 fn v_length_concat_location_prefix() {
     // (b) `#` and `..` carry the chunk-location prefix and the message body.
     for v in [LuaVersion::V53, LuaVersion::V54, LuaVersion::V55] {
@@ -875,10 +923,14 @@ fn v54_utf8_offset_arity_unchanged() {
 #[test]
 fn v55_collectgarbage_drops_setpause_setstepmul() {
     // 5.5 removed setpause/setstepmul; they are now invalid options.
+    // Item B: the message carries the function name and the offending value,
+    // not the bare truncated `invalid option`.
     err_contains(LuaVersion::V55,
-        "return collectgarbage('setpause', 100)", "invalid option");
+        "return collectgarbage('setpause', 100)", "to 'collectgarbage'");
     err_contains(LuaVersion::V55,
-        "return collectgarbage('setstepmul', 100)", "invalid option");
+        "return collectgarbage('setpause', 100)", "invalid option 'setpause'");
+    err_contains(LuaVersion::V55,
+        "return collectgarbage('setstepmul', 100)", "invalid option 'setstepmul'");
 }
 
 #[test]
@@ -895,9 +947,9 @@ fn v55_collectgarbage_param_surface() {
     // param read returns an integer.
     eq(LuaVersion::V55,
         "return math.type(collectgarbage('param', 'pause'))", "integer");
-    // invalid param name errors via luaL_checkoption.
+    // invalid param name errors via luaL_checkoption, carrying the value.
     err_contains(LuaVersion::V55,
-        "return collectgarbage('param', 'bogus')", "invalid option");
+        "return collectgarbage('param', 'bogus')", "invalid option 'bogus'");
     // write returns the OLD value, then read returns the value just written
     // (round-trip on the faithful-shape backing store).
     eq(LuaVersion::V55,
