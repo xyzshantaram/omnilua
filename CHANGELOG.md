@@ -4,6 +4,22 @@ All notable changes to `lua-rs` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.23] - 2026-06-01
+
+### Fixed
+
+- **Windows build** (#90): `lua-cli`'s `os.date`/`os.time` local-timezone hook
+  used `libc::localtime_r` and read `tm_gmtoff`, neither of which exists in
+  Windows' MSVCRT, so `lua-cli` failed to compile on Windows. The
+  `local_offset_hook` is now `cfg`-split — the Unix path is unchanged; the
+  Windows path derives the same offset (DST included) by decomposing the instant
+  with `localtime_s` and `gmtime_s` and differencing the two wall clocks.
+
+### CI
+
+- Releases now gate on a `windows-build` job (`windows-latest`, MSVC) that
+  `publish-crates` depends on, so a Windows compile break can no longer ship.
+
 ## [0.0.22] - 2026-06-01
 
 ### Added — Lua 5.1 and 5.2; one API now spans Lua 5.1–5.5
