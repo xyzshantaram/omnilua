@@ -1211,10 +1211,6 @@ pub fn f_read(state: &mut LuaState) -> Result<usize, LuaError> {
 
 // ── Write helpers ────────────────────────────────────────────────────────────
 
-/// Dispatch one or more write values. C: `g_write(L, f, arg)`.
-///
-/// TODO(port): borrow split — same issue as g_read.
-#[expect(dead_code, reason = "ported stdlib helper; not yet wired into the runtime")]
 /// Render a numeric `LuaValue` to its `io.write` byte form.
 ///
 /// C's `g_write` writes numbers with `lua_tostring`, i.e. the same
@@ -1230,6 +1226,10 @@ fn num_to_write_bytes(state: &mut LuaState, val: &LuaValue) -> Result<Vec<u8>, L
     Ok(s.as_bytes().to_vec())
 }
 
+/// Dispatch one or more write values. C: `g_write(L, f, arg)`.
+///
+/// TODO(port): borrow split — same issue as g_read.
+#[expect(dead_code, reason = "ported stdlib helper; not yet wired into the runtime")]
 fn g_write(
     state: &mut LuaState,
     file: &mut dyn LuaFileHandle,
