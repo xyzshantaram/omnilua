@@ -769,7 +769,11 @@ fn pairs_cont(_state: &mut LuaState, _status: i32, _ctx: isize) -> Result<usize,
 ///
 pub(crate) fn pairs_fn(state: &mut LuaState) -> Result<usize, LuaError> {
     state.check_arg_any(1)?;
-    if state.get_metafield(1, b"__pairs")? == LuaType::Nil {
+    // Lua 5.1 has no `__pairs` metamethod; `pairs(t)` always iterates the raw
+    // table even when a `__pairs` is set (it is silently ignored). `__pairs`
+    // was added in 5.2 and removed again in 5.4, so only consult it off V51.
+    let consult_pairs_tm = !matches!(state.global().lua_version, lua_types::LuaVersion::V51);
+    if !consult_pairs_tm || state.get_metafield(1, b"__pairs")? == LuaType::Nil {
         state.push_c_function(next_fn)?;
         state.push_copy(1)?;
         state.push(LuaValue::Nil);

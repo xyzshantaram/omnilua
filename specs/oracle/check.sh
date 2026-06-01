@@ -190,6 +190,14 @@ if [ "$ver" = "5.1" ]; then
   run "string length"       'print(#"hello")'
   run "table length"        'print(#({10,20}))'
 
+  # Metamethod flip: __pairs on a TABLE is IGNORED in 5.1 (added in 5.2). A
+  # __pairs that error()s never fires; pairs(t) iterates the raw table.
+  run "__pairs ignored"     'local t=setmetatable({10,20,30},{__pairs=function() error("x") end}); local s=0; for k,v in pairs(t) do s=s+v end; print(s)'
+
+  # Metamethod flip: __gc on a TABLE is INERT in 5.1 (only userdata finalize).
+  # Setting __gc on a table metatable does not call it on collection.
+  run "__gc table inert"    'local flag={f=false}; do local t=setmetatable({},{__gc=function() flag.f=true end}); t=nil end; collectgarbage(); collectgarbage(); print(tostring(flag.f))'
+
   # Stdlib roster (5.1): fenv globals present, _ENV/bit32/utf8 absent,
   # unpack/loadstring globals, legacy table/math names, no math.type.
   run "getfenv present"     'print(type(getfenv))'
