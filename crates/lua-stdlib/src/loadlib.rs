@@ -1253,10 +1253,14 @@ pub fn luaopen_package(state: &mut LuaState) -> Result<usize, LuaError> {
     )?;
     state.pop_n(1);
 
-    // Lua 5.1's deprecated module system: `package.seeall` (a field on the
-    // package table) and the `module` global. Both were removed in 5.2.
-    // Verified against lua5.1.5. See specs/followup/5.1-roster-syntax.md §1.
-    if matches!(state.global().lua_version, lua_types::LuaVersion::V51) {
+    // The deprecated module system: `package.seeall` (a field on the package
+    // table) and the `module` global. Present in 5.1 and kept in 5.2.4 via the
+    // default-on `LUA_COMPAT_MODULE`; fully removed in 5.3. Verified against
+    // lua5.1.5 and lua5.2.4. See specs/followup/5.1-roster-syntax.md §1.
+    if matches!(
+        state.global().lua_version,
+        lua_types::LuaVersion::V51 | lua_types::LuaVersion::V52
+    ) {
         // The package table is on top of the stack here.
         state.push_c_function(ll_seeall)?;
         state.set_field(-2, b"seeall")?;
