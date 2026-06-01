@@ -1994,3 +1994,64 @@ fn v52_v53_backward_goto_to_enclosing_block_label() {
     eq(LuaVersion::V54, prog, "3");
     eq(LuaVersion::V55, prog, "3");
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// __gc finalizer error propagation (shared-core item 3).
+//
+// Version split confirmed against the reference binaries (gcerr probe):
+//   5.1            — silently swallows; pcall(collectgarbage) returns ok.
+//   5.2 / 5.3      — C `GCTM` propagates the wrapped error
+//                    `error in __gc metamethod (<msg>)` out of collectgarbage
+//                    (gc.lua:360 asserts `not pcall(collectgarbage)`).
+//   5.4 / 5.5      — C `GCTM` catches and routes to `luaE_warnerror`; the
+//                    error never propagates (collectgarbage returns ok). The
+//                    warning is silent unless `warn("@on")`.
+// The close path (lua_close / callallpendingfinalizers, propagateerrors=0)
+// swallows on every version — exercised end-to-end by traceback_oracle.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Drives a `__gc`-erroring finalizer through an explicit `collectgarbage()`
+/// and reports whether the collect call propagated (returns the error text)
+/// or swallowed (returns "ok").
+fn gc_finalizer_error_disposition(version: LuaVersion, body: &str) -> Result<String, String> {
+    run(
+        version,
+        &format!(
+            "do local x = setmetatable({{}}, {{__gc = function() {body} end}}); x = nil end\n\
+             local ok, err = pcall(collectgarbage)\n\
+             if ok then return 'ok' else return tostring(err) end"
+        ),
+    )
+}
+
+#[test]
+fn v52_v53_gc_finalizer_error_propagates() {
+    for v in [LuaVersion::V52, LuaVersion::V53] {
+        let got = gc_finalizer_error_disposition(v, "error('boom')").expect("collect runs");
+        assert!(
+            got.contains("error in __gc metamethod (") && got.contains("boom"),
+            "version {v:?}: expected wrapped __gc error, got `{got}`"
+        );
+    }
+}
+
+#[test]
+fn v52_v53_gc_finalizer_nonstring_error_is_no_message() {
+    for v in [LuaVersion::V52, LuaVersion::V53] {
+        let got = gc_finalizer_error_disposition(v, "error({})").expect("collect runs");
+        assert_eq!(
+            got, "error in __gc metamethod (no message)",
+            "version {v:?}: non-string __gc error object"
+        );
+    }
+}
+
+#[test]
+fn v51_v54_v55_gc_finalizer_error_swallowed() {
+    // 5.1 silently swallows; 5.4/5.5 route to the (default-silent) warning
+    // system. In every case the explicit collect does NOT propagate.
+    for v in [LuaVersion::V51, LuaVersion::V54, LuaVersion::V55] {
+        let got = gc_finalizer_error_disposition(v, "error('boom')").expect("collect runs");
+        assert_eq!(got, "ok", "version {v:?}: __gc error must not propagate");
+    }
+}

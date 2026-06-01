@@ -1225,6 +1225,18 @@ pub struct GlobalState {
     /// strong roots so they survive the sweep that scheduled them.
     pub to_be_finalized: Vec<GcRef<lua_types::value::LuaTable>>,
 
+    /// Error raised by a `__gc` finalizer during an explicit `collectgarbage`
+    /// on 5.2 / 5.3, parked here for the `collectgarbage` wrapper to re-raise.
+    ///
+    /// C-Lua re-throws the wrapped `error in __gc metamethod (%s)` directly out
+    /// of `GCTM` via `luaD_throw`. The Rust `api::gc` entry point returns `i32`
+    /// (its many callers cannot all thread a `Result`), so the explicit-collect
+    /// path stashes the wrapped error here and the `collectgarbage` built-in
+    /// drains it into the `Result<usize, LuaError>` it already returns. Only
+    /// the explicit-collect path sets this; the automatic GC-step and close
+    /// paths never do (matching `GCTM(L, 0)` and the dispatch-loop swallow).
+    pub gc_finalizer_error: Option<LuaValue>,
+
     // Phase-D NOTE: tobefnz + fixedgc removed (dead since Phase A — see
     // sibling note above re allgc et al). Pending finalizers live in
     // `pending_finalizers` above; fixed objects live in heap.allgc with the
@@ -4613,6 +4625,7 @@ pub fn new_state() -> Option<LuaState> {
         gc_tracked_long_strings: Vec::new(),
         pending_finalizers: Vec::new(),
         to_be_finalized: Vec::new(),
+        gc_finalizer_error: None,
         twups: Vec::new(),
         panic: None,
         mainthread: None,

@@ -679,3 +679,66 @@ fn print_global_tostring_matches_reference_per_version() {
         }
     }
 }
+
+/// `__gc` finalizer error disposition through the spawned CLI (shared-core
+/// item 3). An explicit `collectgarbage()` runs a finalizer that errors; we
+/// assert the program's own `pcall(collectgarbage)` result and the default
+/// stderr, then diff against the reference binary where present.
+///
+///   5.3            — propagates: pcall returns the wrapped
+///                    `error in __gc metamethod (...)`, nothing on stderr.
+///   5.4 / 5.5      — swallows: pcall returns ok. Default warnings are off, so
+///                    stderr stays empty (matching the reference default).
+#[test]
+fn gc_finalizer_error_disposition_via_cli() {
+    const PROG: &str = "\
+        do local x = setmetatable({}, {__gc = function() error('boom') end}); x = nil end\n\
+        local ok, err = pcall(collectgarbage)\n\
+        io.write(tostring(ok), '|', tostring(err), '\\n')\n";
+
+    for &v in VERSIONS {
+        let out = lua_rs()
+            .env("LUA_RS_VERSION", v)
+            .arg("-e")
+            .arg(PROG)
+            .output()
+            .expect("spawn lua-rs -e");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+        match v {
+            "5.3" => {
+                assert!(
+                    stdout.starts_with("false|")
+                        && stdout.contains("error in __gc metamethod (")
+                        && stdout.contains("boom"),
+                    "[gcfin/{v}] expected propagated __gc error, got stdout `{stdout}`"
+                );
+            }
+            "5.4" | "5.5" => {
+                assert!(
+                    stdout.starts_with("true|"),
+                    "[gcfin/{v}] __gc error must be swallowed, got stdout `{stdout}`"
+                );
+                assert!(
+                    stderr.is_empty(),
+                    "[gcfin/{v}] no warning with warnings off, got stderr `{stderr}`"
+                );
+            }
+            other => panic!("unhandled version {other}"),
+        }
+
+        if let Some(refbin) = reference_binary(v) {
+            let rout = Command::new(&refbin)
+                .arg("-e")
+                .arg(PROG)
+                .output()
+                .expect("spawn reference");
+            assert_eq!(
+                stdout,
+                String::from_utf8_lossy(&rout.stdout),
+                "[gcfin/{v}] stdout must match reference"
+            );
+        }
+    }
+}
