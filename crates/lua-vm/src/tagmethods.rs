@@ -755,7 +755,15 @@ pub(crate) fn call_order_tm(
         )
     {
         let res_idx = state.top_idx();
-        if call_bin_tm(state, p2, p1, res_idx, TagMethod::Lt)? {
+        // Mark the CallInfo: a `__lt` standing in for `__le`. If the `__lt`
+        // metamethod yields, `call_bin_tm` returns Err and the clear below is
+        // skipped, so the mark survives the yield and `vm::finish_op` negates
+        // the result on resume. C: `L->ci->callstatus |= CIST_LEQ`.
+        state.current_call_info_mut().callstatus |= crate::state::CIST_LEQ;
+        let called = call_bin_tm(state, p2, p1, res_idx, TagMethod::Lt)?;
+        // Synchronous return: clear the mark (C: `callstatus ^= CIST_LEQ`).
+        state.current_call_info_mut().callstatus &= !crate::state::CIST_LEQ;
+        if called {
             // l_isfalse(result): a <= b  ==  not (b < a)
             let result = state.get_at(res_idx).clone();
             return Ok(matches!(result, LuaValue::Nil | LuaValue::Bool(false)));

@@ -1485,12 +1485,19 @@ pub(crate) fn finish_op(state: &mut LuaState) -> Result<(), LuaError> {
         | OpCode::GtI | OpCode::GeI | OpCode::Eq => {
             let top_minus1 = state.top_idx() - 1;
             let v = state.get_at(top_minus1);
-            let res = !matches!(v, LuaValue::Nil | LuaValue::Bool(false));
+            let mut res = !matches!(v, LuaValue::Nil | LuaValue::Bool(false));
             state.dec_top();
+            // LUA_COMPAT_LT_LE: if this `__le` was derived from a `__lt` that
+            // yielded (5.1–5.4), the result `b < a` must be negated back to
+            // `a <= b`. The mark was set in `tagmethods::call_order_tm`.
+            // C (lvm.c luaV_finishOp): `if (callstatus & CIST_LEQ) { ^= ; res = !res; }`
+            if (state.get_ci(ci).callstatus & crate::state::CIST_LEQ) != 0 {
+                state.get_ci_mut(ci).callstatus &= !crate::state::CIST_LEQ;
+                res = !res;
+            }
             if (res as i32) != inst.arg_k() {
                 state.ci_skip_next_instruction(ci);
             }
-            // Note: CIST_LEQ compatibility not supported (LUA_COMPAT_LT_LE dropped)
         }
         //    StkId top = L->top.p - 1;
         //    int a = GETARG_A(inst);
