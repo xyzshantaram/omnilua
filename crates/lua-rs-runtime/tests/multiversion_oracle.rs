@@ -1882,3 +1882,33 @@ fn v52_plus_roster_unchanged_by_v51_work() {
     eq(LuaVersion::V52, "return type(table.unpack)", "function");
     eq(LuaVersion::V52, "return type(table.pack)", "function");
 }
+
+#[test]
+fn v55_table_downward_resize_no_panic() {
+    // Regression for the `nextvar.lua` (5.5) table-resize panic: a downward
+    // array resize migrated array slots into the hash part by calling `set_int`
+    // *while iterating the live array*; the first migrated key (`alimit+1`)
+    // could re-enter `resize` and truncate the very array being read, so the
+    // loop indexed past its (now shorter) physical length and panicked
+    // ("index out of bounds: len N, index N") — a panic in safe Rust, worse
+    // than any parity mismatch. The fix detaches the migrating slots into an
+    // owned snapshot and truncates the array *before* reinserting.
+    //
+    // This is the exact shape from `nextvar.lua`'s "length for some random
+    // tables" loop (`table.create` preallocates an array part, then sparse
+    // integer inserts force rehash + downward resize). Seed 7 deterministically
+    // reproduced the panic on the unfixed binary; the assertion below would
+    // panic inside the VM harness on regression.
+    eq(
+        LuaVersion::V55,
+        "math.randomseed(7)\n\
+         local N = 130\n\
+         for i = 1, 1000 do\n\
+           local a = table.create(math.random(N))\n\
+           for j = 1, math.random(N) do a[math.random(N)] = true end\n\
+           local _ = #a\n\
+         end\n\
+         return 'done'",
+        "done",
+    );
+}
