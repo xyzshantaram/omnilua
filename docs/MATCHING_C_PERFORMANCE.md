@@ -777,6 +777,17 @@ Correctness gates:
 - `./harness/canaries/gc/run_canaries.sh`
 - `make test` passed, including 44/44 official tests
 
+Rejected follow-up:
+
+- Replacing integer `format!("{}", i)` in `number_to_str_buf` with a manual
+  i64 decimal formatter passed `cargo check -p lua-vm` and a targeted
+  `i64::MIN` unit test, but did not move the intended workload. Direct
+  Rust A/B, best-of-20
+  (`harness/bench/results/20260602T203114Z-d44ead4-bin-ab.tsv`), left
+  `table_hash_pressure`, `gc_pressure`, and `string_ops` flat, slightly
+  regressed `string_ops_long` to 1.009x candidate/base, and only moved
+  `binarytrees` to 0.988x. It was dropped.
+
 Tool gaps:
 
 - `sample` plus `vm-execute.txt` still leaves `UNKNOWN_INLINED` samples and
