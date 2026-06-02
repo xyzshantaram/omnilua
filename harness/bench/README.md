@@ -18,8 +18,11 @@ harness/bench/
 ├── compare.sh           <- main ledgered bench: run all workloads vs reference
 ├── gc-profile.sh        <- end-of-run collector counters
 ├── opcode-profile.sh    <- feature-gated opcode execution counters
+├── profile-inventory.sh <- repo + host profiler/tool availability
 ├── profile-hotspots.sh  <- macOS sample wrapper + VM execute attribution
 ├── scaling-check.py     <- complexity gate: flag superlinear (O(n^2)) behavior
+├── value-layout.sh      <- Rust-vs-C value/frame/object layout probe
+├── vm-execute-attribution.py <- source-region parser for sample output
 ├── workloads/           <- self-contained .lua microbenchmarks (timed vs C)
 │   ├── binarytrees.lua  <- GC pressure (CLBG-style)
 │   ├── closure_ops.lua  <- closure allocation + upvalue access
@@ -44,6 +47,11 @@ harness/bench/
 of a base size and fits the complexity exponent, failing if an operation that
 should be linear goes superlinear. That gate catches O(n^2) regressions a
 single-size ratio would miss (it is what would have caught the #38 table bug).
+
+`profile-inventory.sh` is the cheap first command for a new performance
+session. It prints which repo probes exist and which host profilers are
+available on the machine, including `sample`, `xctrace`, `leaks`, DTrace,
+`inferno-flamegraph`, `samply`, and Linux `perf`.
 
 Generated artifacts land under `results/` and `profiles/` (gitignored).
 The static dashboard at `history/index.html` IS tracked so it can be viewed
@@ -138,13 +146,29 @@ When the raw sample contains `lua_vm::vm::execute`, the same runner also writes
 `execute` source-line samples into frame setup, dispatch fetch, opcode arms,
 return re-entry, and unknown-inlined regions. The headline table uses
 self-samples, so an outer `OP_CALL` frame is not charged for time spent in the
-nested callee's active VM frame.
+nested callee's active VM frame. The report also includes
+`opaque_self_samples` plus an "Opaque VM execute self samples by source file"
+section, so `UNKNOWN_INLINED` time can be separated into `vm.rs:0`,
+`result.rs:0`, `value.rs:0`, or other inlined source buckets before reaching
+for heavier tooling. Opaque rows also show compact address-offset bundles from
+the raw sample output; those offsets are not per-offset counts, but they show
+when one line-0 row is aggregating multiple code addresses.
 
 This is still sampling telemetry, not exact per-op timing. It is useful for
 distinguishing "all time vanished into `vm::execute`" from concrete buckets
 such as dispatch, `OP_CALL`, `OP_GETUPVAL`, and `OP_SETUPVAL`. Use
 `opcode-profile.sh` when you need execution counts; use `vm-execute.txt` when
 you need approximate time attribution inside the interpreter loop.
+
+If `vm-execute.txt` warns that no `lua_vm::vm::execute` source-line data was
+found, the profile can still show top symbols but cannot attribute VM buckets.
+Rebuild before profiling:
+
+```bash
+CARGO_PROFILE_RELEASE_DEBUG=true \
+RUSTFLAGS="-C force-frame-pointers=yes" \
+  cargo build --release -p lua-cli
+```
 
 `opcode-profile.sh` is a feature-gated VM opcode counter for cases where stack
 sampling collapses into `vm::execute`:
@@ -159,18 +183,34 @@ It builds `lua-rs` with `--features opcode-profile`, writes
 `target/release/lua-rs` with the instrumented binary. Rebuild a normal release
 binary before running `compare.sh`.
 
-`gc-profile.sh` runs the normal release binary and writes end-of-run collector
-counters:
+`gc-profile.sh` runs the normal release binary and writes collector counters:
 
 ```bash
 bash harness/bench/gc-profile.sh gc_pressure
 PROFILE_REPEAT=10 bash harness/bench/gc-profile.sh binarytrees
 ```
 
-It writes `profiles/gc-profile/<UTC>-<sha>-<label>/gc.tsv`. The report covers
-collection counts, heap cohorts, latest mark/sweep counters, grayagain count,
-and intern-table size. It is useful when `/usr/bin/sample` says a GC phase is
-hot but cannot explain how many objects the phase is visiting or freeing.
+It writes `profiles/gc-profile/<UTC>-<sha>-<label>/gc-start.tsv`, `gc.tsv`,
+`gc-delta.tsv`, and `gc-rates.tsv`. The start snapshot is taken after
+CLI/library startup and before script or `-e` execution; the end snapshot is
+taken after close-time finalizers. The report covers collection counts, heap
+cohorts, latest mark/sweep counters, grayagain count, intern-table size,
+per-run/per-second rates for cumulative counters, and net deltas for live
+gauges such as the intern table. It is useful when
+`/usr/bin/sample` says a GC phase is hot but cannot explain how many objects
+the phase is visiting or freeing.
+
+`value-layout.sh` is a representation probe, not a benchmark:
+
+```bash
+bash harness/bench/value-layout.sh
+```
+
+It compiles a tiny Rust example plus a temporary C probe against
+`reference/lua-5.4.7/src` and prints `impl/type/size_bytes/align_bytes` rows
+for value, stack, frame, table, closure, userdata, proto, and upvalue
+structures. Use it before making claims about safe-Rust value layout or
+unsafe representation ceilings.
 
 ## Reproducibility rules
 
@@ -186,16 +226,21 @@ hot but cannot explain how many objects the phase is visiting or freeing.
 2. `profile-hotspots.sh` is wired for `/usr/bin/sample` summaries and supports
    `PROFILE_REPEAT=N` for scaled short-workload probes. `PROFILE_LUA_EVAL`
    remains available for custom probe shapes. When `vm::execute` dominates,
-   inspect the adjacent `vm-execute.txt` before adding deeper profiler tooling.
+   inspect the adjacent `vm-execute.txt`, including its opaque-source table,
+   before adding deeper profiler tooling.
 3. `opcode-profile.sh` covers per-op counts when stack samples flatten into
    `vm::execute`; it does not provide per-op timing. Pair it with
    `vm-execute.txt` when opcode frequency and sampled time diverge.
-4. `gc-profile.sh` covers end-of-run collector counters. It does not provide
-   allocation stack attribution or cumulative per-phase timing.
+4. `gc-profile.sh` covers collector counters and start/end cadence deltas. It
+   does not provide allocation stack attribution or cumulative per-phase
+   timing.
 5. `compare.sh` appends ledger rows directly. Typed bench runner entries in
    `harness/runners.toml` are still useful future cleanup, but not required
    for evidence-backed perf work.
-6. Backfill remains future work for answering "when did this regress?" across
+6. `profile-inventory.sh` and `value-layout.sh` are telemetry probes. They do
+   not write ledger rows and should be cited as design evidence, not speed
+   claims.
+7. Backfill remains future work for answering "when did this regress?" across
    older commits.
-7. Keep `results/` and `profiles/` generated artifacts ignored unless a run is
+8. Keep `results/` and `profiles/` generated artifacts ignored unless a run is
    deliberately promoted into committed evidence.

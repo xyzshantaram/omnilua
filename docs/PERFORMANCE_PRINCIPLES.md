@@ -41,8 +41,9 @@ recent 1.75×-2.00× band to 1.14× in the broad matrix and 1.17× in a
 best-of-10 focused run. The overall ratio stayed about 1.54× because the
 largest remaining workloads are VM-call and GC dominated, not string-key
 construction dominated.
-The next tall poles are core VM call/upvalue dispatch, collector
-sweep/allocation mechanics, and byte-string pattern matching.
+The next tall poles are core VM call/upvalue dispatch, GC cadence on
+`gc_pressure`, old-revisit/cohort volume on `binarytrees`, table string-key
+write paths on `table_hash_pressure`, and byte-string pattern matching.
 
 ## The gate
 
@@ -349,7 +350,7 @@ was a real cost — every `OP_ADD` cloned two operands to satisfy the
 borrow checker. We refactored to use primitive-tag accessors
 (`get_int_at` returns `Option<i64>`, no enum clone). **Result:
 mandelbrot improved (2.12× → 2.00×) but fibonacci was essentially
-unchanged** — the LLVM-inlined 24-byte enum copy was not material.
+unchanged** — the LLVM-inlined value copy was not material.
 The real fibonacci bottleneck is the dispatch machinery (precall,
 upvalue_get, instruction decode). Profile evidence beats hypothesis;
 sometimes the hypothesis was wrong about magnitude even when the
@@ -420,8 +421,11 @@ barriers, skipped metamethod checks, or benchmark-only dispatch.
 - **`vm::execute` needs source-region attribution.** If
   `profile-hotspots.sh` sees `lua_vm::vm::execute` in the raw `sample.txt`, it
   writes `vm-execute.txt` beside the hotspot summary. Treat that as the first
-  pass at per-region timing inside the interpreter loop. It is sampled
-  line/offset evidence, not exact opcode timing, so pair it with
+  pass at per-region timing inside the interpreter loop. Read
+  `opaque_self_samples` and the opaque-source table before treating
+  `UNKNOWN_INLINED` as one bucket; it often distinguishes `vm.rs:0` from
+  standard-library inlining such as `result.rs:0` or `value.rs:0`. It is
+  sampled line/offset evidence, not exact opcode timing, so pair it with
   `opcode-profile.sh` when you need executed-op counts.
 
 ## What about JIT?
@@ -444,7 +448,7 @@ When starting a perf push:
 3. Build the profile-friendly binary (`force-frame-pointers=yes`).
 4. Run `bash harness/bench/profile-hotspots.sh <workload>` to capture
    a wall-clock sample. Read the top frames and, when present, the adjacent
-   `vm-execute.txt` source-region report.
+   `vm-execute.txt` source-region and opaque-source report.
 5. Form a hypothesis. Write it down (commit message body is fine).
 6. Apply *one* change. Smaller is better.
 7. `cargo build --release -p lua-cli`. Run the 44/44 suite.
