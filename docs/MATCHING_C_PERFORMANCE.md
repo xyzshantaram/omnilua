@@ -576,6 +576,27 @@ What this says about the roadmap:
   frame invariants, cached frame/upvalue pointers, and larger table/upvalue
   heap objects.
 
+Follow-up rejected call/frame spikes:
+
+- A no-hook `RETURN0`/`RETURN1` direct re-entry cleanup removed the shared
+  `RETURN_REENTRY` bucket, but the best-of-10 focused matrix
+  (`harness/bench/results/20260602T190002Z-89161f2-compare.tsv`) regressed
+  `binarytrees` to 2.05x and `closure_ops` to 2.00x while only moving
+  `fibonacci` to 1.85x. It was dropped.
+- Caching `GcRef<LuaLClosure>` in `CallInfoFrame::Lua` did not increase
+  `CallInfo` size (`value-layout.sh` still showed `CallInfo` 72B and
+  `CallInfoFrame` 32B), but it added a write on every Lua call. The best-of-10
+  focused matrix
+  (`harness/bench/results/20260602T190627Z-89161f2-compare.tsv`) improved
+  `closure_ops` to 1.88x and `fibonacci` to 1.83x, but regressed
+  `binarytrees` to 2.02x. It was dropped. The signal is that cached frame data
+  has to avoid per-call write cost.
+- Co-loading `CallInfo.func` and `savedpc` at frame entry was behavior-neutral
+  and performance-neutral. The best-of-5 focused matrix
+  (`harness/bench/results/20260602T190952Z-89161f2-compare.tsv`) matched the
+  baseline shape (`binarytrees` 1.93x, `closure_ops` 1.94x, `fibonacci` 1.87x),
+  so the change was dropped as noise.
+
 Tool gaps:
 
 - `sample` plus `vm-execute.txt` still leaves `UNKNOWN_INLINED` samples and
