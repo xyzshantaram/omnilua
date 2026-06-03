@@ -9,7 +9,7 @@ either, use `mlua`.
 
 ```toml
 [dependencies]
-lua-rs-runtime = "0.0.28"
+lua-rs-runtime = "0.0.29"
 ```
 
 ## Calling Rust from Lua
