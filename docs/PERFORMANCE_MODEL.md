@@ -126,7 +126,7 @@ COUNT — our cycles-per-instruction is *better* than C's:
 
 | workload | C Ir/iter | rs Ir/iter | Ir ratio | wall ratio | CPI factor |
 |---|---:|---:|---:|---:|---:|
-| concat_chain | 2,965 | 8,100 | 2.73 | 2.54 | 0.93 |
+| concat_chain | 2,965 | 7,350 (was 8,100 pre-stringtable) | 2.48 | ~1.98 est | |
 | table_seti_same | 61 | 157 | 2.57 | 1.95 | 0.76 |
 | fibonacci | (totals) | | 2.32 | 1.58 | 0.68 |
 | string_format_mixed | 12,286 | 20,336 | 1.66 | 1.90 | 1.14 |
