@@ -65,9 +65,10 @@ perf:
 	$(CARGO) build --release --bin lua-rs
 	bash harness/bench/compare.sh
 
-perf-pgo:
+perf-pgo: setup
 	@[ -x reference/lua-5.4.7/src/lua ] || $(MAKE) -C reference/lua-5.4.7 guess
 	bash harness/bench/build-pgo.sh
+	./harness/run_official_all.sh
 	BENCH_VARIANT=pgo bash harness/bench/compare.sh
 	$(CARGO) build --release --bin lua-rs
 
