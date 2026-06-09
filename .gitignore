@@ -52,3 +52,4 @@ harness/loop/state/
 # oracle scratch outputs — never commit (harness/CLAUDE.md)
 harness/impl/official/*.out
 harness/.perf-experiment
+harness/impl/stop-build.err
