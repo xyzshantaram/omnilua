@@ -44,6 +44,7 @@ RUNS=5
 WORKLOAD_FILTER=""
 MIN_SAMPLE_S="${MIN_SAMPLE_S:-0.5}"
 CALIB_CACHE="$OUT_DIR/.calib-cache.tsv"
+BENCH_VARIANT="${BENCH_VARIANT:-stock}"
 
 # Hold the perf-experiment marker so a Stop-hook firing mid-run neither
 # contends for CPU nor auto-commits (PERF_PUSH_SPEC P7.4).
@@ -157,6 +158,7 @@ measure_one() {
     printf '# min_sample_s:  %s (auto repeat calibration)\n' "$MIN_SAMPLE_S"
     printf '# dirty:         %s\n' "$DIRTY"
     printf '# diff_sha256:   %s\n' "$DIFF_SHA"
+    printf '# variant:       %s (non-stock ledger rows are excluded from the dashboard trend)\n' "$BENCH_VARIANT"
     printf '# reference:     %s (Lua 5.4.7, sha256 %s)\n' "$REF_BIN" "$REF_SHA"
     printf '# lua-rs:        %s (sha256 %s)\n' "$RS_BIN" "$RS_SHA"
     printf '#\n'
@@ -282,9 +284,9 @@ EVIDENCE_REL="harness/bench/results/$(basename "$JSON")"
 
 # Use Python (already available, no jq dependency) to emit well-formed JSON
 # Lines from the same JSON_ROWS string we just built.
-python3 - "$JSON" "$COMMIT" "$TS" "$OS_NAME" "$ARCH" "$CPU" "$EVIDENCE_REL" "$RUNS" "$LEDGER" <<'PY'
+python3 - "$JSON" "$COMMIT" "$TS" "$OS_NAME" "$ARCH" "$CPU" "$EVIDENCE_REL" "$RUNS" "$LEDGER" "$BENCH_VARIANT" <<'PY'
 import json, sys
-json_path, commit, ts, os_name, arch, cpu, evidence_rel, runs, ledger = sys.argv[1:]
+json_path, commit, ts, os_name, arch, cpu, evidence_rel, runs, ledger, variant = sys.argv[1:]
 with open(json_path) as f:
     data = json.load(f)
 # Parity threshold: workloads above this wall_ratio are considered "failing
@@ -311,6 +313,7 @@ with open(ledger, "a") as out:
                 "runner": "bench-vs-reference",
                 "runs": int(runs),
                 "repeat_each": int(row.get("repeat_each", 1)),
+                "variant": variant,
                 "os": os_name,
                 "arch": arch,
                 "cpu": cpu,
@@ -319,7 +322,10 @@ with open(ledger, "a") as out:
         # Oracle-style row so the chassis's failing_rust_vs_ref_fixtures
         # filter sees this workload as a failing target. Format mirrors
         # the test-suite oracle rows: kind=oracle, target=rust-vs-reference,
-        # numerator < denominator when failing parity.
+        # numerator < denominator when failing parity. The parity gate is
+        # defined on stock builds only — variant runs skip oracle rows.
+        if variant != "stock":
+            continue
         passing = row["wall_ratio"] <= PARITY_THRESHOLD
         oracle = {
             "schema_version": 1,
