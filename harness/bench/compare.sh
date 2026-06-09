@@ -294,6 +294,8 @@ with open(ledger, "a") as out:
     for row in data["rows"]:
         if row.get("status", "ok") != "ok":
             continue
+        if row["workload"] == "startup_empty":
+            continue
         for metric in ("wall_ratio", "rss_ratio"):
             entry = {
                 "schema_version": 1,

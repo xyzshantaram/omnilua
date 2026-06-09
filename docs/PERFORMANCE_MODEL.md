@@ -20,28 +20,47 @@ scorecard with enforced >=0.5 s samples, interleaved pairs, and repeat
 calibration (artifact `20260609T203851Z-87ef21f-compare.tsv`, ledgered).
 Overall wall ratio **1.51x**. Sorted by median pair ratio:
 
+P6 expansion rows (artifact `20260609T205627Z-933d82e-compare.tsv`, same
+host/method) are merged below and marked NEW — the previously unmeasured
+paths hid the two tallest poles on the board:
+
 | workload | wall ratio | median | note |
 |---|---:|---:|---|
-| table_setfield_same | 2.35 | 2.37 | tallest pole: existing short-string SETFIELD |
+| concat_chain | 2.54 | 2.54 | NEW tallest pole: short multi-operand `..` chains |
+| coroutine_pingpong | 2.53 | 2.53 | NEW: resume/yield switch cost |
+| table_setfield_same | 2.35 | 2.37 | existing short-string SETFIELD |
 | global_settabup_same | 2.33 | 2.33 | _ENV SETTABUP write path |
+| method_calls | 2.06 | 2.27 | NEW: OP_SELF `obj:method()` dispatch |
 | binarytrees | 2.05 | 2.15 | GC family; RSS 4.5x |
 | gc_pressure | 2.04 | 2.02 | GC family |
+| json_roundtrip | 2.02 | 2.00 | NEW: pure-Lua macro bench — the "real program" number |
 | table_seti_same | 1.95 | 1.97 | integer SETI existing slot |
+| string_format_mixed | 1.90 | 1.89 | NEW |
+| pcall_error | 1.90 | 1.90 | NEW: throw/unwind; RSS 2.3x |
 | call_return_shapes | 1.86 | 1.90 | frame setup / return re-entry |
 | closure_ops | 1.85 | 1.91 | upvalues; RSS 5.1x |
 | table_settable_string_key | 1.83 | 1.84 | |
+| varargs_spread | 1.77 | 1.74 | NEW |
 | numeric_mixed | 1.77 | 1.71 | |
 | bitwise_mixed | 1.71 | 1.70 | |
 | string_ops | 1.69 | 1.69 | old "1.00x" row was startup quantization |
+| sort_seeded | 1.68 | 1.72 | NEW |
 | loop_variants | 1.65 | 1.65 | |
 | fibonacci | 1.58 | 1.62 | |
 | mandelbrot / _long | 1.53 | 1.53 | |
+| metatable_index_chain | 1.52 | 1.50 | NEW: `__index` chain reads healthier than feared |
 | compare_immediates | 1.48 | 1.49 | improved by 2026-06-09 packets |
 | string_ops_long | 1.47 | 1.46 | |
 | table_field_index | 1.19 | 1.14 | |
 | table_hash_pressure | 1.07 | 1.02 | at parity |
 | table_ops_long | 0.43 | 0.43 | stdlib-divergence row, not VM parity |
 | table_ops | — | — | skipped: generational-GC LIVELOCK (tracked) |
+| startup_empty | — | — | absolute startup constant only; excluded from ratios/ledger |
+
+All ratios above are STOCK builds. The measured PGO lever (see Build-config
+experiments) sits on top: estimated overall ~1.51x -> ~1.34x once shipped.
+Note the PGO training set predates the NEW rows — the ship packet must
+retrain on the expanded matrix.
 
 RSS is now a first-class problem: `binarytrees` 4.5x and `closure_ops` 5.1x
 memory ratios are unexplained pending the allocation-parity probe (spec P2.6).
