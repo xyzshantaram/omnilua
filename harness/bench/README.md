@@ -115,27 +115,25 @@ bash harness/bench/compare_bins.sh \
   --workloads gc_pressure,binarytrees
 ```
 
-For short workloads where one invocation rounds to only a few hundredths of a
-second, repeat the workload inside each measured run:
-
-```bash
-bash harness/bench/compare_bins.sh \
-  --a /tmp/lua-rs-base \
-  --b target/release/lua-rs \
-  --label-a base \
-  --label-b candidate \
-  --runs 20 \
-  --workloads table_hash_pressure \
-  --repeat-each 10
-```
+Short workloads are handled automatically: `--repeat-each` defaults to
+`auto`, which calibrates a repeat factor per workload so every measured
+sample is at least `--min-sample` seconds (default 0.5). Pass an explicit
+`--repeat-each N` to override.
 
 Output:
 - `harness/bench/results/<UTC>-<sha>-bin-ab.tsv`
+- `harness/bench/results/<UTC>-<sha>-bin-ab.raw.tsv` (per-pair samples)
 - `harness/bench/results/<UTC>-<sha>-bin-ab.json`
 
 This runner checks that both binaries produce byte-identical workload output
-and reports `candidate_over_base` wall/RSS ratios. Use it for local packet
-evidence; use `compare.sh` for reference-C ratios and dashboard history.
+and runs **interleaved A/B pairs** (A then B, N times) so thermal/clock drift
+hits both binaries symmetrically. Per workload it reports best-of-N wall, the
+median of per-pair ratios, the fraction of pairs where B beat A, and a machine
+verdict (`improved` / `regressed` / `inconclusive` / `short`). With `--gate`
+it exits non-zero when any workload regresses, so packet gates are exit codes
+rather than eyeball calls. Headers carry provenance: dirty-tree flag, working
+diff sha256, and both binary sha256s. Use it for local packet evidence; use
+`compare.sh` for reference-C ratios and dashboard history.
 
 ## How to read the numbers
 
@@ -285,9 +283,9 @@ unsafe representation ceilings.
 4. `gc-profile.sh` covers collector counters and start/end cadence deltas. It
    does not provide allocation stack attribution or cumulative per-phase
    timing.
-5. `compare_bins.sh` covers direct Rust-vs-Rust A/B checks for small packets
-   without appending ledger rows. Use `--repeat-each N` when a single workload
-   invocation is too short for stable wall-clock resolution.
+5. `compare_bins.sh` covers direct A/B checks for small packets without
+   appending ledger rows. Repeat calibration is automatic; `--gate` turns the
+   verdict into an exit code.
 6. `compare.sh` appends ledger rows directly. Typed bench runner entries in
    `harness/runners.toml` are still useful future cleanup, but not required
    for evidence-backed perf work.
