@@ -388,12 +388,19 @@ numbers.
       now fixed per P2 decision)
 - [x] P2 strategy decision recorded with spike numbers (§3 P2 DECISION)
 - [x] Bug A fixed: canary_q (fails on parent, passes at fix) + release
-      db.wrap green ×10 (`0677646`); ASAN confirmation rides the next
-      battery `--asan` run
+      db.wrap green ×10 (`0677646`); ASAN-confirmed clean (battery
+      `--asan` at `abe2b52`, stress on/off)
 - [x] Bug B fixed: battery config 2 (stress+quarantine db/coroutine/
       db.wrap) is the dedicated regression oracle — deterministic panic
-      at parent `9807995`, clean after; ASAN confirmation rides the next
-      `--asan` run
-- [ ] Full suite + canaries clean under stress+ASAN, both modes, both profiles
-- [ ] Perf gates green (or tracked regressed-minor) on exactness changes
+      at parent `9807995`, clean after; ASAN-confirmed clean at
+      `abe2b52` (stress on/off)
+- [x] Battery clean at `abe2b52` (2026-06-10): all canaries both GC
+      modes under quarantine AND stress+quarantine; FULL official suite
+      under quarantine; repro set under ASAN stress on/off; official
+      suite 44/44 on BOTH build profiles. Remaining time-boxed extension:
+      full-suite stress sweep (spec P5 allows quarantine-with-
+      justification; the 4 cadence-assert canaries f/l/m/n are the
+      documented stress exclusions)
+- [x] Perf gates green: interleaved A/B vs `9807995` zero regressed
+      (3 improved, 4 inconclusive; no tracked line items)
 - [ ] R2 landed; fresh matrices; release shipped per RELEASING.md
