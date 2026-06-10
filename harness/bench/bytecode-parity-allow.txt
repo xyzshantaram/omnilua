@@ -4,21 +4,19 @@
 # specialization differences. Work the counts DOWN; the gate fails
 # on any increase. workload:count
 binarytrees:8
-call_return_shapes:11
+call_return_shapes:8
 closure_ops:2
-coroutine_pingpong:6
+coroutine_pingpong:2
 fibonacci:3
-global_settabup_same:3
+global_settabup_same:2
 json_roundtrip:18
-mandelbrot:2
-mandelbrot_long:4
+mandelbrot_long:2
 metatable_index_chain:4
 method_calls:6
 pcall_error:4
 sort_seeded:4
 table_field_index:6
 table_hash_pressure:1
-table_setfield_same:2
-table_seti_same:1
-table_settable_string_key:2
+table_setfield_same:1
+table_settable_string_key:1
 varargs_spread:2

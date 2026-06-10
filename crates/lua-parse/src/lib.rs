@@ -1309,19 +1309,20 @@ fn cg_emit_order(
             lua_code::opcodes::OpCode::Lt,
         )
     };
-    let (r1, r2, cmp_op) = if let Some(im) = cg_sc_int(e2) {
+    let (r1, r2, cmp_op, isfloat) = if let Some((im, isf)) = cg_sc_number(e2) {
         let r1 = cg_exp_to_any_reg(fs, line, e1)?;
-        (r1, im, op_imm_e2)
-    } else if let Some(im) = cg_sc_int(e1) {
+        (r1, im, op_imm_e2, isf)
+    } else if let Some((im, isf)) = cg_sc_number(e1) {
         let r1 = cg_exp_to_any_reg(fs, line, e2)?;
-        (r1, im, op_imm_e1)
+        (r1, im, op_imm_e1, isf)
     } else {
         let r2 = cg_exp_to_any_reg(fs, line, e2)?;
         let r1 = cg_exp_to_any_reg(fs, line, e1)?;
-        (r1, r2, op_reg)
+        (r1, r2, op_reg, false)
     };
     cg_free_exps(fs, e1, e2);
-    let cmp = lua_code::opcodes::Instruction::abck(cmp_op, r1 as u32, r2 as u32, 0, 1);
+    let cmp =
+        lua_code::opcodes::Instruction::abck(cmp_op, r1 as u32, r2 as u32, isfloat as u32, 1);
     emit_inst(fs, line, cmp);
     let jmp_arg = (NO_JUMP + lua_code::opcodes::OFFSET_S_J) as u32;
     let jmp = lua_code::opcodes::Instruction::sj(lua_code::opcodes::OpCode::Jmp, jmp_arg, 0);
@@ -1347,17 +1348,18 @@ fn cg_emit_eq(
         std::mem::swap(e1, e2);
     }
     let r1 = cg_exp_to_any_reg(fs, line, e1)?;
-    let (r2, cmp_op) = if let Some(im) = cg_sc_int(e2) {
-        (im, lua_code::opcodes::OpCode::EqI)
+    let (r2, cmp_op, isfloat) = if let Some((im, isf)) = cg_sc_number(e2) {
+        (im, lua_code::opcodes::OpCode::EqI, isf)
     } else if cg_exp_to_const_k(fs, e2, lua_code::opcodes::MAXARG_B) {
-        (e2.u.info as u8, lua_code::opcodes::OpCode::EqK)
+        (e2.u.info as u8, lua_code::opcodes::OpCode::EqK, false)
     } else {
         let r = cg_exp_to_any_reg(fs, line, e2)?;
-        (r, lua_code::opcodes::OpCode::Eq)
+        (r, lua_code::opcodes::OpCode::Eq, false)
     };
     cg_free_exps(fs, e1, e2);
     let k_bit = if matches!(op, BinOpr::Eq) { 1 } else { 0 };
-    let cmp = lua_code::opcodes::Instruction::abck(cmp_op, r1 as u32, r2 as u32, 0, k_bit);
+    let cmp =
+        lua_code::opcodes::Instruction::abck(cmp_op, r1 as u32, r2 as u32, isfloat as u32, k_bit);
     emit_inst(fs, line, cmp);
     let jmp_pc = cg_jump(fs, line);
     e1.u.info = jmp_pc;
@@ -1419,16 +1421,62 @@ fn cg_emit_concat(
     Ok(())
 }
 
+/// Mirrors the `constfolding` call in C's `luaK_prefix` (`lcode.c`) for
+/// unary minus and bitwise-not on jump-free numeric literals: folds in
+/// place and returns `true` when the operation applies. Integer negation
+/// wraps (`intop(-, 0, v)`); float negation refuses NaN and zero results so
+/// `-0.0` keeps its sign as a runtime `OP_UNM`; bitwise-not requires an
+/// operand that converts exactly to an integer (`F2Ieq`), matching
+/// `luaO_rawarith`'s `validop`. A `false` return leaves `e` untouched and
+/// the caller emits the register-form opcode, exactly like C falling
+/// through to `codeunexpval`.
+fn cg_fold_unary(op: UnOpr, e: &mut ExprDesc) -> bool {
+    if e.t != NO_JUMP || e.f != NO_JUMP {
+        return false;
+    }
+    match (op, e.k) {
+        (UnOpr::Minus, ExprKind::KInt) => {
+            e.u.ival = e.u.ival.wrapping_neg();
+            true
+        }
+        (UnOpr::Minus, ExprKind::KFlt) => {
+            let n = -e.u.nval;
+            if n.is_nan() || n == 0.0 {
+                false
+            } else {
+                e.u.nval = n;
+                true
+            }
+        }
+        (UnOpr::BNot, ExprKind::KInt) => {
+            e.u.ival = !e.u.ival;
+            true
+        }
+        (UnOpr::BNot, ExprKind::KFlt) => match flt_to_int_exact(e.u.nval) {
+            Some(iv) => {
+                e.k = ExprKind::KInt;
+                e.u.ival = !iv;
+                true
+            }
+            None => false,
+        },
+        _ => false,
+    }
+}
+
 /// Mirrors C's `luaK_prefix` from `lcode.c`. Discharges `e`, then for
-/// `Minus` / `BNot` / `Len` emits the unary opcode via `codeunexpval`
-/// (place operand in a register, emit `OP_UNM` / `OP_BNOT` / `OP_LEN`
-/// with `A` left as 0 so the result is relocatable). Constant folding
-/// for `Minus` / `BNot` is skipped here; the runtime falls back to the
-/// register form, matching C semantics (just less efficient). `Not`
-/// is routed through `cg_codenot`, which performs literal folding,
-/// JMP-condition flipping, or emits `OP_NOT` for register operands.
+/// `Minus` / `BNot` tries compile-time constant folding (`cg_fold_unary`);
+/// when that does not apply (and always for `Len`), emits the unary opcode
+/// via the `codeunexpval` shape (place operand in a register, emit
+/// `OP_UNM` / `OP_BNOT` / `OP_LEN` with `A` left as 0 so the result is
+/// relocatable). `Not` is routed through `cg_codenot`, which performs
+/// literal folding, JMP-condition flipping, or emits `OP_NOT` for register
+/// operands.
 fn cg_prefix(fs: &mut FuncState, op: UnOpr, e: &mut ExprDesc, line: i32) -> Result<(), LuaError> {
     cg_discharge_vars(fs, line, e)?;
+    if matches!(op, UnOpr::Minus | UnOpr::BNot) && cg_fold_unary(op, e) {
+        return Ok(());
+    }
     let opcode = match op {
         UnOpr::Minus => lua_code::opcodes::OpCode::Unm,
         UnOpr::BNot => lua_code::opcodes::OpCode::BNot,
@@ -1789,6 +1837,41 @@ fn cg_sc_int(e: &ExprDesc) -> Option<u8> {
     let biased = (e.u.ival as u64).wrapping_add(lua_code::opcodes::OFFSET_S_C as u64);
     if biased <= lua_code::opcodes::MAXARG_C as u64 {
         Some(biased as u8)
+    } else {
+        None
+    }
+}
+
+/// Exact float-to-integer conversion: C's `luaV_flttointns` with `F2Ieq`
+/// (`lvm.c`). Succeeds only when `n` has no fractional part and the value is
+/// representable as an `i64`; the range test mirrors `lua_numbertointeger`.
+fn flt_to_int_exact(n: f64) -> Option<i64> {
+    if n.floor() == n && n >= (i64::MIN as f64) && n < -(i64::MIN as f64) {
+        Some(n as i64)
+    } else {
+        None
+    }
+}
+
+/// Mirrors C's `isSCnumber` from `lcode.c`: like [`cg_sc_int`] but also
+/// accepts a float literal whose value converts exactly to an integer
+/// (`F2Ieq`), reporting which case matched so the caller can encode the
+/// `isfloat` flag in the comparison instruction's C slot. The VM's
+/// metamethod fallback (`order_imm_slow` -> `call_order_i_tm`) reads that
+/// flag to rebuild the constant with its original type, so `x < 2.0` calls
+/// `__lt` with a float even though the immediate is stored as an integer.
+fn cg_sc_number(e: &ExprDesc) -> Option<(u8, bool)> {
+    let (i, isfloat) = match e.k {
+        ExprKind::KInt => (e.u.ival, false),
+        ExprKind::KFlt => (flt_to_int_exact(e.u.nval)?, true),
+        _ => return None,
+    };
+    if e.t != NO_JUMP || e.f != NO_JUMP {
+        return None;
+    }
+    let biased = (i as u64).wrapping_add(lua_code::opcodes::OFFSET_S_C as u64);
+    if biased <= lua_code::opcodes::MAXARG_C as u64 {
+        Some((biased as u8, isfloat))
     } else {
         None
     }
