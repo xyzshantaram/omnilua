@@ -653,51 +653,86 @@ impl<T: FinalizerEntry> FinalizerRegistry<T> {
 /// Per-object GC metadata. Lives at the start of every `GcBox`.
 #[repr(C)]
 pub struct GcHeader {
+    /// Hot fields read/written by the mark/sweep/barrier loops keep their
+    /// own bytes — packing them measurably taxed gc-heavy workloads
+    /// (recount 2026-06-10: +4% Ir on gc_pressure). The 64 -> 40 byte diet
+    /// comes from the COLD side instead: the diagnostics-only `type_name`
+    /// fat pointer became a `Trace` method, the three cold bool flags share
+    /// one byte, and the pacer size is u32.
     color: Cell<Color>,
     age: Cell<GcAge>,
-    /// Mirrors C-Lua's FINALIZEDBIT: true while the object is registered in a
-    /// pending/to-be-finalized list. Cleared when the object is popped for its
-    /// `__gc` call.
-    finalized: Cell<bool>,
-    /// True iff this box is linked into one of a heap's owner lists, so it will be
-    /// swept and its `size` refunded. `new_uncollected` boxes leave this
-    /// false: they never join a chain, are never swept, and so must never
-    /// have buffer bytes charged against the pacer (the charge would never be
-    /// refunded). [`Gc::account_buffer`] is a no-op when this is false.
-    ///
-    /// Kept separate from `size`: `collected` controls whether buffer charges
-    /// are refundable; `size` remains the exact byte count refunded by sweep.
-    collected: Cell<bool>,
+    /// Cold flags, one bit each: finalized (FINALIZEDBIT — set while the
+    /// object is registered in a pending/to-be-finalized list, cleared when
+    /// popped for `__gc`), collected (true iff this box is linked into a
+    /// heap owner list so it will be swept and its `size` refunded;
+    /// `new_uncollected` boxes stay false and must never have buffer bytes
+    /// charged — [`Gc::account_buffer`] no-ops), gray_listed (true while
+    /// linked into the grayagain revisit list).
+    flags: Cell<u8>,
+    /// Rough byte size charged to the pacer for this object. Starts at the
+    /// `GcBox<T>` size and is adjusted in place by [`Gc::account_buffer`]
+    /// when the value's owned heap buffers (table array/node Vecs) grow or
+    /// shrink. Invariant: this is always exactly the amount sweep will
+    /// refund to the heap's byte counter when this object is freed. `u32`:
+    /// a single object cannot meaningfully exceed 4 GiB; setters saturate.
+    size: Cell<u32>,
     /// Intrusive link into exactly one heap owner list.
     next: Cell<Option<NonNull<GcBox<dyn Trace>>>>,
     /// Intrusive link into the collector's grayagain-style revisit list.
     gray_next: Cell<Option<NonNull<GcBox<dyn Trace>>>>,
-    /// True while this object is linked into the grayagain revisit list.
-    gray_listed: Cell<bool>,
-    /// Rough byte size charged to the pacer for this object. Starts at the
-    /// `GcBox<T>` size and is adjusted in place by [`Gc::account_buffer`] when
-    /// the value's owned heap buffers (table array/node Vecs) grow or shrink.
-    /// Invariant: this is always exactly the amount sweep will refund to the
-    /// heap's byte counter when this object is freed.
-    size: Cell<usize>,
-    /// Concrete Rust type name captured at allocation for testC/diagnostic
-    /// telemetry. Collector behavior must not branch on this field.
-    type_name: &'static str,
 }
 
+const HDR_FINALIZED: u8 = 1;
+const HDR_COLLECTED: u8 = 2;
+const HDR_GRAY_LISTED: u8 = 4;
+
 impl GcHeader {
-    fn new_white(size: usize, color: Color, type_name: &'static str) -> Self {
+    fn new_white(size: usize, color: Color, flags: u8) -> Self {
         Self {
             color: Cell::new(color),
             age: Cell::new(GcAge::New),
-            finalized: Cell::new(false),
-            collected: Cell::new(false),
+            flags: Cell::new(flags),
+            size: Cell::new(size.min(u32::MAX as usize) as u32),
             next: Cell::new(None),
             gray_next: Cell::new(None),
-            gray_listed: Cell::new(false),
-            size: Cell::new(size),
-            type_name,
         }
+    }
+
+    fn flag(&self, bit: u8) -> bool {
+        self.flags.get() & bit != 0
+    }
+
+    fn set_flag(&self, bit: u8, on: bool) {
+        let f = self.flags.get();
+        self.flags.set(if on { f | bit } else { f & !bit });
+    }
+
+    pub fn finalized(&self) -> bool {
+        self.flag(HDR_FINALIZED)
+    }
+
+    pub fn set_finalized(&self, finalized: bool) {
+        self.set_flag(HDR_FINALIZED, finalized);
+    }
+
+    pub fn collected(&self) -> bool {
+        self.flag(HDR_COLLECTED)
+    }
+
+    pub fn gray_listed(&self) -> bool {
+        self.flag(HDR_GRAY_LISTED)
+    }
+
+    pub fn set_gray_listed(&self, listed: bool) {
+        self.set_flag(HDR_GRAY_LISTED, listed);
+    }
+
+    pub fn size(&self) -> usize {
+        self.size.get() as usize
+    }
+
+    pub fn set_size(&self, size: usize) {
+        self.size.set(size.min(u32::MAX as usize) as u32);
     }
 }
 
@@ -762,7 +797,7 @@ impl<T: Trace + 'static> Gc<T> {
     pub fn new_uncollected(value: T) -> Self {
         let size = std::mem::size_of::<T>();
         let boxed = Box::new(GcBox {
-            header: GcHeader::new_white(size, Color::White0, std::any::type_name::<T>()),
+            header: GcHeader::new_white(size, Color::White0, 0),
             value,
         });
         Gc {
@@ -822,11 +857,11 @@ impl<T: ?Sized> Gc<T> {
     }
 
     pub fn is_finalized(self) -> bool {
-        self.header().finalized.get()
+        self.header().finalized()
     }
 
     pub fn set_finalized(self, finalized: bool) {
-        self.header().finalized.set(finalized);
+        self.header().set_finalized(finalized);
     }
 
     /// Charge (`delta > 0`) or refund (`delta < 0`) `delta` bytes of this
@@ -843,17 +878,13 @@ impl<T: ?Sized> Gc<T> {
             return;
         }
         let header = self.header();
-        if !header.collected.get() {
+        if !header.collected() {
             return;
         }
         if delta >= 0 {
-            header
-                .size
-                .set(header.size.get().saturating_add(delta as usize));
+            header.set_size(header.size().saturating_add(delta as usize));
         } else {
-            header
-                .size
-                .set(header.size.get().saturating_sub((-delta) as usize));
+            header.set_size(header.size().saturating_sub((-delta) as usize));
         }
         heap.adjust_bytes(delta);
     }
@@ -890,6 +921,15 @@ impl<T: ?Sized> AsRef<T> for Gc<T> {
 /// ```
 pub trait Trace {
     fn trace(&self, m: &mut Marker);
+
+    /// Concrete Rust type name for diagnostic/testC telemetry
+    /// ([`Heap::type_name_count`]). Collector behavior must not branch on
+    /// this. The default covers container blanket impls, which are never
+    /// GC-boxed directly; concrete runtime types override it with
+    /// `std::any::type_name::<Self>()`.
+    fn type_name(&self) -> &'static str {
+        "unknown"
+    }
 }
 
 // Common blanket impls so most container types Just Work.
@@ -1075,14 +1115,6 @@ impl Marker {
             stats: MarkerStats::default(),
             mode,
         }
-    }
-
-    fn new_reserving(capacity: usize) -> Self {
-        Self::new_with_capacity(MarkerMode::Full, capacity)
-    }
-
-    fn new_minor_reserving(capacity: usize) -> Self {
-        Self::new_with_capacity(MarkerMode::Minor, capacity)
     }
 
     fn should_trace_age(&self, age: GcAge) -> bool {
@@ -1329,6 +1361,13 @@ pub struct Heap {
     next_allocation_token: Cell<usize>,
     /// Threshold above which `step` triggers a collection.
     threshold: Cell<usize>,
+    /// HARDMEMTESTS-style stress mode (env `LUA_RS_GC_STRESS=1`, read once
+    /// at construction): `would_collect` fires at every checkpoint, so a
+    /// collection happens at essentially every allocation boundary. Turns
+    /// GC-cadence-dependent anchoring bugs (objects reachable from Rust
+    /// locals but not from roots) into deterministic failures — pair with
+    /// an ASAN build. Debug instrument only; never set in benchmarks.
+    stress: bool,
     /// Multiplier on bytes_used to set next threshold after collection.
     pause_multiplier: Cell<usize>,
     /// State machine for the incremental collector.
@@ -1353,6 +1392,12 @@ pub struct Heap {
     /// In-progress marker state for incremental cycles. `Some` between
     /// `Propagate` start and `Sweep` start; `None` otherwise.
     marker: RefCell<Option<Marker>>,
+    /// Recycled mark-phase buffers (gray queue + visited set). A mark phase
+    /// sizes its visited set to the live-object count (hundreds of KB);
+    /// without pooling, binarytrees churned 396 such buffers for 249 MB of
+    /// allocator traffic (dhat, 2026-06-10). One buffer pair is kept and
+    /// reused across cycles; capacity follows the heap's high-water mark.
+    marker_pool: RefCell<Option<(Vec<NonNull<GcBox<dyn Trace>>>, IdentityHashSet)>>,
     /// Sweep cursor. Points at the `Cell` whose `Option<NonNull>` is the
     /// "current" link being inspected during the sweep phase. Encoded as a
     /// raw pointer because the cell lives inside a `GcHeader` (Cell, not Cell<Cell>).
@@ -1385,6 +1430,7 @@ impl Heap {
             allocation_tokens: RefCell::new(IdentityHashMap::default()),
             next_allocation_token: Cell::new(1),
             threshold: Cell::new(64 * 1024), // initial threshold: 64 KB
+            stress: std::env::var_os("LUA_RS_GC_STRESS").is_some_and(|v| v == "1"),
             pause_multiplier: Cell::new(200), // 200% = collect when bytes 2x threshold
             state: Cell::new(GcState::Pause),
             paused: Cell::new(true), // start paused; caller enables when world is consistent
@@ -1395,6 +1441,7 @@ impl Heap {
             last_sweep_stats: Cell::new(SweepStats::default()),
             grayagain: Cell::new(None),
             marker: RefCell::new(None),
+            marker_pool: RefCell::new(None),
             sweep_prev_next: Cell::new(None),
         }
     }
@@ -1413,11 +1460,10 @@ impl Heap {
     pub fn allocate<T: Trace + 'static>(&self, value: T) -> Gc<T> {
         let size = std::mem::size_of::<GcBox<T>>();
         let boxed = Box::new(GcBox {
-            header: GcHeader::new_white(size, self.current_white.get(), std::any::type_name::<T>()),
+            header: GcHeader::new_white(size, self.current_white.get(), HDR_COLLECTED),
             value,
         });
         boxed.header.next.set(self.head.get());
-        boxed.header.collected.set(true);
         let raw: *mut GcBox<T> = Box::into_raw(boxed);
         let ptr: NonNull<GcBox<T>> = NonNull::new(raw).expect("Box::into_raw is non-null");
         let dyn_ptr: NonNull<GcBox<dyn Trace>> = ptr;
@@ -1473,6 +1519,9 @@ impl Heap {
     /// `!paused && bytes_used() >= threshold_bytes()`. Callers that build
     /// snapshot state before invoking the heap should gate on this.
     pub fn would_collect(&self) -> bool {
+        if self.stress {
+            return !self.paused.get();
+        }
         !self.paused.get() && self.bytes.get() >= self.threshold.get()
     }
 
@@ -1619,7 +1668,7 @@ impl Heap {
         if self.finobjrold.get() == Some(removed) {
             self.finobjrold.set(next);
         }
-        if self.header_from_ptr(removed).gray_listed.get() {
+        if self.header_from_ptr(removed).gray_listed() {
             self.unlink_grayagain(removed);
         }
     }
@@ -1680,7 +1729,7 @@ impl Heap {
 
     pub fn move_allgc_to_finobj(&self, ptr: NonNull<GcBox<dyn Trace>>) -> bool {
         let header = self.header_from_ptr(ptr);
-        if !header.collected.get() {
+        if !header.collected() {
             return false;
         }
         if !self.unlink_from_list(&self.head, ptr) {
@@ -1718,11 +1767,11 @@ impl Heap {
 
     fn remember_minor_revisit(&self, ptr: NonNull<GcBox<dyn Trace>>) {
         let header = self.header_from_ptr(ptr);
-        if header.gray_listed.get() {
+        if header.gray_listed() {
             return;
         }
         header.gray_next.set(self.grayagain.get());
-        header.gray_listed.set(true);
+        header.set_gray_listed(true);
         self.grayagain.set(Some(ptr));
     }
 
@@ -1743,7 +1792,7 @@ impl Heap {
             let header = self.header_from_ptr(ptr);
             cursor = header.gray_next.get();
             header.gray_next.set(None);
-            header.gray_listed.set(false);
+            header.set_gray_listed(false);
         }
     }
 
@@ -1755,7 +1804,7 @@ impl Heap {
             let header = self.header_from_ptr(ptr);
             cursor = header.gray_next.get();
             header.gray_next.set(None);
-            header.gray_listed.set(false);
+            header.set_gray_listed(false);
             objects.push(ptr);
         }
         objects
@@ -1909,7 +1958,7 @@ impl Heap {
         if self.paused.get() {
             return;
         }
-        if self.bytes.get() < self.threshold.get() {
+        if !self.stress && self.bytes.get() < self.threshold.get() {
             return;
         }
         self.full_collect_with_post_mark(roots, post_mark);
@@ -1933,12 +1982,13 @@ impl Heap {
         if self.paused.get() {
             return;
         }
-        let mut marker = Marker::new_reserving(self.objects.get());
+        let mut marker = self.marker_from_pool(MarkerMode::Full);
         roots.trace(&mut marker);
         marker.drain_gray_queue();
         post_mark(&mut marker);
         marker.drain_gray_queue();
         self.last_mark_stats.set(marker.stats());
+        self.recycle_marker(marker);
     }
 
     /// Metadata transition used when entering generational mode after a full
@@ -1981,7 +2031,7 @@ impl Heap {
         }
 
         self.state.set(GcState::Propagate);
-        let mut marker = Marker::new_minor_reserving(self.objects.get());
+        let mut marker = self.marker_from_pool(MarkerMode::Minor);
         self.last_sweep_stats.set(SweepStats::default());
         self.mark_minor_revisit_objects(&mut marker);
         roots.trace(&mut marker);
@@ -1992,10 +2042,11 @@ impl Heap {
         post_mark(&mut marker);
         marker.drain_gray_queue();
         self.last_mark_stats.set(marker.stats());
+        self.recycle_marker(marker);
 
         self.state.set(GcState::SweepAllGc);
         self.sweep_young();
-        *self.marker.borrow_mut() = None;
+        self.recycle_marker_cell();
         self.sweep_prev_next.set(None);
         self.state.set(GcState::Pause);
         self.collections.set(self.collections.get() + 1);
@@ -2219,13 +2270,44 @@ impl Heap {
         }
     }
 
+    /// Take the pooled mark buffers (or build fresh ones sized to the live
+    /// set). Pair with [`Heap::recycle_marker`] when the mark phase ends.
+    fn marker_from_pool(&self, mode: MarkerMode) -> Marker {
+        match self.marker_pool.borrow_mut().take() {
+            Some((gray_queue, visited)) => Marker {
+                gray_queue,
+                visited,
+                stats: MarkerStats::default(),
+                mode,
+            },
+            None => Marker::new_with_capacity(mode, self.objects.get()),
+        }
+    }
+
+    fn recycle_marker(&self, marker: Marker) {
+        let Marker {
+            mut gray_queue,
+            mut visited,
+            ..
+        } = marker;
+        gray_queue.clear();
+        visited.clear();
+        *self.marker_pool.borrow_mut() = Some((gray_queue, visited));
+    }
+
+    fn recycle_marker_cell(&self) {
+        if let Some(marker) = self.marker.borrow_mut().take() {
+            self.recycle_marker(marker);
+        }
+    }
+
     fn start_cycle(&self, roots: &dyn Trace) {
         self.flip_current_white();
         let dead_white = self.other_white();
         self.for_each_header(|header| {
             header.color.set(dead_white);
         });
-        let mut marker = Marker::new_reserving(self.objects.get());
+        let mut marker = self.marker_from_pool(MarkerMode::Full);
         roots.trace(&mut marker);
         *self.marker.borrow_mut() = Some(marker);
         self.sweep_prev_next.set(None);
@@ -2300,7 +2382,7 @@ impl Heap {
             let color = header.color.get();
             if color == dead_white {
                 prev_cell.set(next);
-                let size = header.size.get();
+                let size = header.size();
                 freed_bytes += size;
                 stats.record_free(size);
                 self.correct_generation_pointers(ptr, next);
@@ -2381,7 +2463,7 @@ impl Heap {
             }
             if header.color.get().is_white() && !age.is_old() {
                 prev_cell.set(next);
-                let size = header.size.get();
+                let size = header.size();
                 *freed_bytes += size;
                 stats.record_free(size);
                 self.correct_generation_pointers(ptr, next);
@@ -2529,7 +2611,7 @@ impl Heap {
             .map(|marker| marker.stats())
             .unwrap_or_default();
         self.last_mark_stats.set(stats);
-        *self.marker.borrow_mut() = None;
+        self.recycle_marker_cell();
         self.sweep_prev_next.set(None);
         let next = self.bytes.get().saturating_mul(self.pause_multiplier.get()) / 100;
         self.threshold.set(next.max(GC_MIN_THRESHOLD));
@@ -2549,7 +2631,7 @@ impl Heap {
 
     fn abort_cycle(&self) {
         if !self.state.get().is_pause() {
-            *self.marker.borrow_mut() = None;
+            self.recycle_marker_cell();
             self.sweep_prev_next.set(None);
             let current_white = self.current_white();
             self.for_each_header(|header| {
@@ -2574,11 +2656,16 @@ impl Heap {
     /// must not depend on Rust type names.
     pub fn type_name_count(&self, mut predicate: impl FnMut(&'static str) -> bool) -> usize {
         let mut count = 0usize;
-        self.for_each_header(|header| {
-            if predicate(header.type_name) {
-                count += 1;
+        for head in [self.head.get(), self.finobj.get(), self.tobefnz.get()] {
+            let mut cursor = head;
+            while let Some(ptr) = cursor {
+                let bx = unsafe { ptr.as_ref() };
+                cursor = bx.header.next.get();
+                if predicate(bx.value().type_name()) {
+                    count += 1;
+                }
             }
-        });
+        }
         count
     }
 
@@ -2586,7 +2673,7 @@ impl Heap {
     /// After this returns, every outstanding `Gc<T>` is dangling — callers
     /// must ensure no `Gc<T>` outlives the `Heap`.
     pub fn drop_all(&self) {
-        *self.marker.borrow_mut() = None;
+        self.recycle_marker_cell();
         self.sweep_prev_next.set(None);
         self.clear_generation_cursors();
         self.state.set(GcState::Pause);
@@ -2968,7 +3055,7 @@ mod tests {
             assert!(heap.bytes_used() > baseline);
             a.account_buffer(&heap, 4096);
             assert_eq!(
-                a.header().size.get(),
+                a.header().size(),
                 std::mem::size_of::<GcBox<Cell0>>() + 4096
             );
         }

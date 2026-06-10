@@ -38,6 +38,11 @@ impl<T: Trace + 'static> Trace for GcRef<T> {
 /// LuaValue — central enum. Variants Nil/Bool/Int/Float/LightUserData carry
 /// no GC; Str/Table/Function/UserData/Thread carry collectable payloads.
 impl Trace for LuaValue {
+
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn trace(&self, m: &mut Marker) {
         match self {
             LuaValue::Nil
@@ -64,6 +69,11 @@ impl Trace for LuaValue {
 /// LuaString — interned byte string. The `Rc<[u8]>` backing buffer is
 /// owned, not GC-managed, so this impl is intentionally empty.
 impl Trace for LuaString {
+
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn trace(&self, _m: &mut Marker) {}
 }
 
@@ -71,6 +81,11 @@ impl Trace for LuaString {
 /// LuaValue). The Open variant carries no direct GC reference; the slot it
 /// points at is traced through the owning thread's stack walk.
 impl Trace for UpVal {
+
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn trace(&self, m: &mut Marker) {
         if self.try_open_payload().is_some() {
             return;
@@ -103,20 +118,29 @@ impl Trace for UpVal {
 /// block, which expects unreferenced long strings to free their bytes
 /// after a single `collectgarbage()` cycle.
 impl Trace for LuaTable {
+
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn trace(&self, m: &mut Marker) {
         const WEAK_KEYS: u8 = 1;
         const WEAK_VALUES: u8 = 1 << 1;
         let mode = self.weak_mode();
         let trace_keys = (mode & WEAK_KEYS) == 0;
         let trace_values = (mode & WEAK_VALUES) == 0 && trace_keys;
-        self.for_each_entry(|k, v| {
-            if trace_keys {
-                k.trace(m);
-            }
-            if trace_values {
-                v.trace(m);
-            }
-        });
+        if trace_keys && trace_values {
+            self.trace_entries_with_clearkey(|v| v.trace(m));
+        } else {
+            self.for_each_entry(|k, v| {
+                if trace_keys {
+                    k.trace(m);
+                }
+                if trace_values {
+                    v.trace(m);
+                }
+            });
+        }
         if let Some(mt) = self.metatable() {
             mt.trace(m);
         }
@@ -126,6 +150,11 @@ impl Trace for LuaTable {
 /// LuaProto — bytecode prototype. k (constants), p (child protos),
 /// source, upvalue names, locvar names.
 impl Trace for LuaProto {
+
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn trace(&self, m: &mut Marker) {
         for v in self.k.iter() {
             v.trace(m);
@@ -152,6 +181,11 @@ impl Trace for LuaProto {
 
 /// LuaLClosure — Lua closure carrying a Proto and its captured upvalues.
 impl Trace for LuaLClosure {
+
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn trace(&self, m: &mut Marker) {
         self.proto.trace(m);
         for uv in self.upvals.iter() {
@@ -163,6 +197,11 @@ impl Trace for LuaLClosure {
 /// LuaClosure — dispatch to Lua/C variants; LightC is a bare function-ptr
 /// index with no payload.
 impl Trace for LuaClosure {
+
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn trace(&self, m: &mut Marker) {
         match self {
             LuaClosure::Lua(l) => l.trace(m),
@@ -174,6 +213,11 @@ impl Trace for LuaClosure {
 
 /// LuaCClosure — Rust-side C closure carrying captured upvalues.
 impl Trace for LuaCClosure {
+
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn trace(&self, m: &mut Marker) {
         for v in self.upvalues.borrow().iter() {
             v.trace(m);
@@ -183,6 +227,11 @@ impl Trace for LuaCClosure {
 
 /// LuaUserData — boxed payload + optional metatable + user values.
 impl Trace for LuaUserData {
+
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn trace(&self, m: &mut Marker) {
         if let Some(mt) = self.metatable() {
             mt.trace(m);
@@ -198,6 +247,11 @@ impl Trace for LuaUserData {
 /// `lua-vm`'s `GlobalState::threads` map and is traced from
 /// `GlobalState::trace` as a root.
 impl Trace for LuaThread {
+
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn trace(&self, _m: &mut Marker) {}
 }
 

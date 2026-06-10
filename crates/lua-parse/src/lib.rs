@@ -713,6 +713,53 @@ fn cg_free_exps(fs: &mut FuncState, e1: &ExprDesc, e2: &ExprDesc) {
 /// metamethod-dispatch instruction. `Concat` is delegated to
 /// `cg_emit_concat`; comparisons to `cg_emit_order` / `cg_emit_eq`;
 /// `And` / `Or` short-circuit jumps to `cg_concat`.
+/// Floor modulo with C-Lua semantics (`luaV_mod`, lvm.c): result takes the
+/// divisor's sign; `n == -1` short-circuits to 0 to avoid `i64::MIN % -1`
+/// overflow, matching C's castS2U special case.
+fn fold_int_mod(m: i64, n: i64) -> i64 {
+    if n == -1 {
+        return 0;
+    }
+    let r = m % n;
+    if r != 0 && (r ^ n) < 0 {
+        r + n
+    } else {
+        r
+    }
+}
+
+/// Floor division with C-Lua semantics (`luaV_idiv`, lvm.c): rounds toward
+/// negative infinity; `n == -1` short-circuits to wrapping negation to
+/// avoid `i64::MIN / -1` overflow, matching C's castS2U special case.
+fn fold_int_idiv(m: i64, n: i64) -> i64 {
+    if n == -1 {
+        return m.wrapping_neg();
+    }
+    let q = m / n;
+    if (m ^ n) < 0 && m % n != 0 {
+        q - 1
+    } else {
+        q
+    }
+}
+
+/// Left shift with C-Lua semantics (`luaV_shiftl`, lvm.c): negative counts
+/// shift right LOGICALLY (unsigned), counts at or beyond the integer width
+/// produce 0.
+fn fold_int_shiftl(x: i64, y: i64) -> i64 {
+    if y < 0 {
+        if y <= -64 {
+            0
+        } else {
+            ((x as u64) >> (-y as u32)) as i64
+        }
+    } else if y >= 64 {
+        0
+    } else {
+        ((x as u64) << (y as u32)) as i64
+    }
+}
+
 fn cg_posfix_fold(
     fs: &mut FuncState,
     op: BinOpr,
@@ -746,11 +793,13 @@ fn cg_posfix_fold(
                 BinOpr::Add => Some(a.wrapping_add(b)),
                 BinOpr::Sub => Some(a.wrapping_sub(b)),
                 BinOpr::Mul => Some(a.wrapping_mul(b)),
-                BinOpr::Mod if b != 0 => Some(a.rem_euclid(b)),
-                BinOpr::IDiv if b != 0 => Some(a.div_euclid(b)),
+                BinOpr::Mod if b != 0 => Some(fold_int_mod(a, b)),
+                BinOpr::IDiv if b != 0 => Some(fold_int_idiv(a, b)),
                 BinOpr::BAnd => Some(a & b),
                 BinOpr::BOr => Some(a | b),
                 BinOpr::BXor => Some(a ^ b),
+                BinOpr::Shl => Some(fold_int_shiftl(a, b)),
+                BinOpr::Shr => Some(fold_int_shiftl(a, b.wrapping_neg())),
                 _ => None,
             };
             if let Some(v) = r {
@@ -769,7 +818,7 @@ fn cg_posfix_fold(
                 _ => None,
             };
             if let Some(v) = r {
-                if v.is_finite() {
+                if !v.is_nan() && v != 0.0 {
                     e1.k = ExprKind::KFlt;
                     e1.u.nval = v;
                     return Ok(());
@@ -1309,19 +1358,20 @@ fn cg_emit_order(
             lua_code::opcodes::OpCode::Lt,
         )
     };
-    let (r1, r2, cmp_op) = if let Some(im) = cg_sc_int(e2) {
+    let (r1, r2, cmp_op, isfloat) = if let Some((im, isf)) = cg_sc_number(e2) {
         let r1 = cg_exp_to_any_reg(fs, line, e1)?;
-        (r1, im, op_imm_e2)
-    } else if let Some(im) = cg_sc_int(e1) {
+        (r1, im, op_imm_e2, isf)
+    } else if let Some((im, isf)) = cg_sc_number(e1) {
         let r1 = cg_exp_to_any_reg(fs, line, e2)?;
-        (r1, im, op_imm_e1)
+        (r1, im, op_imm_e1, isf)
     } else {
         let r2 = cg_exp_to_any_reg(fs, line, e2)?;
         let r1 = cg_exp_to_any_reg(fs, line, e1)?;
-        (r1, r2, op_reg)
+        (r1, r2, op_reg, false)
     };
     cg_free_exps(fs, e1, e2);
-    let cmp = lua_code::opcodes::Instruction::abck(cmp_op, r1 as u32, r2 as u32, 0, 1);
+    let cmp =
+        lua_code::opcodes::Instruction::abck(cmp_op, r1 as u32, r2 as u32, isfloat as u32, 1);
     emit_inst(fs, line, cmp);
     let jmp_arg = (NO_JUMP + lua_code::opcodes::OFFSET_S_J) as u32;
     let jmp = lua_code::opcodes::Instruction::sj(lua_code::opcodes::OpCode::Jmp, jmp_arg, 0);
@@ -1347,17 +1397,18 @@ fn cg_emit_eq(
         std::mem::swap(e1, e2);
     }
     let r1 = cg_exp_to_any_reg(fs, line, e1)?;
-    let (r2, cmp_op) = if let Some(im) = cg_sc_int(e2) {
-        (im, lua_code::opcodes::OpCode::EqI)
+    let (r2, cmp_op, isfloat) = if let Some((im, isf)) = cg_sc_number(e2) {
+        (im, lua_code::opcodes::OpCode::EqI, isf)
     } else if cg_exp_to_const_k(fs, e2, lua_code::opcodes::MAXARG_B) {
-        (e2.u.info as u8, lua_code::opcodes::OpCode::EqK)
+        (e2.u.info as u8, lua_code::opcodes::OpCode::EqK, false)
     } else {
         let r = cg_exp_to_any_reg(fs, line, e2)?;
-        (r, lua_code::opcodes::OpCode::Eq)
+        (r, lua_code::opcodes::OpCode::Eq, false)
     };
     cg_free_exps(fs, e1, e2);
     let k_bit = if matches!(op, BinOpr::Eq) { 1 } else { 0 };
-    let cmp = lua_code::opcodes::Instruction::abck(cmp_op, r1 as u32, r2 as u32, 0, k_bit);
+    let cmp =
+        lua_code::opcodes::Instruction::abck(cmp_op, r1 as u32, r2 as u32, isfloat as u32, k_bit);
     emit_inst(fs, line, cmp);
     let jmp_pc = cg_jump(fs, line);
     e1.u.info = jmp_pc;
@@ -1419,16 +1470,62 @@ fn cg_emit_concat(
     Ok(())
 }
 
+/// Mirrors the `constfolding` call in C's `luaK_prefix` (`lcode.c`) for
+/// unary minus and bitwise-not on jump-free numeric literals: folds in
+/// place and returns `true` when the operation applies. Integer negation
+/// wraps (`intop(-, 0, v)`); float negation refuses NaN and zero results so
+/// `-0.0` keeps its sign as a runtime `OP_UNM`; bitwise-not requires an
+/// operand that converts exactly to an integer (`F2Ieq`), matching
+/// `luaO_rawarith`'s `validop`. A `false` return leaves `e` untouched and
+/// the caller emits the register-form opcode, exactly like C falling
+/// through to `codeunexpval`.
+fn cg_fold_unary(op: UnOpr, e: &mut ExprDesc) -> bool {
+    if e.t != NO_JUMP || e.f != NO_JUMP {
+        return false;
+    }
+    match (op, e.k) {
+        (UnOpr::Minus, ExprKind::KInt) => {
+            e.u.ival = e.u.ival.wrapping_neg();
+            true
+        }
+        (UnOpr::Minus, ExprKind::KFlt) => {
+            let n = -e.u.nval;
+            if n.is_nan() || n == 0.0 {
+                false
+            } else {
+                e.u.nval = n;
+                true
+            }
+        }
+        (UnOpr::BNot, ExprKind::KInt) => {
+            e.u.ival = !e.u.ival;
+            true
+        }
+        (UnOpr::BNot, ExprKind::KFlt) => match flt_to_int_exact(e.u.nval) {
+            Some(iv) => {
+                e.k = ExprKind::KInt;
+                e.u.ival = !iv;
+                true
+            }
+            None => false,
+        },
+        _ => false,
+    }
+}
+
 /// Mirrors C's `luaK_prefix` from `lcode.c`. Discharges `e`, then for
-/// `Minus` / `BNot` / `Len` emits the unary opcode via `codeunexpval`
-/// (place operand in a register, emit `OP_UNM` / `OP_BNOT` / `OP_LEN`
-/// with `A` left as 0 so the result is relocatable). Constant folding
-/// for `Minus` / `BNot` is skipped here; the runtime falls back to the
-/// register form, matching C semantics (just less efficient). `Not`
-/// is routed through `cg_codenot`, which performs literal folding,
-/// JMP-condition flipping, or emits `OP_NOT` for register operands.
+/// `Minus` / `BNot` tries compile-time constant folding (`cg_fold_unary`);
+/// when that does not apply (and always for `Len`), emits the unary opcode
+/// via the `codeunexpval` shape (place operand in a register, emit
+/// `OP_UNM` / `OP_BNOT` / `OP_LEN` with `A` left as 0 so the result is
+/// relocatable). `Not` is routed through `cg_codenot`, which performs
+/// literal folding, JMP-condition flipping, or emits `OP_NOT` for register
+/// operands.
 fn cg_prefix(fs: &mut FuncState, op: UnOpr, e: &mut ExprDesc, line: i32) -> Result<(), LuaError> {
     cg_discharge_vars(fs, line, e)?;
+    if matches!(op, UnOpr::Minus | UnOpr::BNot) && cg_fold_unary(op, e) {
+        return Ok(());
+    }
     let opcode = match op {
         UnOpr::Minus => lua_code::opcodes::OpCode::Unm,
         UnOpr::BNot => lua_code::opcodes::OpCode::BNot,
@@ -1701,23 +1798,62 @@ fn cg_go_if_false(fs: &mut FuncState, line: i32, e: &mut ExprDesc) -> Result<(),
     Ok(())
 }
 
-/// Emit `OP_TESTSET R[NO_REG], R[e.info], cond` followed by an `OP_JMP` so
-/// control transfers to the jump's patch list when `e`'s truth value equals
-/// `cond`. Returns the pc of the emitted jump so the caller can append it
-/// to the appropriate exit list.
+/// Emit a conditional test (`OP_TESTSET` in general; bare `OP_TEST` when a
+/// trailing `OP_NOT` is peephole-folded) followed by an `OP_JMP`, so control
+/// transfers to the jump's patch list when `e`'s truth value equals `cond`.
+/// Returns the pc of the emitted jump so the caller can append it to the
+/// appropriate exit list. Mirrors C's `jumponcond` from `lcode.c`,
+/// including both subtleties: the `OP_NOT` removal for `VRELOC` operands,
+/// and discharging via `discharge2anyreg` (NOT `exp2anyreg`) so pending
+/// jump lists survive for the caller to patch.
 ///
-/// Mirrors C's `jumponcond` from `lcode.c`. The `OP_NOT` peephole that C
-/// applies for `VRELOC` operands is intentionally skipped for the Phase-A
-/// bootstrap; correctness is unaffected and the optimisation can land with
-/// the codegen reconciliation pass.
+/// Mirrors C's `removelastinstruction` / `removelastlineinfo` from
+/// `lcode.c`: drops the last emitted instruction and undoes its line-info
+/// bookkeeping. A relative line entry rolls `previousline` / `iwthabs`
+/// back; an absolute entry is popped and the next emit is forced absolute
+/// by saturating `iwthabs` (C sets `MAXIWTHABS + 1`).
+fn remove_last_instruction(fs: &mut FuncState) {
+    const ABS_LINE_INFO: i8 = -0x80i8;
+    let pc = (fs.pc - 1) as usize;
+    if fs.f.lineinfo[pc] != ABS_LINE_INFO {
+        fs.previousline -= fs.f.lineinfo[pc] as i32;
+        fs.iwthabs -= 1;
+    } else {
+        debug_assert_eq!(
+            fs.f.abslineinfo[fs.nabslineinfo as usize - 1].pc,
+            pc as i32
+        );
+        fs.f.abslineinfo.pop();
+        fs.nabslineinfo -= 1;
+        fs.iwthabs = 129;
+    }
+    fs.pc -= 1;
+}
+
 fn cg_jump_on_cond(
     fs: &mut FuncState,
     line: i32,
     e: &mut ExprDesc,
     cond: u8,
 ) -> Result<i32, LuaError> {
-    let reg = cg_exp_to_any_reg(fs, line, e)?;
+    if e.k == ExprKind::Reloc {
+        let ie = lua_code::opcodes::Instruction(fs.f.code[e.u.info as usize].0);
+        if ie.opcode() == Some(lua_code::opcodes::OpCode::Not) {
+            remove_last_instruction(fs);
+            let test = lua_code::opcodes::Instruction::abck(
+                lua_code::opcodes::OpCode::Test,
+                ie.arg_b(),
+                0,
+                0,
+                (cond == 0) as u32,
+            );
+            emit_inst(fs, line, test);
+            return Ok(cg_jump(fs, line));
+        }
+    }
+    cg_discharge_to_any_reg(fs, line, e)?;
     cg_free_exp(fs, e);
+    let reg = e.u.info;
     let test = lua_code::opcodes::Instruction::abck(
         lua_code::opcodes::OpCode::TestSet,
         lua_code::opcodes::NO_REG,
@@ -1727,6 +1863,25 @@ fn cg_jump_on_cond(
     );
     emit_inst(fs, line, test);
     Ok(cg_jump(fs, line))
+}
+
+/// Mirrors C's `discharge2anyreg` from `lcode.c`: if `e` is not already
+/// sitting in a register, reserve one and discharge into it. Unlike
+/// `cg_exp_to_any_reg` (`luaK_exp2anyreg`), this does NOT resolve pending
+/// `e.t` / `e.f` jump lists — `jumponcond` relies on that, because the
+/// lists must stay live for the caller's `goiftrue` / `goiffalse` to patch
+/// (that is how an `and`-chain's `TESTSET` gets demoted to `TEST` at the
+/// following `or`).
+fn cg_discharge_to_any_reg(
+    fs: &mut FuncState,
+    line: i32,
+    e: &mut ExprDesc,
+) -> Result<(), LuaError> {
+    if e.k != ExprKind::NonReloc {
+        let reg = reserve_reg(fs)?;
+        cg_discharge_to_reg(fs, line, e, reg)?;
+    }
+    Ok(())
 }
 
 /// First half of `luaK_posfix`: pre-process the left operand `v` of a binary
@@ -1789,6 +1944,41 @@ fn cg_sc_int(e: &ExprDesc) -> Option<u8> {
     let biased = (e.u.ival as u64).wrapping_add(lua_code::opcodes::OFFSET_S_C as u64);
     if biased <= lua_code::opcodes::MAXARG_C as u64 {
         Some(biased as u8)
+    } else {
+        None
+    }
+}
+
+/// Exact float-to-integer conversion: C's `luaV_flttointns` with `F2Ieq`
+/// (`lvm.c`). Succeeds only when `n` has no fractional part and the value is
+/// representable as an `i64`; the range test mirrors `lua_numbertointeger`.
+fn flt_to_int_exact(n: f64) -> Option<i64> {
+    if n.floor() == n && n >= (i64::MIN as f64) && n < -(i64::MIN as f64) {
+        Some(n as i64)
+    } else {
+        None
+    }
+}
+
+/// Mirrors C's `isSCnumber` from `lcode.c`: like [`cg_sc_int`] but also
+/// accepts a float literal whose value converts exactly to an integer
+/// (`F2Ieq`), reporting which case matched so the caller can encode the
+/// `isfloat` flag in the comparison instruction's C slot. The VM's
+/// metamethod fallback (`order_imm_slow` -> `call_order_i_tm`) reads that
+/// flag to rebuild the constant with its original type, so `x < 2.0` calls
+/// `__lt` with a float even though the immediate is stored as an integer.
+fn cg_sc_number(e: &ExprDesc) -> Option<(u8, bool)> {
+    let (i, isfloat) = match e.k {
+        ExprKind::KInt => (e.u.ival, false),
+        ExprKind::KFlt => (flt_to_int_exact(e.u.nval)?, true),
+        _ => return None,
+    };
+    if e.t != NO_JUMP || e.f != NO_JUMP {
+        return None;
+    }
+    let biased = (i as u64).wrapping_add(lua_code::opcodes::OFFSET_S_C as u64);
+    if biased <= lua_code::opcodes::MAXARG_C as u64 {
+        Some((biased as u8, isfloat))
     } else {
         None
     }
@@ -2057,6 +2247,11 @@ fn cg_store_abrk(
     b: u32,
     ex: &mut ExprDesc,
 ) -> Result<(), LuaError> {
+    if cg_exp_to_const_k(fs, ex, lua_code::opcodes::MAXARG_C) {
+        let inst = lua_code::opcodes::Instruction::abck(op, a, b, ex.u.info as u32, 1);
+        emit_inst(fs, line, inst);
+        return Ok(());
+    }
     let c_reg = cg_exp_to_any_reg(fs, line, ex)?;
     let inst = lua_code::opcodes::Instruction::abck(op, a, b, c_reg as u32, 0);
     emit_inst(fs, line, inst);

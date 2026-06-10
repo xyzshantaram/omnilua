@@ -57,6 +57,25 @@ WORKLOAD_COLORS = {
     "table_hash_pressure": "#d46b6b",
     "string_ops":      "#008c9e",
     "string_ops_long": "#8a6500",
+    "bitwise_mixed":   "#4f5d75",
+    "call_return_shapes": "#bc4b51",
+    "compare_immediates": "#5b8e7d",
+    "loop_variants":   "#8e7dbe",
+    "numeric_mixed":   "#f4a259",
+    "table_field_index": "#2a9d8f",
+    "global_settabup_same": "#e76f51",
+    "table_setfield_same": "#9c6644",
+    "table_seti_same": "#577590",
+    "table_settable_string_key": "#b56576",
+    "method_calls":    "#3d5a80",
+    "metatable_index_chain": "#98c1d9",
+    "pcall_error":     "#ee6c4d",
+    "varargs_spread":  "#293241",
+    "coroutine_pingpong": "#6a994e",
+    "string_format_mixed": "#bc6c25",
+    "concat_chain":    "#d62246",
+    "sort_seeded":     "#7b2cbf",
+    "json_roundtrip":  "#118ab2",
 }
 
 
@@ -77,6 +96,8 @@ def load_ledger_rows() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
             continue
         kind = row.get("kind")
         if kind == "bench" and row.get("target") == "rust-vs-reference":
+            if row.get("variant", "stock") != "stock":
+                continue
             if row.get("metric") in {"wall_ratio", "rss_ratio"} and row.get("workload") in WORKLOAD_COLORS:
                 bench_rows.append(row)
         elif kind == "tests" and row.get("target") == "official-suite":

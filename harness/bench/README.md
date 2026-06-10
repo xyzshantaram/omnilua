@@ -22,6 +22,13 @@ harness/bench/
 ├── profile-inventory.sh <- repo + host profiler/tool availability
 ├── profile-hotspots.sh  <- macOS sample wrapper + VM execute attribution
 ├── scaling-check.py     <- complexity gate: flag superlinear (O(n^2)) behavior
+├── instr-count.sh       <- deterministic Ir budgets (cachegrind in docker) — the A/B arbiter
+├── instr/               <- container half of the instruction-count rig
+├── probes/              <- differential probes (loop_only, call_only) — NOT matrix rows
+├── bytecode-parity.py   <- codegen parity gate vs luac -l -l (make bytecode-parity)
+├── bytecode-parity-allow.txt <- baselined divergences; counts may only shrink
+├── build-pgo.sh         <- PGO build w/ pinned training set (make perf-pgo ships it)
+├── with-timeout.sh      <- process-GROUP killing watchdog (perl; macOS has no timeout)
 ├── value-layout.sh      <- Rust-vs-C value/frame/object layout probe
 ├── vm-execute-attribution.py <- source-region parser for sample output
 ├── workloads/           <- self-contained .lua microbenchmarks (timed vs C)
@@ -115,27 +122,40 @@ bash harness/bench/compare_bins.sh \
   --workloads gc_pressure,binarytrees
 ```
 
-For short workloads where one invocation rounds to only a few hundredths of a
-second, repeat the workload inside each measured run:
-
-```bash
-bash harness/bench/compare_bins.sh \
-  --a /tmp/lua-rs-base \
-  --b target/release/lua-rs \
-  --label-a base \
-  --label-b candidate \
-  --runs 20 \
-  --workloads table_hash_pressure \
-  --repeat-each 10
-```
+Short workloads are handled automatically: `--repeat-each` defaults to
+`auto`, which calibrates a repeat factor per workload so every measured
+sample is at least `--min-sample` seconds (default 0.5). Pass an explicit
+`--repeat-each N` to override. The calibration and the output-match check
+are cached (keyed on binary sha256 + workload mtime), so repeat invocations
+of the same binary pair skip both. `--quick` is the exploratory preset
+(5 runs, 0.3 s floor) — use it for inner-loop iteration and keep the default
+for landing gates. Workloads marked `LIVELOCK` in `manifest.tsv` are
+auto-skipped unless explicitly requested with `--workloads`.
 
 Output:
 - `harness/bench/results/<UTC>-<sha>-bin-ab.tsv`
+- `harness/bench/results/<UTC>-<sha>-bin-ab.raw.tsv` (per-pair samples)
 - `harness/bench/results/<UTC>-<sha>-bin-ab.json`
 
 This runner checks that both binaries produce byte-identical workload output
-and reports `candidate_over_base` wall/RSS ratios. Use it for local packet
-evidence; use `compare.sh` for reference-C ratios and dashboard history.
+and runs **interleaved A/B pairs** (A then B, N times) so thermal/clock drift
+hits both binaries symmetrically. Per workload it reports best-of-N wall, the
+median of per-pair ratios, the fraction of pairs where B beat A, and a machine
+verdict (`improved` / `regressed-minor` / `regressed` / `inconclusive` /
+`short` / `hang`). With `--gate` it exits non-zero only on a **material**
+regression (median at or above the tolerance, default 1.03x, tunable with
+`--tolerance`); a consistent slowdown inside the band is `regressed-minor` —
+it lands, but the run prints a reminder that it must be tracked (task or
+registry note). `--strict` makes minor regressions fail too; use it for
+release gates. Headers carry provenance: dirty-tree flag, working diff
+sha256, and both binary sha256s.
+
+Confirmation policy (when to run the A/B twice): a second run is required
+only for verdicts that decide something contentious — a regression you intend
+to waive or act on, a win that is the packet's headline claim, or any verdict
+near its threshold. Clear interior wins (median <=0.97, frac >=0.9) on
+non-headline rows do not need a second run. Use it for local packet evidence;
+use `compare.sh` for reference-C ratios and dashboard history.
 
 ## How to read the numbers
 
@@ -148,9 +168,10 @@ filters out scheduling jitter without smearing real performance differences.
 `rss_ratio` is max-RSS lua-rs / max-RSS reference. Memory overhead at peak.
 
 Hardware + commit fingerprint is in the TSV header. **Do not merge runs
-from different machines** — apples to oranges. For the current scorecard and
-running optimization journal, read `docs/PERFORMANCE_PRINCIPLES.md` and
-`docs/MATCHING_C_PERFORMANCE.md`.
+from different machines** — apples to oranges. For the current scorecard,
+active bottleneck model, and agent handoff, read
+`docs/PERFORMANCE_MODEL.md`. For the rules and longer optimization journal,
+read `docs/PERFORMANCE_PRINCIPLES.md` and `docs/MATCHING_C_PERFORMANCE.md`.
 
 ## Probe vs ledgered bench split (when we add probes)
 
@@ -284,9 +305,9 @@ unsafe representation ceilings.
 4. `gc-profile.sh` covers collector counters and start/end cadence deltas. It
    does not provide allocation stack attribution or cumulative per-phase
    timing.
-5. `compare_bins.sh` covers direct Rust-vs-Rust A/B checks for small packets
-   without appending ledger rows. Use `--repeat-each N` when a single workload
-   invocation is too short for stable wall-clock resolution.
+5. `compare_bins.sh` covers direct A/B checks for small packets without
+   appending ledger rows. Repeat calibration is automatic; `--gate` turns the
+   verdict into an exit code.
 6. `compare.sh` appends ledger rows directly. Typed bench runner entries in
    `harness/runners.toml` are still useful future cleanup, but not required
    for evidence-backed perf work.

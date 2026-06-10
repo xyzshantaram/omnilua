@@ -120,6 +120,8 @@ jobs:
           ref: main
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools
       - uses: Swatinem/rust-cache@v2
       - name: benchmark and regenerate dashboard
         # `make perf` builds reference C (guess) + lua-rs, then runs
@@ -127,8 +129,15 @@ jobs:
         # HEAD) to harness/evidence/ledger.jsonl. Ratios are measured on the
         # same runner, so they are hardware-independent and slot into the
         # existing trajectory regardless of CI runner variance.
+        #
+        # `make perf-pgo` then builds the PGO binary (pinned training set),
+        # conformance-gates it (full official suite), and appends
+        # variant=pgo ledger rows — the headline numbers. The dashboard
+        # trend stays stock-only (history.py filters variants), so the two
+        # series never silently mix.
         run: |
           make perf
+          make perf-pgo
           python3 harness/bench/history.py
       - name: commit dashboard to main
         run: |

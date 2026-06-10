@@ -1,0 +1,5 @@
+# Known codegen divergences vs luac -l -l. EMPTY as of 2026-06-10: all 31
+# bench workloads emit opcode-exact streams (packets: unary const folding,
+# float-immediate compares, RK stores, jumponcond NOT peephole +
+# discharge2anyreg fix; plus the gate's own RETURN0/1 regex truncation
+# fix). Any new entry needs a written justification. workload:count

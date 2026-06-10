@@ -19,8 +19,6 @@
 // arithmetic and is not translated. Rust owns the allocations via Rc/Box.
 
 use std::cell::RefCell;
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 
@@ -114,7 +112,99 @@ impl Hasher for LuaByteHasher {
 }
 
 pub type LuaByteBuildHasher = BuildHasherDefault<LuaByteHasher>;
-pub type InternedStringMap = HashMap<Box<[u8]>, GcRef<LuaString>, LuaByteBuildHasher>;
+
+/// The short-string intern table, shaped like C-Lua's `stringtable`
+/// (lstring.c): power-of-two hash buckets of `GcRef<LuaString>` chained by
+/// Vec instead of `u.hnext`. Compared to the previous
+/// `HashMap<Box<[u8]>, GcRef<LuaString>>`:
+///
+/// - lookup hashes the input bytes ONCE and never allocates (the entry-API
+///   shape boxed the key on every call — rejected experiment
+///   `intern-hitpath-borrowed-lookup` documents why a partial fix loses);
+/// - insert reuses the same hash, no second probe;
+/// - bytes are stored once (in the `LuaString`), not duplicated in a map key;
+/// - dead strings are removed O(dead) by `(hash, identity)` pairs collected
+///   during the GC mark phase, replacing the O(table·log live)
+///   sort + binary-search retain that dominated churn-heavy profiles
+///   (concat_chain 20260609T2201Z: intern machinery ~25% of wall).
+pub struct InternedStringMap {
+    buckets: Vec<Vec<GcRef<LuaString>>>,
+    count: usize,
+}
+
+impl Default for InternedStringMap {
+    fn default() -> Self {
+        InternedStringMap {
+            buckets: (0..64).map(|_| Vec::new()).collect(),
+            count: 0,
+        }
+    }
+}
+
+impl InternedStringMap {
+    #[inline]
+    fn mask(&self) -> usize {
+        self.buckets.len() - 1
+    }
+
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    #[inline]
+    pub fn find(&self, bytes: &[u8], hash: u32) -> Option<GcRef<LuaString>> {
+        let bucket = &self.buckets[hash as usize & self.mask()];
+        bucket
+            .iter()
+            .find(|s| s.hash() == hash && s.as_bytes() == bytes)
+            .cloned()
+    }
+
+    /// C's `luaS_resize` growth rule: keep average chain length ~1.
+    pub fn insert(&mut self, s: GcRef<LuaString>) {
+        if self.count >= self.buckets.len() {
+            self.resize(self.buckets.len() * 2);
+        }
+        let m = self.mask();
+        self.buckets[s.hash() as usize & m].push(s);
+        self.count += 1;
+    }
+
+    fn resize(&mut self, new_len: usize) {
+        let old = std::mem::replace(
+            &mut self.buckets,
+            (0..new_len).map(|_| Vec::new()).collect(),
+        );
+        let m = self.mask();
+        for bucket in old {
+            for s in bucket {
+                self.buckets[s.hash() as usize & m].push(s);
+            }
+        }
+    }
+
+    /// O(dead): removes one entry located by its cached hash + GC identity.
+    pub fn remove(&mut self, hash: u32, identity: usize) {
+        let m = self.mask();
+        let bucket = &mut self.buckets[hash as usize & m];
+        if let Some(pos) = bucket.iter().position(|s| s.identity() == identity) {
+            bucket.swap_remove(pos);
+            self.count -= 1;
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &GcRef<LuaString>> {
+        self.buckets.iter().flatten()
+    }
+
+    pub fn contains_key(&self, bytes: &[u8]) -> bool {
+        self.find(bytes, LuaString::hash_bytes(bytes, 0)).is_some()
+    }
+}
 
 /// A Lua-callable function pointer. C: `lua_CFunction`.
 ///
@@ -406,21 +496,27 @@ pub use lua_types::status::LuaStatus;
 
 // ─── StackValue ───────────────────────────────────────────────────────────────
 
-/// One slot on the Lua value stack.  Wraps a `LuaValue` and an optional
-/// to-be-closed delta (for the `tbclist` mechanism).
+/// One slot on the Lua value stack.
 ///
-/// types.tsv: `StackValue → StackValue { val: LuaValue, tbclist.delta: u16 }`
+/// C's `StackValue` overlays a to-be-closed delta (`tbclist.delta: u16`) in a
+/// union with the value, because C threads its tbclist through the stack
+/// itself. The Rust port keeps that list as a side structure
+/// (`LuaState.tbclist: Vec<StackIdx>`), so the slot is just the value and
+/// stays 16 bytes — matching C's slot size without the union. A vestigial
+/// `tbc_delta: u16` field (written, never read) padded every slot to 24 bytes
+/// until it was removed on 2026-06-09 (PERF_PUSH_SPEC.md P3).
+///
+/// types.tsv: `StackValue → StackValue { val: LuaValue }` (tbclist.delta →
+/// `LuaState.tbclist: Vec<StackIdx>`)
 #[derive(Clone)]
 pub struct StackValue {
     pub val: LuaValue,
-    pub tbc_delta: u16,
 }
 
 impl Default for StackValue {
     fn default() -> Self {
         StackValue {
             val: LuaValue::Nil,
-            tbc_delta: 0,
         }
     }
 }
@@ -856,12 +952,21 @@ impl LuaTableRefExt for GcRef<LuaTable> {
     }
     /// Forwards to [`LuaTable::try_raw_set`], which performs the nil/NaN
     /// key validation internally as part of its integer-fast-path match.
+    ///
+    /// A collectable KEY stored into the table needs its own backward
+    /// barrier, mirroring C-Lua's `luaC_barrierback(L, obj2gco(t), key)`
+    /// inside `luaH_newkey` (ltable.c:717). Without it a young key inserted
+    /// into an old table is invisible to the generational collector and is
+    /// freed while still referenced — the 2026-06-09 table livelock.
     #[inline(always)]
     fn raw_set(&self, state: &mut LuaState, k: LuaValue, v: LuaValue) -> Result<(), LuaError> {
         match k {
             LuaValue::Int(i) => return self.raw_set_int(state, i, v),
             LuaValue::Str(s) if s.is_short() => return self.raw_set_short_str(state, s, v),
             k => {
+                if k.is_collectable() {
+                    state.gc_table_barrier_back(self, &k);
+                }
                 let before = (**self).buffer_bytes();
                 let result = (**self).try_raw_set(k, v);
                 if result.is_ok() {
@@ -885,16 +990,20 @@ impl LuaTableRefExt for GcRef<LuaTable> {
             }
         }
     }
+    /// The miss arm inserts a NEW short-string key, so the key itself is
+    /// barriered (C-Lua does this inside `luaH_newkey`, ltable.c:717); the
+    /// hit arm only overwrites a value whose key is already traced.
     #[inline(always)]
     fn raw_set_short_str(
         &self,
-        _state: &mut LuaState,
+        state: &mut LuaState,
         k: GcRef<LuaString>,
         v: LuaValue,
     ) -> Result<(), LuaError> {
         match (**self).try_update_short_str(&k, v) {
             Ok(()) => Ok(()),
             Err(v) => {
+                state.gc_table_barrier_back(self, &LuaValue::Str(k));
                 let before = (**self).buffer_bytes();
                 let result = (**self).try_raw_set(LuaValue::Str(k), v);
                 if result.is_ok() {
@@ -1725,6 +1834,16 @@ pub struct GlobalState {
     /// child coroutine cannot sweep entries still present in the parent's
     /// `openupval` list.
     pub suspended_parent_open_upvals: Vec<Vec<GcRef<UpVal>>>,
+
+    /// Capacity pools for the two snapshot kinds above. A resume previously
+    /// allocated and freed a fresh `Vec` per snapshot — 2 mallocs + 2 frees
+    /// on every `coroutine.resume` (the top allocator frames in the
+    /// coroutine_pingpong profile, 20260609T2243Z). Popped snapshots park
+    /// their (cleared) buffers here for reuse; pool depth is bounded by the
+    /// maximum resume nesting depth. The pooled vectors are always empty, so
+    /// they root nothing.
+    pub snapshot_stack_pool: Vec<Vec<LuaValue>>,
+    pub snapshot_upval_pool: Vec<Vec<GcRef<UpVal>>>,
 }
 
 /// `LUA_MASKCOUNT` (`1 << LUA_HOOKCOUNT`) — the count-hook event mask the
@@ -2329,9 +2448,9 @@ impl LuaState {
     pub fn push(&mut self, val: LuaValue) {
         let top = self.top.0 as usize;
         if top < self.stack.len() {
-            self.stack[top] = StackValue { val, tbc_delta: 0 };
+            self.stack[top] = StackValue { val };
         } else {
-            self.stack.push(StackValue { val, tbc_delta: 0 });
+            self.stack.push(StackValue { val });
         }
         self.top = StackIdx(self.top.0 + 1);
     }
@@ -2440,27 +2559,24 @@ impl LuaState {
     /// `ls->h` anchor table.
     ///
     /// macros.tsv: `luaS_new → state.intern_str(s)`
+    /// Short-string interning, `luaS_newlstr` shape: one hash of the input
+    /// bytes, a bucket walk on hit (zero allocation), and an insert that
+    /// reuses the same hash on miss. See the `InternedStringMap` doc for why
+    /// this replaced the owned-key `HashMap` entry API.
     pub fn intern_str(&mut self, bytes: &[u8]) -> Result<GcRef<LuaString>, LuaError> {
         if bytes.len() <= crate::string::MAX_SHORT_LEN {
-            let mut inserted = false;
-            let interned = {
-                let key = bytes.to_vec().into_boxed_slice();
-                let mut global = self.global_mut();
-                match global.interned_lt.entry(key) {
-                    Entry::Occupied(existing) => existing.get().clone(),
-                    Entry::Vacant(vacant) => {
-                        let new_ref = GcRef::new(LuaString::from_bytes(vacant.key().to_vec()));
-                        new_ref.account_buffer(new_ref.buffer_bytes() as isize);
-                        vacant.insert(new_ref.clone());
-                        inserted = true;
-                        new_ref
-                    }
+            let hash = LuaString::hash_bytes(bytes, 0);
+            {
+                let global = self.global();
+                if let Some(existing) = global.interned_lt.find(bytes, hash) {
+                    return Ok(existing);
                 }
-            };
-            if inserted {
-                self.mark_gc_check_needed();
             }
-            Ok(interned)
+            let new_ref = GcRef::new(LuaString::from_bytes(bytes.to_vec()));
+            new_ref.account_buffer(new_ref.buffer_bytes() as isize);
+            self.global_mut().interned_lt.insert(new_ref.clone());
+            self.mark_gc_check_needed();
+            Ok(new_ref)
         } else {
             self.mark_gc_check_needed();
             let new_ref = GcRef::new(LuaString::from_bytes(bytes.to_vec()));
@@ -2514,7 +2630,6 @@ impl LuaState {
         }
         for i in start.0..end.0 {
             self.stack[i as usize].val = LuaValue::Nil;
-            self.stack[i as usize].tbc_delta = 0;
         }
     }
     /// Hot-path accessor: returns `Some(i)` only when the stack slot at `idx`
@@ -4227,33 +4342,31 @@ fn close_open_upvalues_for_unreachable_threads(global: &GlobalState, marker: &mu
     marker.drain_gray_queue();
 }
 
-fn record_live_interned_strings(
+/// Mark-phase half of intern-table cleanup (C: dead strings leave the
+/// stringtable via `luaS_remove` at free time). The marker and a `&mut`
+/// global cannot coexist, so this records each DEAD entry's
+/// `(hash, identity)` pair during the immutable post-mark hook; the
+/// steady-state output is empty or tiny, replacing the old all-live-ids
+/// vector (O(table) push + sort + per-entry binary-search retain).
+fn record_dead_interned_strings(
     global: &GlobalState,
     marker: &lua_gc::Marker,
-    live_ids: &std::cell::RefCell<Vec<usize>>,
+    dead_pairs: &std::cell::RefCell<Vec<(u32, usize)>>,
 ) {
-    let mut live = live_ids.borrow_mut();
-    for s in global.interned_lt.values() {
+    let mut dead = dead_pairs.borrow_mut();
+    for s in global.interned_lt.iter() {
         let id = s.identity();
-        if marker.is_visited(id) {
-            live.push(id);
+        if !marker.is_visited(id) {
+            dead.push((s.hash(), id));
         }
     }
 }
 
-fn retain_live_interned_strings(global: &mut GlobalState, mut live_ids: Vec<usize>) {
-    if live_ids.is_empty() {
-        global.interned_lt.clear();
-        return;
+/// Sweep-phase half: O(dead) bucket removals by cached hash + identity.
+fn remove_dead_interned_strings(global: &mut GlobalState, dead_pairs: Vec<(u32, usize)>) {
+    for (hash, id) in dead_pairs {
+        global.interned_lt.remove(hash, id);
     }
-    if live_ids.len() == global.interned_lt.len() {
-        return;
-    }
-    live_ids.sort_unstable();
-    live_ids.dedup();
-    global
-        .interned_lt
-        .retain(|_, s| live_ids.binary_search(&s.identity()).is_ok());
 }
 
 impl<'a> GcHandle<'a> {
@@ -4435,7 +4548,7 @@ impl<'a> GcHandle<'a> {
         // distinguish "still reachable from program state" from "only kept
         // alive by the finalizer registry."
         let weak_table_capacity = weak_tables_snapshot.len();
-        let (pending_snapshot, thread_capacity, interned_capacity): (
+        let (pending_snapshot, thread_capacity, _interned_capacity): (
             Vec<FinalizerObject>,
             usize,
             usize,
@@ -4457,7 +4570,7 @@ impl<'a> GcHandle<'a> {
             std::cell::RefCell::new(std::collections::HashSet::new());
         let alive_thread_ids: std::cell::RefCell<std::collections::HashSet<u64>> =
             std::cell::RefCell::new(std::collections::HashSet::new());
-        let live_interned_ids: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(Vec::new());
+        let dead_interned: std::cell::RefCell<Vec<(u32, usize)>> = std::cell::RefCell::new(Vec::new());
         let collect_ran = std::cell::Cell::new(false);
 
         {
@@ -4473,7 +4586,6 @@ impl<'a> GcHandle<'a> {
                 newly_unreachable.borrow_mut().reserve(finalizer_capacity);
                 finalizing_ids.borrow_mut().reserve(finalizer_capacity);
                 alive_thread_ids.borrow_mut().reserve(thread_capacity);
-                live_interned_ids.borrow_mut().reserve(interned_capacity);
                 trace_reachable_threads(&*global, global.current_thread_id, marker);
                 close_open_upvalues_for_unreachable_threads(&*global, marker);
                 loop {
@@ -4549,7 +4661,7 @@ impl<'a> GcHandle<'a> {
                         }
                     }
                 }
-                record_live_interned_strings(&*global, marker, &live_interned_ids);
+                record_dead_interned_strings(&*global, marker, &dead_interned);
             };
             match mode {
                 HeapCollectMode::Full => global.heap.full_collect_with_post_mark(&roots, hook),
@@ -4568,9 +4680,9 @@ impl<'a> GcHandle<'a> {
         let alive_set = alive_ids.into_inner();
         let promote: Vec<FinalizerObject> = newly_unreachable.into_inner();
         let alive_thread_ids = alive_thread_ids.into_inner();
-        let live_interned_ids = live_interned_ids.into_inner();
+        let dead_interned = dead_interned.into_inner();
         let mut g = state_ref.global.borrow_mut();
-        retain_live_interned_strings(&mut *g, live_interned_ids);
+        remove_dead_interned_strings(&mut *g, dead_interned);
         g.weak_tables_registry.retain_identities(&alive_set);
         let main_thread_id = g.main_thread_id;
         g.threads.retain(|id, _| alive_thread_ids.contains(id));
@@ -4691,7 +4803,7 @@ impl<'a> GcHandle<'a> {
         };
 
         let weak_table_capacity = weak_tables_snapshot.len();
-        let (pending_snapshot, thread_capacity, interned_capacity): (
+        let (pending_snapshot, thread_capacity, _interned_capacity): (
             Vec<FinalizerObject>,
             usize,
             usize,
@@ -4713,7 +4825,7 @@ impl<'a> GcHandle<'a> {
             std::cell::RefCell::new(std::collections::HashSet::new());
         let alive_thread_ids: std::cell::RefCell<std::collections::HashSet<u64>> =
             std::cell::RefCell::new(std::collections::HashSet::new());
-        let live_interned_ids: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(Vec::new());
+        let dead_interned: std::cell::RefCell<Vec<(u32, usize)>> = std::cell::RefCell::new(Vec::new());
         let atomic_ran = std::cell::Cell::new(false);
 
         let stop_target = {
@@ -4738,7 +4850,6 @@ impl<'a> GcHandle<'a> {
                 newly_unreachable.borrow_mut().reserve(finalizer_capacity);
                 finalizing_ids.borrow_mut().reserve(finalizer_capacity);
                 alive_thread_ids.borrow_mut().reserve(thread_capacity);
-                live_interned_ids.borrow_mut().reserve(interned_capacity);
                 trace_reachable_threads(&*global, global.current_thread_id, marker);
                 close_open_upvalues_for_unreachable_threads(&*global, marker);
                 loop {
@@ -4807,7 +4918,7 @@ impl<'a> GcHandle<'a> {
                         }
                     }
                 }
-                record_live_interned_strings(&*global, marker, &live_interned_ids);
+                record_dead_interned_strings(&*global, marker, &dead_interned);
             };
             let budget = StepBudget::from_work(work_units);
             if let Some(target) = stop_target {
@@ -4825,9 +4936,9 @@ impl<'a> GcHandle<'a> {
             let alive_set = alive_ids.into_inner();
             let promote: Vec<FinalizerObject> = newly_unreachable.into_inner();
             let alive_thread_ids = alive_thread_ids.into_inner();
-            let live_interned_ids = live_interned_ids.into_inner();
+            let dead_interned = dead_interned.into_inner();
             let mut g = state_ref.global.borrow_mut();
-            retain_live_interned_strings(&mut *g, live_interned_ids);
+            remove_dead_interned_strings(&mut *g, dead_interned);
             g.weak_tables_registry.retain_identities(&alive_set);
             let main_thread_id = g.main_thread_id;
             g.threads.retain(|id, _| alive_thread_ids.contains(id));
@@ -4866,12 +4977,12 @@ impl<'a> GcHandle<'a> {
             let mut g = state_ref.global.borrow_mut();
             g.weak_tables_registry.live_snapshot_by_kind()
         };
-        let interned_capacity = {
+        let _interned_capacity = {
             let g = state_ref.global.borrow();
             g.interned_lt.len()
         };
 
-        let live_interned_ids: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(Vec::new());
+        let dead_interned: std::cell::RefCell<Vec<(u32, usize)>> = std::cell::RefCell::new(Vec::new());
 
         {
             let global = state_ref.global.borrow();
@@ -4881,7 +4992,6 @@ impl<'a> GcHandle<'a> {
                 thread: state_ref,
             };
             let hook = |marker: &mut lua_gc::Marker| {
-                live_interned_ids.borrow_mut().reserve(interned_capacity);
                 trace_reachable_threads(&*global, global.current_thread_id, marker);
                 loop {
                     let visited_before = marker.visited_count();
@@ -4909,14 +5019,14 @@ impl<'a> GcHandle<'a> {
                     }
                 }
                 marker.drain_gray_queue();
-                record_live_interned_strings(&*global, marker, &live_interned_ids);
+                record_dead_interned_strings(&*global, marker, &dead_interned);
             };
             global.heap.mark_only_with_post_mark(&roots, hook);
         }
 
-        let live_interned_ids = live_interned_ids.into_inner();
+        let dead_interned = dead_interned.into_inner();
         let mut g = state_ref.global.borrow_mut();
-        retain_live_interned_strings(&mut *g, live_interned_ids);
+        remove_dead_interned_strings(&mut *g, dead_interned);
     }
 
     /// Set the GC kind (incremental/generational).
@@ -5270,7 +5380,6 @@ fn stack_init(thread: &mut LuaState) {
 
     thread.stack[0] = StackValue {
         val: LuaValue::Nil,
-        tbc_delta: 0,
     };
 
     thread.top = StackIdx(1);
@@ -5747,6 +5856,8 @@ pub fn new_state() -> Option<LuaState> {
         cross_thread_upvals: std::collections::HashMap::new(),
         suspended_parent_stacks: Vec::new(),
         suspended_parent_open_upvals: Vec::new(),
+        snapshot_stack_pool: Vec::new(),
+        snapshot_upval_pool: Vec::new(),
     };
 
     let global_rc = Rc::new(RefCell::new(global));

@@ -65,6 +65,17 @@ perf:
 	$(CARGO) build --release --bin lua-rs
 	bash harness/bench/compare.sh
 
+perf-pgo: setup
+	@[ -x reference/lua-5.4.7/src/lua ] || $(MAKE) -C reference/lua-5.4.7 guess
+	bash harness/bench/build-pgo.sh
+	./harness/run_official_all.sh
+	BENCH_VARIANT=pgo bash harness/bench/compare.sh
+	$(CARGO) build --release --bin lua-rs
+
+bytecode-parity:
+	$(CARGO) build --release --bin lua-rs -q
+	python3 harness/bench/bytecode-parity.py
+
 scaling:
 	$(CARGO) build --release --bin lua-rs
 	python3 harness/bench/scaling-check.py

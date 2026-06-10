@@ -2947,7 +2947,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                                 TagMethod::Lt,
                             )?,
                         };
-                        finish_order_imm_jump(state, &cl, &mut pc, &mut trap, ci, i, cond);
+                        finish_order_imm_jump(state, code, &mut pc, &mut trap, ci, i, cond);
                     }
                     OpCode::LeI => {
                         let ra = base + i.arg_a();
@@ -2971,7 +2971,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                                 TagMethod::Le,
                             )?,
                         };
-                        finish_order_imm_jump(state, &cl, &mut pc, &mut trap, ci, i, cond);
+                        finish_order_imm_jump(state, code, &mut pc, &mut trap, ci, i, cond);
                     }
                     OpCode::GtI => {
                         let ra = base + i.arg_a();
@@ -2995,7 +2995,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                                 TagMethod::Lt,
                             )?,
                         };
-                        finish_order_imm_jump(state, &cl, &mut pc, &mut trap, ci, i, cond);
+                        finish_order_imm_jump(state, code, &mut pc, &mut trap, ci, i, cond);
                     }
                     OpCode::GeI => {
                         let ra = base + i.arg_a();
@@ -3019,7 +3019,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                                 TagMethod::Le,
                             )?,
                         };
-                        finish_order_imm_jump(state, &cl, &mut pc, &mut trap, ci, i, cond);
+                        finish_order_imm_jump(state, code, &mut pc, &mut trap, ci, i, cond);
                     }
                     // ── OP_TEST ────────────────────────────────────────────────
                     OpCode::Test => {
@@ -3206,29 +3206,37 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                             if forloop_legacy(state, ra) {
                                 pc = (pc as i64 - i.arg_bx() as i64) as u32;
                             }
-                            trap = state.ci_trap(ci);
+                            if state.hookmask != 0 {
+                                trap = state.ci_trap(ci);
+                            }
                         } else {
                             let ra_u = ra.0 as usize;
-                            if let LuaValue::Int(step) = state.stack[ra_u + 2].val {
-                                let count = match state.stack[ra_u + 1].val {
+                            let window: &mut [crate::state::StackValue; 4] = (&mut state.stack
+                                [ra_u..ra_u + 4])
+                                .try_into()
+                                .expect("FORLOOP register window");
+                            if let LuaValue::Int(step) = window[2].val {
+                                let count = match window[1].val {
                                     LuaValue::Int(c) => c as u64,
                                     _ => 0,
                                 };
                                 if count > 0 {
-                                    let idx = match state.stack[ra_u].val {
+                                    let idx = match window[0].val {
                                         LuaValue::Int(x) => x,
                                         _ => 0,
                                     };
-                                    state.stack[ra_u + 1].val = LuaValue::Int((count - 1) as i64);
+                                    window[1].val = LuaValue::Int((count - 1) as i64);
                                     let new_idx = intop_add(idx, step);
-                                    state.stack[ra_u].val = LuaValue::Int(new_idx);
-                                    state.stack[ra_u + 3].val = LuaValue::Int(new_idx);
+                                    window[0].val = LuaValue::Int(new_idx);
+                                    window[3].val = LuaValue::Int(new_idx);
                                     pc = (pc as i64 - i.arg_bx() as i64) as u32;
                                 }
                             } else if float_for_loop(state, ra) {
                                 pc = (pc as i64 - i.arg_bx() as i64) as u32;
                             }
-                            trap = state.ci_trap(ci);
+                            if state.hookmask != 0 {
+                                trap = state.ci_trap(ci);
+                            }
                         }
                     }
                     // ── OP_FORPREP ─────────────────────────────────────────────
@@ -3707,7 +3715,7 @@ fn order_imm_slow(
 #[inline(always)]
 fn finish_order_imm_jump(
     state: &mut LuaState,
-    cl: &lua_types::GcRef<lua_types::LuaLClosure>,
+    code: &[Instruction],
     pc: &mut u32,
     trap: &mut bool,
     ci: CallInfoIdx,
@@ -3717,9 +3725,11 @@ fn finish_order_imm_jump(
     if (cond as i32) != i.arg_k() {
         *pc += 1;
     } else {
-        let next = state.proto_code(&cl, *pc);
+        let next = code[*pc as usize];
         *pc = (*pc as i64 + next.arg_s_j() as i64 + 1) as u32;
-        *trap = state.ci_trap(ci);
+        if state.hookmask != 0 {
+            *trap = state.ci_trap(ci);
+        }
     }
 }
 
