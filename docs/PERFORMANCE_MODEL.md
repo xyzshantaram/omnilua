@@ -15,43 +15,56 @@ Read this alongside:
 
 ## Current Position
 
-**2026-06-10** — full stock + PGO matrices at `fc0805b` (artifacts
-`20260610T000424Z-fc0805b-compare.tsv` stock,
-`20260610T001xZ` `variant=pgo`, both ledgered). **PGO is the shipping
-configuration** (release CI publishes it). Overall: stock 1.65x, **PGO
-1.41x**, no PGO row above 2.08x:
+**2026-06-10 PM** — full stock + PGO matrices at `c1dfdc1` (artifacts
+`20260610T143508Z-c1dfdc1-compare.tsv` stock,
+`20260610T144112Z-c1dfdc1-compare.tsv` `variant=pgo`, both ledgered).
+These INCLUDE the whole 06-09/10 packet wave: C-shaped stringtable,
+coroutine pools, FORLOOP register window, full codegen parity
+(unary folds, float-immediate compares, RK stores, NOT peephole), the
+GC mark-buffer pool, and fat LTO (now the stock release profile).
+Overall: **stock 1.54x, PGO 1.43x**:
 
 | workload | stock | PGO | | workload | stock | PGO |
 |---|---:|---:|---|---|---:|---:|
-| coroutine_pingpong | 2.17 | 2.08 | | mandelbrot/_long | 1.69 | 1.53 |
-| method_calls | 2.35 | 2.05 | | table_settable_string_key | 1.81 | 1.49 |
-| table_setfield_same | 2.40 | 2.02 | | fibonacci | 1.67 | 1.44 |
-| binarytrees | 2.20 | 1.98 | | string_format_mixed | 1.64 | 1.44 |
-| global_settabup_same | 2.36 | 1.88 | | compare_immediates | 1.69 | 1.41 |
-| concat_chain | 2.00 | 1.82 | | loop_variants | 1.70 | 1.40 |
-| bitwise_mixed | 2.02 | 1.76 | | string_ops | 1.51 | 1.28 |
-| call_return_shapes | 2.11 | 1.70 | | metatable_index_chain | 1.52 | 1.27 |
-| gc_pressure | 2.06 | 1.67 | | table_field_index | 1.24 | 1.15 |
-| table_seti_same | 2.05 | 1.66 | | string_ops_long | 1.31 | 1.14 |
-| closure_ops | 1.94 | 1.60 | | sort_seeded | 1.70 | 1.06 |
-| pcall_error | 1.83 | 1.59 | | table_hash_pressure | 0.95 | 0.84 |
-| varargs_spread | 2.02 | 1.58 | | table_ops / _long | 0.44 | 0.48 |
-| numeric_mixed | 1.75 | 1.57 | | json_roundtrip | 1.96 | 1.56 |
+| method_calls | 1.80 | 2.14 | | varargs_spread | 1.68 | 1.63 |
+| coroutine_pingpong | 2.02 | 2.12 | | call_return_shapes | 1.64 | 1.61 |
+| global_settabup_same | 2.00 | 2.10 | | json_roundtrip | 1.84 | 1.50 |
+| table_seti_same | 1.87 | 2.10 | | fibonacci | 1.64 | 1.47 |
+| binarytrees | 2.17 | 2.05 | | string_format_mixed | 1.62 | 1.45 |
+| table_setfield_same | 2.08 | 1.98 | | compare_immediates | 1.70 | 1.41 |
+| concat_chain | 1.96 | 1.82 | | mandelbrot / _long | 1.47 | 1.41 |
+| table_settable_string_key | 1.63 | 1.80 | | metatable_index_chain | 1.43 | 1.38 |
+| gc_pressure | 1.98 | 1.78 | | loop_variants | 1.70 | 1.37 |
+| bitwise_mixed | 1.85 | 1.73 | | string_ops | 1.46 | 1.26 |
+| closure_ops | 1.69 | 1.69 | | string_ops_long | 1.28 | 1.11 |
+| numeric_mixed | 1.83 | 1.65 | | sort_seeded | 1.52 | 1.02 |
+| pcall_error | 1.77 | 1.63 | | table_hash_pressure | 0.93 | 0.82 |
+| table_ops / _long | 0.43 | 0.42 | | | | |
 
 Reading rules for this table:
 
-- These matrices predate the FORLOOP register window (`661ee2a`, loop tick
-  75 -> 61 Ir) — the next release run includes it.
-- **Stock cross-snapshot comparisons are unreliable**: between the 06-09
-  morning baseline and this table, rows untouched by any packet drifted
-  ±5-15% (bitwise 1.71 -> 2.02, mandelbrot 1.53 -> 1.69) from code-layout
-  redistribution across three GlobalState/dispatch shape changes — proven
-  not to be added work by Ir recounts (fibonacci flat to 4e-7). Judge
-  packets by their gated interleaved A/Bs and recounts; judge releases by
-  the PGO column, where layout is profile-driven and the drift collapses.
-- RSS is DECOMPOSED (W2.3, 2026-06-10): allocation counts are at parity
-  with C; our objects are ~3x bigger. See "RSS decomposition" under
-  Current Findings.
+- **Stock improved 1.65x -> 1.54x in one day** from the packet wave plus
+  fat LTO; per-row examples vs the prior snapshot: method_calls
+  2.35 -> 1.80, table_setfield 2.40 -> 2.08, mandelbrot 1.69 -> 1.47,
+  call_return_shapes 2.11 -> 1.64. (Cross-snapshot stock drift caveat
+  still applies to small deltas; these are large and packet-backed.)
+- **PGO's margin narrowed and is now MIXED per-row**: overall still -7%
+  vs stock (1.54 -> 1.43), but it REGRESSES eight rows vs stock
+  (method_calls 1.80 -> 2.14, table_seti 1.87 -> 2.10,
+  coroutine_pingpong, global_settabup, table_settable_string_key...).
+  Last night PGO beat stock on every row; the difference is fat LTO in
+  the base (stock captured much of PGO's layout win) plus a training
+  set that predates the codegen-parity packets. Follow-up: retrain the
+  pinned training set and re-evaluate per-row; if the setter-row
+  regressions persist, consider per-row variant selection or accept the
+  overall win.
+- **Stock cross-snapshot comparisons remain unreliable for small
+  deltas** (layout drift, proven by recounts). Judge packets by gated
+  interleaved A/Bs and recounts; judge releases by full-matrix runs
+  like this one.
+- RSS is DECOMPOSED (W2.3): allocation counts at parity with C; objects
+  ~3x bigger. See "RSS decomposition" under Current Findings; the table
+  representation diet (candidate 9) is the lever.
 
 ### Prior snapshot — re-baselined 2026-06-09 (P1.6)
 
