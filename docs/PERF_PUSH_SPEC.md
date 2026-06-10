@@ -6,12 +6,17 @@ state). Derived from the 2026-06-09 deep audit of `docs/PERFORMANCE_MODEL.md`,
 `docs/MATCHING_C_PERFORMANCE.md`, `harness/bench/*`, and the
 `lua-vm`/`lua-types` hot paths.
 
-Execution ledger: ~45 commits on main since `v0.0.32` through 2026-06-10.
-Open work, priority order: W2.3 RSS/alloc parity; codegen divergence packets
-(task 11, incl. a CORRECTNESS look at the RETURN-specialization class);
-dispatch-preamble attribution (needs callgrind on a bigger box); W2.2
-call/return diet; P4.2-4.4 build-knob experiments (fat-LTO / fast-alloc /
-panic-abort — still unmeasured); W2.5/P5 safety-tax ablation.
+Execution ledger: ~55 commits on main since `v0.0.32` through 2026-06-10 PM.
+DONE this wave: codegen parity COMPLETE (31/31 workloads opcode-exact vs
+luac, allowlist empty — d98601c, 7508900; the RETURN class was a gate
+regex bug; RETURN-specialization correctness concern dissolved with it);
+P4 build knobs all measured (fat LTO SHIPPED d6df7b4; mimalloc
+measured-not-shipped; panic-abort REJECTED); W2.3 RSS DECOMPOSED (object
+size, not churn — model doc) + mark-buffer pool landed (622ebad).
+Open work, priority order: table representation diet (candidate 9, the
+RSS lever); W2.2 call/return diet; sweep_young scratch pooling (small);
+dispatch-preamble attribution (needs callgrind on a bigger box); W2.5/P5
+safety-tax ablation; PGO-on-mimalloc interplay if RSS pressure rises.
 
 This spec is the work plan that turns the audit into packets. It follows the
 house rules: every packet has a gate, the oracle is the only truth-teller, no
