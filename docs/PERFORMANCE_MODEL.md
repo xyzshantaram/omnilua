@@ -374,11 +374,35 @@ Two model consequences:
    after the loss. Acceptable for shipping; revisit if the row class ever
    approaches parity from above.
 
-Ship status: evidence supports wiring PGO into release builds (separate
-packet: pipeline changes, ledger `variant` labeling so PGO ratios are never
-silently compared against non-PGO history, reproducibility via the pinned
-training set). Until that lands, ledgered compare.sh runs stay on stock
-builds.
+Ship status: SHIPPED 2026-06-10 (`967b801`) — release CI runs
+`make perf-pgo` (conformance-gated, `variant=pgo` ledger rows; the
+dashboard trend stays stock-only).
+
+**mimalloc / `--features fast-alloc` (P4.3, 2026-06-10): measured, not
+shipped.** A/B vs stock at 10 interleaved pairs: big wins on
+allocation-heavy rows — `concat_chain` 0.77, `table_hash_pressure` 0.82,
+`gc_pressure` 0.85, `string_ops_long` 0.85, `json_roundtrip` 0.94 — and
+RSS drops of 21-43% everywhere it matters (`json` 0.57, `gc_pressure`
+0.64, `string_ops_long` 0.59, `binarytrees` 0.78), which bites directly
+into the W2.3 RSS-parity problem. Costs: `binarytrees` wall +4.8-5.1%
+(10/10 pairs, real) and `fibonacci` +1-3% borderline. Verdict: a real
+lever with one real trade; do NOT flip the default from this sample.
+Next step if pursued: full matrix + PGO-on-mimalloc interplay, and check
+whether the binarytrees regression survives PGO.
+
+**fat LTO (P4.2, 2026-06-10): SHIPPED (`d6df7b4`).** A/B vs thin at 10
+interleaved pairs, zero regressions: call_return_shapes -12%,
+binarytrees / mandelbrot_long / table_seti_same / json_roundtrip /
+string_ops_long -4-5%, fibonacci/gc_pressure flat; official suite 44/44
+against the fat binary. No losing row, so unlike mimalloc it ships
+immediately; the release profile is now `lto = "fat"` and PGO layers on
+top of it.
+
+**panic-abort CLI (P4.4, 2026-06-10): REJECTED** (registry
+`panic-abort-cli-build`). pcall is Result-based and `catch_unwind` lives
+only in lua-rs-runtime (not linked by the CLI), so semantics hold
+(44/44) — but there is no unwind tax to reclaim on hot paths, and the
+abort personality regressed `table_seti_same` +17% (0/10 pairs).
 
 ## Rejected Or Inconclusive Experiments
 
