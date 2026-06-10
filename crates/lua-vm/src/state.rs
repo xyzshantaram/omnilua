@@ -4225,6 +4225,17 @@ fn barrier_any(
     }
 }
 
+/// Fixed-point trace of every registered coroutine whose thread handle was
+/// reached from a real root.
+///
+/// A thread whose `RefCell` is mutably borrowed at collect time CANNOT be
+/// traced — its stack is silently invisible to the marker. Exactly two
+/// borrow-holders are legitimate: the currently-running thread (rooted
+/// directly via `CollectRoots.thread`) and resume-chain parents (rooted via
+/// the `suspended_parent_stacks` snapshots, one per nesting level). Any
+/// other borrow held across a collect point un-roots that coroutine for the
+/// whole cycle — the bug-A root-loss class from issue #140 — so debug builds
+/// assert the failure count stays within snapshot coverage.
 fn trace_reachable_threads(
     global: &GlobalState,
     _current_thread_id: u64,
@@ -4232,12 +4243,21 @@ fn trace_reachable_threads(
 ) {
     use lua_gc::Trace;
 
+    #[cfg(debug_assertions)]
+    let mut uncovered_borrowed: Vec<u64> = Vec::new();
+
     loop {
         let visited_before = marker.visited_count();
         for (id, entry) in global.threads.iter() {
             if thread_entry_marked_alive(marker, *id, entry) {
-                if let Ok(thread) = entry.state.try_borrow() {
-                    thread.trace(marker);
+                match entry.state.try_borrow() {
+                    Ok(thread) => thread.trace(marker),
+                    Err(_) => {
+                        #[cfg(debug_assertions)]
+                        if *id != _current_thread_id && !uncovered_borrowed.contains(id) {
+                            uncovered_borrowed.push(*id);
+                        }
+                    }
                 }
             }
         }
@@ -4246,6 +4266,20 @@ fn trace_reachable_threads(
             break;
         }
     }
+
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        uncovered_borrowed.len() <= global.suspended_parent_stacks.len(),
+        "GC root loss: {} marked-alive coroutine(s) (ids {:?}) were mutably \
+         borrowed at collect time with only {} parent snapshot(s) covering \
+         them — their stacks were NOT traced this cycle, so anything only \
+         reachable from them will be swept (issue #140 bug-A class). A borrow \
+         of a coroutine's state must not be held across an allocation \
+         checkpoint without pushing a parent GC snapshot.",
+        uncovered_borrowed.len(),
+        uncovered_borrowed,
+        global.suspended_parent_stacks.len()
+    );
 }
 
 fn thread_entry_marked_alive(
