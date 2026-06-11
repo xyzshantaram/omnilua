@@ -13,8 +13,13 @@ Status checklist (tick only with evidence paths):
       (commit 1ee624c: check.sh 57/54/23/7/10 pass across 5.1–5.5,
       multiversion_oracle 165 pass, run_official_all 44/44, 10-case
       byte-for-byte ref matrix vs /tmp/lua-refs/bin/lua5.1.5)
-- [ ] T2-B: coroutine resume/yield allocator-traffic diet landed
-      (`coroutine_pingpong` improves, canaries + official coroutine tests green)
+- [x] T2-B: coroutine resume/yield allocator-traffic diet landed — PR #147,
+      honest result WALL-NEUTRAL (quiet interleaved A/B 3.40s vs 3.40s over
+      20-run aggregates): the dominant snapshot-buffer pole was already fixed
+      on main by 04cd144 (2026-06-09); the four remaining per-resume Vec
+      buffers are now pooled (canaries 36/0, quarantine clean). Discovered
+      follow-up: T2-B2 below.
+- [ ] T2-B2: per-resume panic-hook machinery diet (design-gated; see below)
 - [x] T2-A: pretailcall `clear_stack_range` verdict recorded: KEEP +
       document (see T2-A section; full analysis 2026-06-11)
 - [ ] T2-C: frame re-entry / `prep_call_info` diet landed (`call_return_shapes`
@@ -155,6 +160,29 @@ multiversion_oracle`, `harness/canaries/gc/run_canaries.sh`,
 (fibonacci as a no-regression control). Target: coroutine_pingpong ≤ 1.7x
 stock-build equivalent (provisional numbers acceptable from the agent; Fable
 re-measures quiet before PR).
+
+### T2-B2 — per-resume panic-hook diet (next pingpong lever, design-gated)
+
+Found during T2-B. `aux_resume` (coro_lib.rs ~235-255) wraps every resume in:
+`take_hook()` → `Arc::new(Mutex::new(Some(prev)))` → `set_hook(Box::new(...))`
+→ resume → `take_hook()` → restore `set_hook(prev)`. That is 3-4 heap
+allocations plus four global hook-lock operations per resume, purely to
+suppress the default panic printer for `LuaThreadClose` unwind payloads
+(coroutine.close's internal unwind), chaining everything else to the previous
+hook.
+
+Design of record (Fable, 2026-06-11): install ONE process-global hook via
+`OnceLock` at first resume, capturing the then-current hook and chaining to
+it; gate the LuaThreadClose suppression on a `thread_local!` suppress
+counter incremented/decremented around the `catch_unwind` (counter, not bool,
+for nested resumes). Per-resume cost drops to two TLS counter writes; the
+scoping semantics (suppression active only inside a resume window) are
+preserved exactly. Known tradeoff to document: an embedder calling
+`std::panic::set_hook` AFTER lua-rs's first resume displaces our chained hook
+permanently (today per-resume reinstall wins each window); acceptable, note in
+the doc-comment. Gates: T2-B gate set + a test that a panic raised inside a
+resumed Rust hostfunc still reaches the default/previous hook (not swallowed),
+plus quiet A/B on coroutine_pingpong.
 
 ### T2-A — pretailcall `clear_stack_range` verdict (investigate, do NOT land without sign-off)
 
