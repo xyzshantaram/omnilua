@@ -286,17 +286,18 @@ fn aux_resume(state: &mut LuaState, co: GcRef<lua_types::value::LuaThread>, narg
     pop_parent_gc_snapshot(state);
 
     {
+        let mut flush = pop_resume_flush_buf(state);
         let mut g = state.global_mut();
-        let mut flush: Vec<(lua_vm::state::StackIdx, LuaValue)> = Vec::new();
         for (tid, idx) in &parent_open_upval_slots {
             if let Some(v) = g.cross_thread_upvals.remove(&(*tid, *idx)) {
                 flush.push((*idx, v));
             }
         }
         drop(g);
-        for (idx, v) in flush {
+        for (idx, v) in flush.drain(..) {
             state.set_at(idx, v);
         }
+        return_resume_flush_buf(state, flush);
     }
     return_resume_slot_buf(state, parent_open_upval_slots);
 
@@ -380,6 +381,20 @@ fn pop_resume_value_buf(state: &mut LuaState) -> Vec<LuaValue> {
 fn return_resume_value_buf(state: &mut LuaState, mut buf: Vec<LuaValue>) {
     buf.clear();
     state.global_mut().resume_value_pool.push(buf);
+}
+
+/// Borrow an empty cross-thread upvalue flush buffer from the resume pool, or a
+/// fresh one if the pool is empty. Park with [`return_resume_flush_buf`] once
+/// the buffer has been drained back onto the parent stack.
+fn pop_resume_flush_buf(state: &mut LuaState) -> Vec<(lua_vm::state::StackIdx, LuaValue)> {
+    state.global_mut().resume_flush_pool.pop().unwrap_or_default()
+}
+
+/// Park a (drained) flush buffer back in the resume pool, clearing it so the
+/// pooled buffer is always empty and roots nothing.
+fn return_resume_flush_buf(state: &mut LuaState, mut buf: Vec<(lua_vm::state::StackIdx, LuaValue)>) {
+    buf.clear();
+    state.global_mut().resume_flush_pool.push(buf);
 }
 
 /// RAII borrow of another thread's `LuaState` that keeps the thread's stack
@@ -790,17 +805,18 @@ fn close_suspended_or_dead(
     pop_parent_gc_snapshot(state);
 
     {
+        let mut flush = pop_resume_flush_buf(state);
         let mut g = state.global_mut();
-        let mut flush: Vec<(lua_vm::state::StackIdx, LuaValue)> = Vec::new();
         for (tid, idx) in &parent_open_upval_slots {
             if let Some(v) = g.cross_thread_upvals.remove(&(*tid, *idx)) {
                 flush.push((*idx, v));
             }
         }
         drop(g);
-        for (idx, v) in flush {
+        for (idx, v) in flush.drain(..) {
             state.set_at(idx, v);
         }
+        return_resume_flush_buf(state, flush);
     }
     return_resume_slot_buf(state, parent_open_upval_slots);
 
