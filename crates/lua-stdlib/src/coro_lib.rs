@@ -15,11 +15,97 @@
 //! Translated from: `reference/lua-5.4.7/src/lcorolib.c` (210 lines, 12 functions)
 //! Target crate: `lua-stdlib`
 
+use std::cell::Cell;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::sync::{Arc, Mutex};
+use std::sync::OnceLock;
 
 use crate::state_stub::{lua_CFunction, upvalue_index, LuaState, LuaStateStubExt as _};
 use lua_types::{error::LuaError, gc::GcRef, value::LuaValue, LuaStatus, LuaThreadClose, LuaType};
+
+thread_local! {
+    /// Per-thread suppression depth for [`LuaThreadClose`] unwind payloads.
+    ///
+    /// Incremented for the duration of each `catch_unwind` resume window by a
+    /// [`SuppressGuard`], decremented (on every path, including a panic
+    /// unwinding through the guard) when the guard drops. The process-global
+    /// chaining hook installed by [`ensure_chaining_panic_hook`] silently
+    /// swallows a `LuaThreadClose` payload only while this counter is non-zero
+    /// **on the panicking thread**, and delegates every other payload — and
+    /// `LuaThreadClose` outside a resume window — to the previously installed
+    /// hook.
+    ///
+    /// It is a counter rather than a bool because resumes nest: a coroutine
+    /// resumed from inside another resume must keep the suppression active for
+    /// the outer window after the inner one exits. Because the state is
+    /// thread-local, a `LuaThreadClose` unwind suppressed on one OS thread
+    /// never silences a simultaneous unrelated panic on another OS thread —
+    /// that thread reads its own zero counter and reaches the previous hook.
+    static THREAD_CLOSE_SUPPRESS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// One-shot install guard for the process-global chaining panic hook.
+static CHAINING_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+
+/// RAII increment of [`THREAD_CLOSE_SUPPRESS`] for one resume window.
+///
+/// Constructing the guard increments the per-thread counter; dropping it
+/// decrements. `catch_unwind` returns normally even when it catches a panic,
+/// so the decrement in `Drop` covers both the caught-panic and the
+/// normal-return paths; an uncaught panic unwinding through the guard runs the
+/// same `Drop`, so the counter invariant holds on every exit.
+struct SuppressGuard;
+
+impl SuppressGuard {
+    fn new() -> Self {
+        THREAD_CLOSE_SUPPRESS.with(|c| c.set(c.get() + 1));
+        SuppressGuard
+    }
+}
+
+impl Drop for SuppressGuard {
+    fn drop(&mut self) {
+        THREAD_CLOSE_SUPPRESS.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
+/// Install — exactly once for the process — a chaining panic hook that
+/// suppresses the default panic printout for [`LuaThreadClose`] unwind
+/// payloads while a resume window is active on the panicking thread, and
+/// delegates everything else to the hook that was current at install time.
+///
+/// `LuaThreadClose` is the internal unwind used by `coroutine.close` (5.5
+/// self-close) and coroutine teardown; it is control flow, not a Rust runtime
+/// fault, so it must never reach the default printer. The previous per-resume
+/// implementation paid 3–4 heap allocations plus four global hook-lock
+/// operations on every resume to install and tear this suppression down around
+/// each `catch_unwind`. This installs the hook once and scopes the suppression
+/// with a thread-local counter ([`THREAD_CLOSE_SUPPRESS`]) instead, so the
+/// per-resume cost is two TLS counter writes.
+///
+/// Suppression is gated on the counter so it is active only inside a resume
+/// window: a `LuaThreadClose` that somehow escaped a resume would still reach
+/// the previous hook, and — because the counter is thread-local — a
+/// `LuaThreadClose` suppressed on one OS thread never silences a simultaneous
+/// unrelated panic on another OS thread.
+///
+/// Accepted tradeoff (T2-B2): an embedder that calls `std::panic::set_hook`
+/// **after** lua-rs's first resume displaces this chained hook permanently —
+/// the previous implementation re-installed the suppression on every resume,
+/// so it won each resume window even against a later embedder hook. Embedders
+/// that need a custom hook should install it before the first resume; the
+/// chaining hook then captures and delegates to it.
+fn ensure_chaining_panic_hook() {
+    CHAINING_HOOK_INSTALLED.get_or_init(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let suppress = info.payload().downcast_ref::<LuaThreadClose>().is_some()
+                && THREAD_CLOSE_SUPPRESS.with(|c| c.get()) > 0;
+            if !suppress {
+                previous(info);
+            }
+        }));
+    });
+}
 
 // ── Coroutine status codes ────────────────────────────────────────────────────
 
@@ -234,24 +320,13 @@ fn aux_resume(state: &mut LuaState, co: GcRef<lua_types::value::LuaThread>, narg
         return_resume_value_buf(state, args);
         co_state.global_mut().current_thread_id = co_id;
         let mut nres: i32 = 0;
-        let previous_hook = Arc::new(Mutex::new(Some(std::panic::take_hook())));
-        let previous_for_hook = Arc::clone(&previous_hook);
-        std::panic::set_hook(Box::new(move |info| {
-            if info.payload().downcast_ref::<LuaThreadClose>().is_none() {
-                if let Ok(guard) = previous_for_hook.lock() {
-                    if let Some(hook) = guard.as_ref() {
-                        hook(info);
-                    }
-                }
-            }
-        }));
-        let resume_result = catch_unwind(AssertUnwindSafe(|| {
-            lua_vm::do_::lua_resume(&mut *co_state, Some(state), narg, &mut nres)
-        }));
-        let _installed_hook = std::panic::take_hook();
-        if let Some(hook) = previous_hook.lock().ok().and_then(|mut h| h.take()) {
-            std::panic::set_hook(hook);
-        }
+        ensure_chaining_panic_hook();
+        let resume_result = {
+            let _suppress = SuppressGuard::new();
+            catch_unwind(AssertUnwindSafe(|| {
+                lua_vm::do_::lua_resume(&mut *co_state, Some(state), narg, &mut nres)
+            }))
+        };
         co_state.global_mut().current_thread_id = parent_thread_id;
         let status = match resume_result {
             Ok(status) => status,
