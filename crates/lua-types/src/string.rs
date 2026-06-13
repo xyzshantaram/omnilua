@@ -1,11 +1,29 @@
 //! `LuaString` — Lua's byte-string (NOT UTF-8). PORT_STRATEGY §3.3.
 //!
-//! Phase A-C: a simple `Rc<[u8]>`-backed struct with a short/long flag.
+//! Phase A-C: a simple `Box<[u8]>`-backed struct with a short/long flag.
 //! Phase D may revisit for interning + content-hash equality.
 
+/// Lua's immutable byte-string value.
+///
+/// The byte payload is a `Box<[u8]>`, NOT an `Rc<[u8]>`. Strings are immutable
+/// and GC-owned: every live `LuaString` is reached through a `GcRef<LuaString>`
+/// (the interner stores `GcRef`s, `LuaValue::Str` holds a `GcRef`), and all
+/// value-level sharing happens at that `GcRef` layer. An `Rc<[u8]>` would
+/// co-locate a 16-byte refcount header (strong + weak counts) with the payload
+/// in the string's heap allocation, so every string allocation paid those 16
+/// bytes on top of its `GcBox<LuaString>` for a refcount machinery nothing
+/// uses. Switching to `Box<[u8]>` drops the 16-byte header per string and the
+/// refcount inc/dec traffic; the win is in the heap allocation, not the struct
+/// field (both `Rc<[u8]>` and `Box<[u8]>` are 16-byte fat pointers).
+///
+/// The `#[derive(Clone)]` is retained, but a by-value `LuaString` clone is now
+/// a deep copy (alloc + memcpy) rather than a refcount bump. This is acceptable
+/// because no hot path clones a `LuaString` by value — hot sharing goes through
+/// the `Copy` `GcRef<LuaString>` handle. The only by-value clones are cold
+/// (error-message construction, `GlobalState` init).
 #[derive(Debug, Clone)]
 pub struct LuaString {
-    bytes: std::rc::Rc<[u8]>,
+    bytes: Box<[u8]>,
     is_short: bool,
     hash: u32,
 }
@@ -15,7 +33,7 @@ impl LuaString {
         let is_short = b.len() <= 40;
         let hash = Self::hash_bytes(&b, 0);
         LuaString {
-            bytes: b.into(),
+            bytes: b.into_boxed_slice(),
             is_short,
             hash,
         }
@@ -23,18 +41,18 @@ impl LuaString {
 
     /// Construct directly from a borrowed slice with a single allocating copy.
     ///
-    /// `from_bytes` takes an owned `Vec<u8>`, but `Vec<u8> -> Rc<[u8]>` always
-    /// reallocates (the `Rc` co-locates its refcount header with the payload and
-    /// cannot adopt a `Vec`'s buffer), so a caller holding only a slice would copy
-    /// twice: once into a `Vec`, once into the `Rc`. `Rc::from(&[u8])` copies the
-    /// slice straight into the final allocation, matching C's single
+    /// `from_bytes` takes an owned `Vec<u8>`, but `Vec<u8> -> Box<[u8]>` via
+    /// `into_boxed_slice` only adopts the existing buffer when it is exactly
+    /// full, otherwise it reallocates; a caller holding only a slice would copy
+    /// twice (once into a `Vec`, once into the `Box`). `Box::from(&[u8])` copies
+    /// the slice straight into the final allocation, matching C's single
     /// `luaS_newlstr` allocation per string. Hash is computed with the same
     /// algorithm as `from_bytes`.
     pub fn from_slice(b: &[u8]) -> Self {
         let is_short = b.len() <= 40;
         let hash = Self::hash_bytes(b, 0);
         LuaString {
-            bytes: std::rc::Rc::from(b),
+            bytes: Box::from(b),
             is_short,
             hash,
         }
@@ -103,5 +121,7 @@ impl Eq for LuaString {}
 //   unsafe_blocks: 0
 //   notes:         LuaString interned-string type. Mirrors C's TString with the short/long
 //                  variant distinction and the hash field; uses GcRef-style ptr
-//                  identity for interning.
+//                  identity for interning. Byte payload is Box<[u8]>, not Rc<[u8]>:
+//                  strings are immutable and shared at the GcRef level, so the Rc
+//                  refcount header (16 B/string) was pure overhead. Box drops it.
 // ──────────────────────────────────────────────────────────────────────────────
