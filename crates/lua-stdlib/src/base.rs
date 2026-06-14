@@ -926,10 +926,14 @@ pub(crate) fn pairs_fn(state: &mut LuaState) -> Result<usize, LuaError> {
 /// The element fetch is a genuine cross-version split. Lua 5.1/5.2's
 /// `ipairsaux` reads with `lua_rawgeti` — `__index` is NOT consulted, so an
 /// empty array part stops immediately even when an `__index` would supply
-/// values. Lua 5.3 switched to `lua_geti`, which honors `__index`. The first
-/// argument is guaranteed a table on 5.1/5.2 (`ipairs` type-checks it there),
-/// so the raw read is safe.
-fn ipairs_aux(state: &mut LuaState) -> Result<usize, LuaError> {
+/// values. Lua 5.3 switched to `lua_geti`, which honors `__index`.
+///
+/// The split is resolved ONCE in the cold `ipairs_fn` setup, which registers
+/// the matching specialization (`ipairs_aux_raw` for 5.1/5.2, `ipairs_aux` for
+/// 5.3+). This per-step loop body therefore carries NO version branch — the GC
+/// `global()` borrow stays out of the hot iteration path (cf. the string
+/// packet's `gmatch_aux` const-split). The `RAW` const folds at monomorphization.
+fn ipairs_step<const RAW: bool>(state: &mut LuaState) -> Result<usize, LuaError> {
     let i = match lua_vm::api::positive_index_value(state, 2) {
         LuaValue::Int(i) => i,
         _ => state.check_arg_integer(2)?,
@@ -937,11 +941,9 @@ fn ipairs_aux(state: &mut LuaState) -> Result<usize, LuaError> {
     // luaL_intop(+, a, b) → wrapping integer addition (PORTING.md §9 / macros.tsv `intop`)
     let i = (i as u64).wrapping_add(1u64) as i64;
     state.push(LuaValue::Int(i));
-    let raw_read = matches!(
-        state.global().lua_version,
-        lua_types::LuaVersion::V51 | lua_types::LuaVersion::V52
-    );
-    let t = if raw_read {
+    let t = if RAW {
+        // 5.1/5.2: `lua_rawgeti`. The first argument is guaranteed a table
+        // (`ipairs` type-checks it on those versions), so the raw read is safe.
         lua_vm::api::raw_get_i(state, 1, i)
     } else {
         let table = lua_vm::api::positive_index_value(state, 1);
@@ -952,6 +954,16 @@ fn ipairs_aux(state: &mut LuaState) -> Result<usize, LuaError> {
     } else {
         Ok(2)
     }
+}
+
+/// 5.3+ `ipairsaux`: honors `__index` via `lua_geti`.
+fn ipairs_aux(state: &mut LuaState) -> Result<usize, LuaError> {
+    ipairs_step::<false>(state)
+}
+
+/// 5.1/5.2 `ipairsaux`: raw `lua_rawgeti`, no `__index`.
+fn ipairs_aux_raw(state: &mut LuaState) -> Result<usize, LuaError> {
+    ipairs_step::<true>(state)
 }
 
 // ── ipairs ────────────────────────────────────────────────────────────────────
@@ -981,16 +993,17 @@ pub(crate) fn ipairs_fn(state: &mut LuaState) -> Result<usize, LuaError> {
         state.call(1, 3)?;
         return Ok(3);
     }
-    let checks_table = matches!(
+    let legacy = matches!(
         version,
         lua_types::LuaVersion::V51 | lua_types::LuaVersion::V52
     );
-    if checks_table {
+    if legacy {
         state.check_arg_type(1, LuaType::Table)?;
+        state.push_c_function(ipairs_aux_raw)?;
     } else {
         state.check_arg_any(1)?;
+        state.push_c_function(ipairs_aux)?;
     }
-    state.push_c_function(ipairs_aux)?;
     state.push_copy(1)?;
     state.push(LuaValue::Int(0));
     Ok(3)
