@@ -124,7 +124,9 @@ struct MatchState<'a> {
 impl<'a> MatchState<'a> {
     /// Build a matcher state. `bound_depth` is `true` on 5.2+ (apply the
     /// `MAX_CC_CALLS` "pattern too complex" guard) and `false` on 5.1 (no guard
-    /// — 5.1's `match()` has no `matchdepth` field).
+    /// — 5.1's `match()` has no `matchdepth` field). `#[inline]` so a caller
+    /// passing a constant `bound_depth` folds the `matchdepth` select away.
+    #[inline]
     fn new(src: &'a [u8], pat: &'a [u8], step_limit: u64, bound_depth: bool) -> Self {
         let matchdepth = if bound_depth {
             MAX_CC_CALLS
@@ -1335,10 +1337,13 @@ fn gmatch_step<const DEDUP: bool>(state: &mut LuaState) -> Result<usize, LuaErro
 
     let s: &[u8] = s_str.as_bytes();
     let p: &[u8] = p_str.as_bytes();
-    let (start_pos, last_match, bound_depth) = {
+    let (start_pos, last_match, stored_bound_depth) = {
         let iter = iter_state.borrow();
         (iter.pos, iter.last_match, iter.bound_depth)
     };
+    // DEDUP=true ⟹ 5.3+ ⟹ the depth bound is always on; fold it to a constant
+    // so the 5.3+ step's `MatchState::new` is the baseline `MAX_CC_CALLS`.
+    let bound_depth = if DEDUP { true } else { stored_bound_depth };
 
     let ls = s.len();
 
