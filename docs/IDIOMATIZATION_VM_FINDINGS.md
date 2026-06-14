@@ -41,7 +41,15 @@ stdlib would be N partial fixes of one root cause. Fix once in the VM resolver.
 
 ---
 
-## F2 — `__name` metamethod honored before 5.3
+## F2 — `__name` metamethod honored before 5.3 — ✅ FIXED 2026-06-14
+
+Fixed via a single-source `LuaVersion::honors_name_metafield()` (false for
+5.1/5.2) gating every `__name` read site: `obj_type_name_cow` (+ the free
+`obj_type_name` that supplies the version), `state.obj_type_name`, and the two
+`auxlib` type-error / `tolstring` sites. Pinned by
+`crates/lua-stdlib/tests/name_metafield_version.rs` (tostring + type-error, per
+version), verified live against `lua5.{1.5,2.4,3.6,4.7,5.0}`. Original finding
+below.
 
 **Divergence.** The `__name` metafield (custom type name in `tostring` and in
 type-mismatch error messages) is honored on all versions; it should be **5.3+

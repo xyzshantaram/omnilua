@@ -473,7 +473,8 @@ pub fn type_error_arg(state: &mut LuaState, arg: i32, tname: &[u8]) -> Result<us
     //      typearg = "light userdata";
     //    else
     //      typearg = luaL_typename(L, arg);
-    let typearg: Vec<u8> = if get_metafield(state, arg, b"__name")? == LuaType::String {
+    let honors_name = state.global().lua_version.honors_name_metafield();
+    let typearg: Vec<u8> = if honors_name && get_metafield(state, arg, b"__name")? == LuaType::String {
         let bytes = state.peek_bytes(-1).unwrap_or_else(|| b"?".to_vec());
         state.pop_n(1);
         bytes
@@ -1206,7 +1207,11 @@ pub fn to_lua_string(state: &mut LuaState, idx: i32) -> Result<Vec<u8>, LuaError
                 state.push_string(b"nil")?;
             }
             _ => {
-                let tt = get_metafield(state, idx, b"__name")?;
+                let tt = if state.global().lua_version.honors_name_metafield() {
+                    get_metafield(state, idx, b"__name")?
+                } else {
+                    LuaType::Nil
+                };
                 let kind: Vec<u8> = if tt == LuaType::String {
                     state.peek_bytes(-1).unwrap_or_else(|| b"?".to_vec())
                 } else {

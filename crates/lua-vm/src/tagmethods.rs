@@ -250,7 +250,7 @@ pub(crate) fn get_tm_by_obj(state: &mut LuaState, o: &LuaValue, event: TagMethod
 /// Uses `LuaTable::get_str_bytes` (linear byte-scan) instead of
 /// `intern_str` + `get_short_str` so the lookup is infallible and requires
 /// no mutable state access.
-pub(crate) fn obj_type_name_cow(o: &LuaValue) -> Cow<'static, [u8]> {
+pub(crate) fn obj_type_name_cow(o: &LuaValue, honors_name: bool) -> Cow<'static, [u8]> {
     if matches!(o, LuaValue::LightUserData(_)) {
         return Cow::Borrowed(b"light userdata");
     }
@@ -260,12 +260,14 @@ pub(crate) fn obj_type_name_cow(o: &LuaValue) -> Cow<'static, [u8]> {
         LuaValue::UserData(u) => u.metatable(),
         _ => None,
     };
-    if let Some(mt_ref) = mt {
-        // Uses get_str_bytes (raw byte scan) rather than intern_str + get_short_str
-        // so no mutable state is needed and no error can propagate.
-        let name_val = mt_ref.get_str_bytes(b"__name");
-        if let LuaValue::Str(s) = name_val {
-            return Cow::Owned(s.as_bytes().to_vec());
+    if honors_name {
+        if let Some(mt_ref) = mt {
+            // Uses get_str_bytes (raw byte scan) rather than intern_str + get_short_str
+            // so no mutable state is needed and no error can propagate.
+            let name_val = mt_ref.get_str_bytes(b"__name");
+            if let LuaValue::Str(s) = name_val {
+                return Cow::Owned(s.as_bytes().to_vec());
+            }
         }
     }
     Cow::Borrowed(type_name(o.base_type()))
@@ -275,11 +277,12 @@ pub(crate) fn obj_type_name_cow(o: &LuaValue) -> Cow<'static, [u8]> {
 /// migrated to `obj_type_name_cow`.  Always allocates; prefer
 /// `obj_type_name_cow` for allocation-free lookup in error-path code.
 ///
-/// PORT NOTE: `state` parameter retained for API compatibility; it is no
-/// longer used since the implementation delegates to `obj_type_name_cow`.
-/// Fallibility (`Result`) is also retained for the same reason.
-pub(crate) fn obj_type_name(_state: &mut LuaState, o: &LuaValue) -> Result<Vec<u8>, LuaError> {
-    Ok(obj_type_name_cow(o).into_owned())
+/// `state` supplies the active version: the `__name` metafield override is a
+/// 5.3 addition, so 5.1/5.2 always report the primitive type name (VM finding
+/// F2). Fallibility (`Result`) is retained for API compatibility.
+pub(crate) fn obj_type_name(state: &mut LuaState, o: &LuaValue) -> Result<Vec<u8>, LuaError> {
+    let honors_name = state.global().lua_version.honors_name_metafield();
+    Ok(obj_type_name_cow(o, honors_name).into_owned())
 }
 
 // ── luaT_callTM ──────────────────────────────────────────────────────────────
