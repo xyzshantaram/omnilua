@@ -154,6 +154,12 @@ struct GMatchIterState {
     pos: usize,
     /// End of the last match, used to avoid zero-length infinite loops.
     last_match: Option<usize>,
+    /// The two version seams, resolved ONCE at iterator creation so the
+    /// per-match `gmatch_aux` step never re-reads `state.global()` (a `RefCell`
+    /// borrow): `dedup` = the 5.3.3 `e != lastmatch` empty-match rule;
+    /// `bound_depth` = the 5.2+ `MAX_CC_CALLS` "pattern too complex" guard.
+    dedup: bool,
+    bound_depth: bool,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1311,18 +1317,15 @@ pub fn gmatch_aux(state: &mut LuaState) -> Result<usize, LuaError> {
 
     let s: &[u8] = s_str.as_bytes();
     let p: &[u8] = p_str.as_bytes();
-    let (start_pos, last_match) = {
+    let (start_pos, last_match, dedup, bound_depth) = {
         let iter = iter_state.borrow();
-        (iter.pos, iter.last_match)
+        (iter.pos, iter.last_match, iter.dedup, iter.bound_depth)
     };
 
     let ls = s.len();
 
-    let version = state.global().lua_version;
-    let dedup = matcher_dedups_empty_match(version);
-
     let step_limit = state.sandbox_match_step_limit();
-    let mut ms = MatchState::new(s, p, step_limit, matcher_bounds_depth(version));
+    let mut ms = MatchState::new(s, p, step_limit, bound_depth);
     let start_byte = required_start_byte(p);
 
     let mut src = start_pos;
@@ -1393,6 +1396,8 @@ pub fn gmatch(state: &mut LuaState) -> Result<usize, LuaError> {
         init = ls + 1;
     }
 
+    let version = state.global().lua_version;
+
     lua_vm::api::set_top(state, 2)?;
 
     state.push_value_at(1)?;
@@ -1401,6 +1406,8 @@ pub fn gmatch(state: &mut LuaState) -> Result<usize, LuaError> {
     let iter_state: Rc<dyn Any> = Rc::new(RefCell::new(GMatchIterState {
         pos: init,
         last_match: None,
+        dedup: matcher_dedups_empty_match(version),
+        bound_depth: matcher_bounds_depth(version),
     }));
     iter_ud.set_host_value(Some(iter_state));
 
