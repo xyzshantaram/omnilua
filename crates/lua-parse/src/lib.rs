@@ -3033,12 +3033,14 @@ fn new_upvalue(
     Ok(fs.nups as i32 - 1)
 }
 
-/// Searches for a local variable named `n`. Returns ExprKind as i32 or -1.
+/// Searches the active local variables of `fs` for one named `n`, scanning
+/// from the most-recently-declared backwards so that the innermost shadowing
+/// declaration wins. On a hit it initializes `var` and returns its [`ExprKind`]
+/// encoded as `i32`; on a miss it returns `-1`.
 fn searchvar(ls: &LexState, fs: &FuncState, n: &GcRef<LuaString>, var: &mut ExprDesc) -> i32 {
-    let mut i = fs.nactvar as i32 - 1;
-    while i >= 0 {
+    for i in (0..fs.nactvar as i32).rev() {
         let vd = get_local_var_desc(ls, fs, i);
-        if vd.name.as_ref().map_or(false, |nm| GcRef::ptr_eq(nm, n)) {
+        if vd.name.as_ref().is_some_and(|nm| GcRef::ptr_eq(nm, n)) {
             if vd.kind == VarKind::CompileTimeConst {
                 init_exp(var, ExprKind::Const, fs.firstlocal + i);
             } else {
@@ -3049,7 +3051,6 @@ fn searchvar(ls: &LexState, fs: &FuncState, n: &GcRef<LuaString>, var: &mut Expr
             }
             return var.k as i32;
         }
-        i -= 1;
     }
     -1
 }
