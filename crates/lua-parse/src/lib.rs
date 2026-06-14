@@ -198,8 +198,19 @@ impl ExprKind {
 
 // ── ExprPayload ─────────────────────────────────────────────────────────────
 
-/// PORT NOTE: C uses a union; all arms share memory. Rust keeps all fields in
-///   one struct for Phase A simplicity. Phase B may refactor to a proper enum.
+/// The payload of an [`ExprDesc`], discriminated by its sibling [`ExprKind`]
+/// (`ExprDesc::k`). Only the field(s) named for the active kind are meaningful;
+/// the rest are unused for that kind.
+///
+/// This is intentionally a flat struct rather than a tagged `enum` carrying
+/// per-variant data. Folding it into one is a deliberate **recorded
+/// honest-negative** (see the Sprint-1 recipe ledger): the kind and the payload
+/// are set in separate statements throughout codegen (e.g. `init_exp` writes a
+/// dummy `info` for every kind, then the caller overwrites the real field), and
+/// several helpers take the kind and the payload as separate arguments — shapes
+/// an enum's "the variant *is* the data" model cannot express without an invalid
+/// intermediate. The behavioral invariant (which field each kind uses) is held
+/// by the bytecode-parity oracle, not by the type system here.
 #[derive(Debug, Clone, Default)]
 pub struct ExprPayload {
     pub ival: i64,
@@ -241,9 +252,10 @@ impl Default for ExprDesc {
 
 // ── VarDesc ─────────────────────────────────────────────────────────────────
 
-/// PORT NOTE: C uses a union (vd fields + k for const value). Rust keeps all
-///   fields in a struct. The `const_val` field is only meaningful when
-///   `kind == VarKind::CompileTimeConst`.
+/// A compile-time variable descriptor. `const_val` is only meaningful when
+/// `kind == VarKind::CompileTimeConst`; for every other kind it is unused. Kept
+/// as a flat struct for the same reason as [`ExprPayload`] (see that type's
+/// note and the Sprint-1 honest-negative).
 #[derive(Debug, Clone)]
 pub struct VarDesc {
     pub kind: VarKind,
@@ -575,20 +587,19 @@ fn sync_from_lex(ls: &mut LexState) {
 /// Re-export of the VM state type the parser threads through codegen.
 pub use lua_vm::state::LuaState;
 
-// ── Inline codegen (lcode.c folded in) ──────────────────────────────────────
+// ── Inline codegen (single-pass bytecode emission) ──────────────────────────
 //
-// The full code generator lives in `lua-code` but operates on its own
-// placeholder `FuncState` / `ExprDesc` types (see `lua-code/src/codegen.rs`
-// "PHASE B PLACEHOLDERS"), so it cannot yet be called from `lua-parse` with
-// the real types defined here. Until that reconciliation lands, the parser
-// emits the small subset of bytecode required to execute simple programs
-// (global lookup + function call + string literal arg) directly, using the
-// shared `Instruction` encoding from `lua-code::opcodes`.
+// The bytecode generator is folded into this crate (the standalone `lua-code`
+// crate is only the opcode tables / `Instruction` encoding). The `cg_*`
+// functions below emit instructions, allocate and free registers, build the
+// constant table, compute jump offsets, fold constants, and attribute line
+// info — single-pass, as each expression and statement is parsed.
 //
-// These helpers mirror the behaviour of the C codegen functions they replace
-// (`luaK_codeABC`, `luaK_stringK`, `luaK_dischargevars` for the VINDEXUP
-// case, `luaK_exp2nextreg` for the VKSTR case). Phase B should delete this
-// section once lua-code is reachable from lua-parse with unified types.
+// This emission/register/jump/line-info/constant-fold core is deliberately
+// kept structurally faithful to its original shape (the hot-loop exception in
+// the idiomatization roadmap): its instruction ordering, register LIFO
+// discipline, and constant-insertion order are the load-bearing details the
+// bytecode-parity oracle pins. Idiomatize *around* it, not *through* it.
 
 fn emit_inst(fs: &mut FuncState, line: i32, inst: lua_code::opcodes::Instruction) -> i32 {
     const MAX_IWTH_ABS: i32 = 128;
@@ -4943,8 +4954,13 @@ fn restassign(
     check_readonly(ls, state, &lh.v.clone())?;
 
     if test_next(ls, state, b',' as TokenKind)? {
+        // The new target is not back-linked into the LHS chain (`prev: None`);
+        // check_conflict therefore only inspects the immediate parent `lh`, not
+        // the full chain back to the first target. A known divergence from
+        // upstream that the bytecode-parity oracle does not surface on the test
+        // corpus; not fixed here to avoid touching codegen behavior.
         let mut nv_assign = LhsAssign {
-            prev: None, // We don't link here — Phase B restructures
+            prev: None,
             v: ExprDesc::default(),
         };
         suffixedexp(ls, state, &mut nv_assign.v)?;
