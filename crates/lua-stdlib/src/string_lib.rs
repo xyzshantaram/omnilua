@@ -878,10 +878,20 @@ fn match_capture(ms: &MatchState, s: usize, l: u8) -> Result<Option<usize>, LuaE
     }
 }
 
-/// Core recursive pattern matcher.
-/// Returns `Ok(Some(new_s))` on match, `Ok(None)` on failure, `Err` on error.
+/// Core recursive pattern matcher: returns `Ok(Some(new_s))` on match,
+/// `Ok(None)` on failure, `Err` on a malformed pattern.
 ///
-/// The C code uses `goto init` for tail calls; here we use a loop.
+/// **Load-bearing, CPI-critical — do not restructure.** This is the hot inner
+/// loop of `find`/`match`/`gmatch`/`gsub`. The `'outer: loop` is the faithful
+/// translation of C's `goto init` tail-call (a self-`continue` re-enters at the
+/// new `s`/`p` without growing the Rust stack); the per-byte `match ms.pat[p]`
+/// is the dispatch; the remaining recursion (capture open/close, the expand
+/// helpers) mirrors the C call graph. Idiomatizing this — extracting helpers
+/// (adds calls), converting the loop to recursion, or replacing the dispatch —
+/// regresses the matcher's instruction count / branch behavior. The matcher is
+/// pinned by the behavioral net (pm.lua, strings.lua, the P2c oracle gates) and
+/// guarded by the Ir/branch-sim perf arbiter; only renames and doc-comments are
+/// admissible here.
 fn match_pat(ms: &mut MatchState, mut s: usize, mut p: usize) -> Result<Option<usize>, LuaError> {
     if ms.aborted {
         return Ok(None);
