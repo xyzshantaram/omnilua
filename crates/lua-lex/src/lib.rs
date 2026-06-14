@@ -553,13 +553,15 @@ fn save_and_next(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
 
-// l_noret → -> !  but in Rust we return LuaError (callers wrap in Err(...))
-// error_sites.tsv: luaX_lexerror → return Err(LuaError::syntax_at(ls, "msg", token))
 /// Build a syntax error, optionally annotated with the offending token text.
 ///
-/// Corresponds to the static `lexerror` function in `llex.c`.  In C this is
-/// `l_noret` (diverges via `luaD_throw`); in Rust it returns a `LuaError`
-/// value that callers wrap in `Err(...)`.
+/// Returns the constructed [`LuaError`] by value rather than diverging. This is
+/// the lexer's error-construction boundary: the lexer's own callsites wrap it as
+/// `return Err(lex_error(...))`, and `lua-parse` does the same across the crate
+/// boundary, so the by-value return is a deliberate public contract — not a
+/// half-finished translation of a diverging C function. The error text format
+/// (`source:line: message` plus an optional ` near <token>` suffix) is the
+/// behavioural invariant the oracle checks.
 ///
 /// # C source
 /// ```c
@@ -590,8 +592,6 @@ pub fn lex_error(ls: &mut LexState, msg: &[u8], token: i32) -> LuaError {
     LuaError::syntax_raw(&full_msg)
 }
 
-// LUAI_FUNC → pub(crate)
-// error_sites.tsv: luaX_syntaxerror → return Err(LuaError::syntax(format_args!("msg")))
 /// Report a syntax error at the current token.
 ///
 /// # C source
@@ -1069,29 +1069,17 @@ fn read_numeral(
         save_and_next(ls, state)?;
     }
 
-    // In Rust, luaO_str2num will receive a byte slice; NUL is not needed.
-    // We save 0 for parity with C, but our str2num stub ignores it.
     save(ls, state, 0)?;
 
-    //        lexerror(ls, "malformed number", TK_FLT);
-    // macros.tsv: luaZ_buffer → buf.as_mut_slice()
     let buf = ls.buff.as_slice();
-    let num_bytes = if buf.last() == Some(&0) {
-        &buf[..buf.len() - 1]
-    } else {
-        buf
+    let num_bytes = match buf.last() {
+        Some(&0) => &buf[..buf.len() - 1],
+        _ => buf,
     };
-    let mut obj = lua_types::LuaValue::Nil;
-    if lua_vm::object::str2num(num_bytes, &mut obj) == 0 {
-        return Err(lex_error(ls, b"malformed number", TK_FLT));
-    }
-    match obj {
-        lua_types::LuaValue::Int(i) => {
-            // Lua 5.1/5.2 are float-only: `lua_Number` is the only numeric type,
-            // so every numeric literal is parsed as a float (`lua_str2number`),
-            // including ones written without a decimal point. A literal like
-            // 9007199254740993 therefore loses precision exactly as in lua5.2.4
-            // (prints `9.007199254741e+15`), rather than surviving as an i64.
+
+    match parse_numeral(num_bytes) {
+        None => Err(lex_error(ls, b"malformed number", TK_FLT)),
+        Some(lua_types::LuaValue::Int(i)) => {
             if is_float_only(state) {
                 *seminfo = TokenValue::Float(i as f64);
                 Ok(TK_FLT)
@@ -1100,11 +1088,11 @@ fn read_numeral(
                 Ok(TK_INT)
             }
         }
-        lua_types::LuaValue::Float(f) => {
+        Some(lua_types::LuaValue::Float(f)) => {
             *seminfo = TokenValue::Float(f);
             Ok(TK_FLT)
         }
-        _ => unreachable!("str2num returned non-numeric LuaValue"),
+        Some(other) => unreachable!("parse_numeral yielded non-numeric value: {other:?}"),
     }
 }
 
@@ -1852,6 +1840,22 @@ fn llex(
 // from_bytes; once LuaState::intern_str is wired, route through there instead.
 fn intern_str_stub(state: &mut LuaState, bytes: &[u8]) -> Result<GcRef<LuaString>, LuaError> {
     state.intern_str(bytes)
+}
+
+/// Parse numeral bytes into an integer or float value, or `None` if malformed.
+///
+/// Wraps `lua_vm::object::str2num`, whose C-derived calling convention is an
+/// out-parameter plus a `usize` status (`0` = no parse). The lexer never needs
+/// the consumed-byte count — the whole token buffer is the numeral — so this
+/// reduces the convention to an idiomatic `Option<LuaValue>`: `Some(value)` on
+/// a successful parse, `None` on a malformed numeral.
+fn parse_numeral(bytes: &[u8]) -> Option<lua_types::LuaValue> {
+    let mut out = lua_types::LuaValue::Nil;
+    if lua_vm::object::str2num(bytes, &mut out) == 0 {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 // TODO(port): replace with lua_vm::object::hex_value(c) in Phase B.
