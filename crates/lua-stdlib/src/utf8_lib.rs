@@ -20,8 +20,70 @@ const MAX_UTF: u32 = 0x7FFF_FFFF;
 // 31 bits are needed for MAX_UTF; u32 is sufficient on all Rust targets.
 type UtfInt = u32;
 
-// sizeof(UTF8PATT)/sizeof(char) - 1 = 14 bytes (contains an embedded NUL).
+/// The 5.4+ `charpattern` (`lutf8lib.c` `UTF8PATT`): the lead-byte range runs to
+/// `\xFD`, the ceiling for the extended (≤ `MAX_UTF`) range.
+///
+/// Embeds a NUL; length is `sizeof(UTF8PATT)/sizeof(char) - 1`.
 const UTF8_PATT: &[u8] = b"[\x00-\x7F\xC2-\xFD][\x80-\xBF]*";
+
+/// The 5.3 `charpattern`: the lead byte stops at `\xF4`, the ceiling for a
+/// ≤ `MAX_UNICODE` (4-byte) sequence. 5.3's `utf8_decode` has no extended range,
+/// so `lutf8lib.c` (5.3.6) ships this narrower pattern.
+const UTF8_PATT_V53: &[u8] = b"[\x00-\x7F\xC2-\xF4][\x80-\xBF]*";
+
+/// How one UTF-8 sequence is validated, derived once from the version + `lax`
+/// flag (the C `lutf8lib.c` regime differs by family, not just by an argument):
+///
+/// - [`Self::V53`] — the 5.3 regime: cap at `MAX_UNICODE`, accept at most a
+///   4-byte sequence, **never** reject surrogates, and ignore the `lax` argument
+///   entirely (5.3's `utf8_decode` takes no strict/lax parameter).
+/// - [`Self::Strict`] — 5.4+ default: cap at `MAX_UTF` while decoding, then
+///   reject surrogates and values above `MAX_UNICODE`.
+/// - [`Self::Lax`] — 5.4+ extended: cap at `MAX_UTF`, accept any well-formed
+///   sequence including surrogates.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecodeMode {
+    V53,
+    Strict,
+    Lax,
+}
+
+impl DecodeMode {
+    /// The `(max continuation count, max codepoint)` pair the decode loop checks.
+    ///
+    /// 5.3 caps at a 4-byte / `MAX_UNICODE` sequence (no extended range); 5.4+
+    /// allow a 6-byte / `MAX_UTF` sequence and apply the Unicode/surrogate
+    /// ceiling separately via [`Self::rejects_surrogates`].
+    fn length_and_value_ceiling(self) -> (usize, UtfInt) {
+        match self {
+            DecodeMode::V53 => (3, MAX_UNICODE),
+            DecodeMode::Strict | DecodeMode::Lax => (5, MAX_UTF),
+        }
+    }
+
+    /// Whether decoding rejects surrogates and values above `MAX_UNICODE`.
+    ///
+    /// Only the 5.4+ strict (default) regime does: 5.3 never rejects surrogates,
+    /// and the 5.4+ lax regime disables the guard.
+    fn rejects_surrogates(self) -> bool {
+        self == DecodeMode::Strict
+    }
+}
+
+/// Resolve the decode regime for `version` and the user's `lax` flag.
+///
+/// 5.3 is its own regime regardless of `lax`; 5.4+ pick strict-vs-lax from the
+/// flag. This is the single source of truth for the version seam — the callers
+/// never branch on the version for decoding.
+fn decode_mode_for(version: lua_types::LuaVersion, lax: bool) -> DecodeMode {
+    if version == lua_types::LuaVersion::V53 {
+        DecodeMode::V53
+    } else if lax {
+        DecodeMode::Lax
+    } else {
+        DecodeMode::Strict
+    }
+}
 
 // ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -66,10 +128,12 @@ fn is_cont_at(s: &[u8], pos: i64) -> bool {
 /// Returns `None` if the byte sequence is invalid.
 /// Returns `Some((remaining_slice, codepoint))` on success.
 ///
-/// When `strict` is `true`, surrogates and values above `MAX_UNICODE` are
-/// rejected. When `false`, any value ≤ `MAX_UTF` is accepted (extended UTF-8).
+/// `mode` selects the validity regime (see [`DecodeMode`]): the 5.3 path caps at
+/// `MAX_UNICODE` and accepts surrogates; the 5.4+ strict/lax paths cap at
+/// `MAX_UTF` and differ only on surrogate rejection. The continuation-byte
+/// bit-math below is shared and version-free.
 ///
-fn utf8_decode(s: &[u8], strict: bool) -> Option<(&[u8], UtfInt)> {
+fn utf8_decode(s: &[u8], mode: DecodeMode) -> Option<(&[u8], UtfInt)> {
     // LIMITS[count] is the minimum value for a sequence with `count` continuation bytes.
     // LIMITS[0] = u32::MAX forces an error when a non-ASCII byte has no continuation bytes.
     const LIMITS: [UtfInt; 6] = [u32::MAX, 0x80, 0x800, 0x10000, 0x200000, 0x4000000];
@@ -110,8 +174,9 @@ fn utf8_decode(s: &[u8], strict: bool) -> Option<(&[u8], UtfInt)> {
 
         r |= (c & 0x7F) << (count as u32 * 5);
 
-        if count > 5 || r > MAX_UTF || r < LIMITS[count] {
-            return None; // invalid (overlong, too large, or excess continuation bytes)
+        let (max_count, max_value) = mode.length_and_value_ceiling();
+        if count > max_count || r > max_value || r < LIMITS[count] {
+            return None;
         }
 
         res = r;
@@ -121,8 +186,8 @@ fn utf8_decode(s: &[u8], strict: bool) -> Option<(&[u8], UtfInt)> {
         }
     }
 
-    if strict && (res > MAX_UNICODE || (0xD800 <= res && res <= 0xDFFF)) {
-        return None; // surrogate or out-of-Unicode-range value in strict mode
+    if mode.rejects_surrogates() && (res > MAX_UNICODE || (0xD800 <= res && res <= 0xDFFF)) {
+        return None;
     }
 
     Some((&s[advance..], res))
@@ -189,7 +254,9 @@ fn utf_len(state: &mut LuaState) -> Result<usize, LuaError> {
 
     let lax: bool = state.to_boolean(4);
 
-    let is_v53 = state.global().lua_version == lua_types::LuaVersion::V53;
+    let version = state.global().lua_version;
+    let mode = decode_mode_for(version, lax);
+    let is_v53 = version == lua_types::LuaVersion::V53;
     let initial_msg: &[u8] = if is_v53 {
         b"initial position out of string"
     } else {
@@ -218,7 +285,7 @@ fn utf_len(state: &mut LuaState) -> Result<usize, LuaError> {
     let mut n: i64 = 0;
 
     while posi <= posj {
-        match utf8_decode(&s[posi as usize..], !lax) {
+        match utf8_decode(&s[posi as usize..], mode) {
             None => {
                 state.push(LuaValue::Nil); // luaL_pushfail
                 state.push(LuaValue::Int(posi + 1)); // 1-based position of failure
@@ -252,7 +319,9 @@ fn codepoint(state: &mut LuaState) -> Result<usize, LuaError> {
 
     let lax: bool = state.to_boolean(4);
 
-    let bounds_msg: &[u8] = if state.global().lua_version == lua_types::LuaVersion::V53 {
+    let version = state.global().lua_version;
+    let mode = decode_mode_for(version, lax);
+    let bounds_msg: &[u8] = if version == lua_types::LuaVersion::V53 {
         b"out of range"
     } else {
         b"out of bounds"
@@ -282,7 +351,7 @@ fn codepoint(state: &mut LuaState) -> Result<usize, LuaError> {
     let mut count: usize = 0;
 
     while pos < end {
-        match utf8_decode(&s[pos..], !lax) {
+        match utf8_decode(&s[pos..], mode) {
             None => return Err(LuaError::runtime(format_args!("invalid UTF-8 code"))),
             Some((remaining, code)) => {
                 state.push(LuaValue::Int(code as i64));
@@ -473,6 +542,8 @@ fn iter_aux(state: &mut LuaState, strict: bool) -> Result<usize, LuaError> {
     let s: Vec<u8> = state.check_arg_string(1)?.to_vec();
     let len = s.len();
 
+    let mode = decode_mode_for(state.global().lua_version, !strict);
+
     let mut n: u64 = state.to_integer(2).unwrap_or(0) as u64;
 
     if (n as usize) < len {
@@ -486,7 +557,7 @@ fn iter_aux(state: &mut LuaState, strict: bool) -> Result<usize, LuaError> {
     }
 
     //    if (next == NULL || iscontp(next)) return luaL_error(L, MSGInvalid);
-    match utf8_decode(&s[n as usize..], strict) {
+    match utf8_decode(&s[n as usize..], mode) {
         None => Err(lua_vm::debug::c_api_runtime(
             state,
             b"invalid UTF-8 code".to_vec(),
@@ -562,11 +633,18 @@ pub const FUNCS: &[(&[u8], fn(&mut LuaState) -> Result<usize, LuaError>)] = &[
 ///
 /// Registers all functions from `FUNCS` into a new table, then sets
 /// `utf8.charpattern` to the byte-string pattern matching one UTF-8 sequence.
+/// The pattern's lead-byte ceiling is version-split: 5.3 stops at `\xF4`
+/// (≤ `MAX_UNICODE`), 5.4+ extend it to `\xFD` (≤ `MAX_UTF`).
 ///
 pub fn open_utf8(state: &mut LuaState) -> Result<usize, LuaError> {
     state.new_lib(FUNCS)?;
 
-    let patt = state.intern_str(UTF8_PATT)?;
+    let patt_bytes: &[u8] = if state.global().lua_version == lua_types::LuaVersion::V53 {
+        UTF8_PATT_V53
+    } else {
+        UTF8_PATT
+    };
+    let patt = state.intern_str(patt_bytes)?;
     state.push(LuaValue::Str(patt));
 
     state.set_field(-2, b"charpattern")?;
