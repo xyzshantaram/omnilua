@@ -1459,6 +1459,305 @@ fn utf8_encode_stub(codepoint: u32) -> Vec<u8> {
     buf
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lua_types::LuaVersion;
+    use lua_vm::state::new_state;
+
+    /// A `LexState` whose fields are about to be (re)initialised by
+    /// [`set_input`]; only `source`/`envn`/`version` need to be real up front.
+    fn empty_lexstate(source: GcRef<LuaString>, ver: LuaVersion) -> LexState {
+        LexState {
+            current: EOZ,
+            linenumber: 1,
+            lastline: 1,
+            t: Token::eos(),
+            lookahead: Token::eos(),
+            fs: None,
+            z: ZIO::from_bytes(Vec::new()),
+            buff: LexBuffer::new(),
+            h: None,
+            long_str_anchor: std::collections::HashMap::new(),
+            dyd: None,
+            source: source.clone(),
+            envn: source,
+            version: ver,
+        }
+    }
+
+    /// Build a `LexState` over `src` at version `ver` and drive [`next`] until
+    /// [`TK_EOS`], collecting each token. The lexer is exercised end-to-end (the
+    /// same path the parser takes), so these tests pin scanning behaviour without
+    /// the full parser/oracle round-trip.
+    fn lex(ver: LuaVersion, src: &[u8]) -> Vec<Token> {
+        let mut state = new_state().expect("state init");
+        state.global_mut().lua_version = ver;
+
+        let source = state.intern_str(b"@test").expect("intern source");
+        let firstchar = src.first().map_or(EOZ, |&b| b as i32);
+        let rest: Vec<u8> = src.iter().skip(1).copied().collect();
+
+        let mut ls = empty_lexstate(source.clone(), ver);
+        set_input(&mut state, &mut ls, ZIO::from_bytes(rest), source, firstchar)
+            .expect("set_input");
+
+        let mut out = Vec::new();
+        loop {
+            next(&mut state, &mut ls).expect("next");
+            let kind = ls.t.kind;
+            out.push(ls.t.clone());
+            if kind == TK_EOS {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Just the token-kind sequence, dropping the trailing `TK_EOS`.
+    fn kinds(ver: LuaVersion, src: &[u8]) -> Vec<i32> {
+        let mut v = lex(ver, src);
+        v.pop();
+        v.into_iter().map(|t| t.kind).collect()
+    }
+
+    /// Lex `src` and return the bytes of its single string-literal token.
+    fn one_string(ver: LuaVersion, src: &[u8]) -> Vec<u8> {
+        let toks = lex(ver, src);
+        let str_tok = toks
+            .iter()
+            .find(|t| t.kind == TK_STRING)
+            .expect("a string token");
+        match &str_tok.value {
+            TokenValue::Str(s) => s.as_bytes().to_vec(),
+            _ => panic!("string token without Str payload"),
+        }
+    }
+
+    #[test]
+    fn crlf_and_lfcr_pair_into_single_lines() {
+        // Three logical lines joined by CRLF; the `+` lands on line 3, so a
+        // lex error there must report line 3 (CRLF counts as ONE newline).
+        let toks = lex(LuaVersion::V54, b"a\r\nb\r\n+");
+        // a(name) b(name) +  EOS  -> the '+' is a single-byte token on line 3.
+        assert_eq!(toks[0].kind, TK_NAME);
+        assert_eq!(toks[1].kind, TK_NAME);
+        assert_eq!(toks[2].kind, b'+' as i32);
+        // LFCR also pairs.
+        let toks2 = lex(LuaVersion::V54, b"a\n\rb");
+        assert_eq!(toks2[0].kind, TK_NAME);
+        assert_eq!(toks2[1].kind, TK_NAME);
+        assert_eq!(toks2[2].kind, TK_EOS);
+    }
+
+    #[test]
+    fn crlf_line_number_attribution() {
+        // The error message must carry line 3 for a malformed numeral there.
+        let mut state = new_state().expect("state init");
+        state.global_mut().lua_version = LuaVersion::V54;
+        let source = state.intern_str(b"@t").unwrap();
+        let src = b"\r\n\r\n0x".to_vec();
+        let firstchar = src[0] as i32;
+        let rest: Vec<u8> = src.iter().skip(1).copied().collect();
+        let mut ls = empty_lexstate(source.clone(), LuaVersion::V54);
+        set_input(&mut state, &mut ls, ZIO::from_bytes(rest), source, firstchar).unwrap();
+        // `0x` with no hex digits is a malformed numeral on line 3.
+        let err = loop {
+            match next(&mut state, &mut ls) {
+                Ok(()) if ls.t.kind == TK_EOS => panic!("expected a lex error"),
+                Ok(()) => continue,
+                Err(e) => break e,
+            }
+        };
+        let msg = err.message_lossy();
+        assert!(msg.contains(":3:"), "error should be on line 3, got: {msg}");
+        assert!(msg.contains("malformed number"), "got: {msg}");
+    }
+
+    #[test]
+    fn hex_escape_decodes_to_bytes() {
+        assert_eq!(one_string(LuaVersion::V54, br#""\x41\x42""#), b"AB");
+        assert_eq!(one_string(LuaVersion::V54, br#""\x00\xff""#), b"\x00\xff");
+    }
+
+    #[test]
+    fn utf8_escape_encodes_codepoint() {
+        assert_eq!(one_string(LuaVersion::V54, br#""\u{48}\u{49}""#), b"HI");
+        // U+00E9 (é) → two UTF-8 bytes 0xC3 0xA9.
+        assert_eq!(one_string(LuaVersion::V54, br#""\u{e9}""#), b"\xc3\xa9");
+        // A 6-byte (non-strict) sequence is accepted up to 0x7FFFFFFF in 5.4.
+        assert_eq!(
+            one_string(LuaVersion::V54, br#""\u{7FFFFFFF}""#),
+            b"\xFD\xBF\xBF\xBF\xBF\xBF"
+        );
+    }
+
+    #[test]
+    fn decimal_escape_and_z_skip() {
+        assert_eq!(one_string(LuaVersion::V54, br#""\65\66""#), b"AB");
+        // \z swallows the following whitespace run (including newlines).
+        assert_eq!(one_string(LuaVersion::V54, b"\"a\\z   \n\t b\""), b"ab");
+    }
+
+    #[test]
+    fn long_brackets_with_levels() {
+        assert_eq!(one_string(LuaVersion::V54, b"[[ hello ]]"), b" hello ");
+        assert_eq!(one_string(LuaVersion::V54, b"[==[ hi ]==]"), b" hi ");
+        // A leading newline immediately after the open bracket is dropped.
+        assert_eq!(one_string(LuaVersion::V54, b"[[\nx]]"), b"x");
+        // An inner `]=]` that is not the matching close is kept as content.
+        assert_eq!(one_string(LuaVersion::V54, b"[==[a]=]b]==]"), b"a]=]b");
+    }
+
+    #[test]
+    fn long_string_normalizes_newlines() {
+        // CRLF inside a long string is normalized to a single \n.
+        assert_eq!(one_string(LuaVersion::V54, b"[[a\r\nb]]"), b"a\nb");
+    }
+
+    #[test]
+    fn numeral_int_float_boundary() {
+        // Integer literals → TK_INT with the exact i64; floats → TK_FLT.
+        let dec = lex(LuaVersion::V54, b"3");
+        assert_eq!(dec[0].kind, TK_INT);
+        assert!(matches!(dec[0].value, TokenValue::Int(3)));
+
+        let hex = lex(LuaVersion::V54, b"0x10");
+        assert_eq!(hex[0].kind, TK_INT);
+        assert!(matches!(hex[0].value, TokenValue::Int(16)));
+
+        let flt = lex(LuaVersion::V54, b"3.0");
+        assert_eq!(flt[0].kind, TK_FLT);
+        assert!(matches!(flt[0].value, TokenValue::Float(f) if f == 3.0));
+
+        let expo = lex(LuaVersion::V54, b"1e2");
+        assert_eq!(expo[0].kind, TK_FLT);
+        assert!(matches!(expo[0].value, TokenValue::Float(f) if f == 100.0));
+
+        // A bare dot followed by digits is a float; a lone dot is the '.' token.
+        let dotnum = lex(LuaVersion::V54, b".5");
+        assert_eq!(dotnum[0].kind, TK_FLT);
+    }
+
+    #[test]
+    fn float_only_versions_widen_integer_literals() {
+        // 5.1/5.2 have no integer subtype: every numeral lexes as a float.
+        let v51 = lex(LuaVersion::V51, b"3");
+        assert_eq!(v51[0].kind, TK_FLT);
+        assert!(matches!(v51[0].value, TokenValue::Float(f) if f == 3.0));
+
+        let v52 = lex(LuaVersion::V52, b"42");
+        assert_eq!(v52[0].kind, TK_FLT);
+    }
+
+    #[test]
+    fn version_gated_operators() {
+        // `<<` is a 5.3+ token; on 5.4 it is one TK_SHL.
+        assert_eq!(kinds(LuaVersion::V54, b"1 << 2"), vec![TK_INT, TK_SHL, TK_INT]);
+        // On the float-only family it is NOT a token: two bare '<' bytes.
+        assert_eq!(
+            kinds(LuaVersion::V51, b"1 << 2"),
+            vec![TK_FLT, b'<' as i32, b'<' as i32, TK_FLT]
+        );
+        // `//` floor-division: TK_IDIV on 5.4, two '/' on 5.1.
+        assert_eq!(kinds(LuaVersion::V54, b"7 // 2"), vec![TK_INT, TK_IDIV, TK_INT]);
+        assert_eq!(
+            kinds(LuaVersion::V51, b"7 // 2"),
+            vec![TK_FLT, b'/' as i32, b'/' as i32, TK_FLT]
+        );
+        // `::` label delimiter: TK_DBCOLON on 5.4, two ':' on 5.1.
+        assert_eq!(kinds(LuaVersion::V54, b"::x::"), vec![TK_DBCOLON, TK_NAME, TK_DBCOLON]);
+        assert_eq!(
+            kinds(LuaVersion::V51, b"::x"),
+            vec![b':' as i32, b':' as i32, TK_NAME]
+        );
+    }
+
+    #[test]
+    fn version_gated_reserved_words() {
+        // `goto` is a keyword on 5.2+ but a plain name on 5.1.
+        assert_eq!(kinds(LuaVersion::V54, b"goto"), vec![TK_GOTO]);
+        assert_eq!(kinds(LuaVersion::V51, b"goto"), vec![TK_NAME]);
+        // `global` is never reserved — always a name.
+        assert_eq!(kinds(LuaVersion::V55, b"global"), vec![TK_NAME]);
+        assert_eq!(kinds(LuaVersion::V54, b"global"), vec![TK_NAME]);
+        // An ordinary keyword still maps to its TK_* on every version.
+        assert_eq!(kinds(LuaVersion::V54, b"while"), vec![TK_WHILE]);
+        assert_eq!(kinds(LuaVersion::V51, b"while"), vec![TK_WHILE]);
+    }
+
+    #[test]
+    fn multichar_symbols_and_dots() {
+        assert_eq!(kinds(LuaVersion::V54, b"=="), vec![TK_EQ]);
+        assert_eq!(kinds(LuaVersion::V54, b"~="), vec![TK_NE]);
+        assert_eq!(kinds(LuaVersion::V54, b"<="), vec![TK_LE]);
+        assert_eq!(kinds(LuaVersion::V54, b">="), vec![TK_GE]);
+        assert_eq!(kinds(LuaVersion::V54, b".."), vec![TK_CONCAT]);
+        assert_eq!(kinds(LuaVersion::V54, b"..."), vec![TK_DOTS]);
+        // A lone dot is its single-byte token.
+        assert_eq!(kinds(LuaVersion::V54, b"."), vec![b'.' as i32]);
+    }
+
+    #[test]
+    fn comments_emit_no_tokens() {
+        // Short comment to end of line, then a name.
+        assert_eq!(kinds(LuaVersion::V54, b"-- a comment\nx"), vec![TK_NAME]);
+        // Long comment.
+        assert_eq!(kinds(LuaVersion::V54, b"--[[ block\ncomment ]] y"), vec![TK_NAME]);
+    }
+
+    #[test]
+    fn empty_input_is_just_eos() {
+        let toks = lex(LuaVersion::V54, b"");
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0].kind, TK_EOS);
+    }
+
+    #[test]
+    fn peek_maps_byte_and_eoz() {
+        // The internal dispatch shape: a byte maps to Peek::Byte, EOZ to Peek::Eoz.
+        let mut state = new_state().unwrap();
+        let source = state.intern_str(b"@t").unwrap();
+        let mut ls = empty_lexstate(source, LuaVersion::V54);
+        ls.current = b'=' as i32;
+        assert!(matches!(peek(&ls), Peek::Byte(b'=')));
+        ls.current = EOZ;
+        assert!(matches!(peek(&ls), Peek::Eoz));
+    }
+
+    #[test]
+    fn zio_yields_bytes_then_eoz() {
+        let mut z = ZIO::from_bytes(b"ab".to_vec());
+        assert_eq!(z.getc(), b'a' as i32);
+        assert_eq!(z.getc(), b'b' as i32);
+        assert_eq!(z.getc(), EOZ);
+        assert_eq!(z.getc(), EOZ);
+        // An empty source is immediately EOZ.
+        let mut empty = ZIO::from_bytes(Vec::new());
+        assert_eq!(empty.getc(), EOZ);
+    }
+
+    #[test]
+    fn lexbuffer_extraction_helpers() {
+        let mut b = LexBuffer::new();
+        for &c in b"\"hello\"" {
+            b.push_byte(c);
+        }
+        assert_eq!(b.trim_ends(1), b"hello");
+        assert_eq!(b.to_owned_text(), b"\"hello\"");
+        // Too-short buffer for the requested delimiter width → empty content.
+        let mut tiny = LexBuffer::new();
+        tiny.push_byte(b'"');
+        assert_eq!(tiny.trim_ends(1), b"");
+        // Trailing-NUL trim drops exactly one sentinel.
+        let mut num = LexBuffer::new();
+        for &c in b"123\0" {
+            num.push_byte(c);
+        }
+        assert_eq!(num.without_trailing_nul(), b"123");
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // PORT STATUS
 //   source:        originally ported from src/llex.c + src/llex.h; the C
