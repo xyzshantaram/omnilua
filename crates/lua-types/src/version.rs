@@ -56,6 +56,13 @@ impl LuaVersion {
         }
     }
 
+    /// Whether the `__name` metafield overrides an object's type name (in
+    /// `tostring` and in type-error messages). `__name` is a 5.3 addition; 5.1
+    /// and 5.2 ignore it and always report the primitive type name.
+    pub fn honors_name_metafield(self) -> bool {
+        !matches!(self, LuaVersion::V51 | LuaVersion::V52)
+    }
+
     /// Whether this version has a real backend. The modern family (5.3/5.4/5.5)
     /// and 5.2 (float-only + `_ENV`) are complete. 5.1 reuses the 5.2 float-only
     /// core plus three faithful 5.1-specific axes:

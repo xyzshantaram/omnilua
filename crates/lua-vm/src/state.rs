@@ -4194,20 +4194,25 @@ impl LuaState {
         g.current_thread_id == g.main_thread_id
     }
     pub fn obj_type_name<'v>(&self, v: &'v LuaValue) -> std::borrow::Cow<'static, [u8]> {
+        let honors_name = self.global().lua_version.honors_name_metafield();
         match v {
             LuaValue::LightUserData(_) => std::borrow::Cow::Borrowed(b"light userdata"),
             LuaValue::Table(t) => {
-                if let Some(mt) = t.metatable() {
-                    if let LuaValue::Str(s) = mt.get_str_bytes(b"__name") {
-                        return std::borrow::Cow::Owned(s.as_bytes().to_vec());
+                if honors_name {
+                    if let Some(mt) = t.metatable() {
+                        if let LuaValue::Str(s) = mt.get_str_bytes(b"__name") {
+                            return std::borrow::Cow::Owned(s.as_bytes().to_vec());
+                        }
                     }
                 }
                 std::borrow::Cow::Borrowed(crate::tagmethods::type_name(v.base_type()))
             }
             LuaValue::UserData(u) => {
-                if let Some(mt) = u.metatable() {
-                    if let LuaValue::Str(s) = mt.get_str_bytes(b"__name") {
-                        return std::borrow::Cow::Owned(s.as_bytes().to_vec());
+                if honors_name {
+                    if let Some(mt) = u.metatable() {
+                        if let LuaValue::Str(s) = mt.get_str_bytes(b"__name") {
+                            return std::borrow::Cow::Owned(s.as_bytes().to_vec());
+                        }
                     }
                 }
                 std::borrow::Cow::Borrowed(crate::tagmethods::type_name(v.base_type()))
