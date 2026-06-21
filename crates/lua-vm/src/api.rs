@@ -1992,7 +1992,12 @@ pub fn load(
         let top = state.top_idx();
         let func_val = state.get_at(top - 1);
         if let LuaValue::Function(LuaClosure::Lua(lcl)) = func_val {
-            if !lcl.upvals.is_empty() {
+            let inject_env = if state.global().lua_version == lua_types::LuaVersion::V52 {
+                lcl.upvals.len() == 1
+            } else {
+                !lcl.upvals.is_empty()
+            };
+            if inject_env {
                 let gt = get_global_table(state);
                 let uv = state.new_upval_closed(gt);
                 lcl.set_upval(0, uv);
