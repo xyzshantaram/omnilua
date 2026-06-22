@@ -2314,11 +2314,33 @@ pub fn lua_error(state: &mut LuaState) -> Result<Infallible, LuaError> {
     }
 }
 
+/// Normalize an integer-valued float resumption key to its integer key on the
+/// float-only number model (5.1/5.2).
+///
+/// Those versions have no integer subtype, so a loop variable used as a table
+/// key arrives as `Float(k.0)` while `new_key` stored it as `Int(k)` (key
+/// normalization runs on every version). Without this the `next` resumption key
+/// would miss the stored key and raise `invalid key to 'next'`. The dual-number
+/// versions (5.3+) must NOT normalize here: reference Lua errors on `next(t, 2.0)`
+/// against an integer key, and that fidelity is preserved by leaving the key as-is.
+fn normalize_float_only_next_key(state: &LuaState, key: LuaValue) -> LuaValue {
+    if state.global().lua_version.number_model() != lua_types::NumberModel::FloatOnly {
+        return key;
+    }
+    if let LuaValue::Float(f) = key {
+        let k = f as i64;
+        if k as f64 == f {
+            return LuaValue::Int(k);
+        }
+    }
+    key
+}
+
 pub fn next(state: &mut LuaState, idx: i32) -> Result<bool, LuaError> {
     let t = get_table_value(state, idx)
         .ok_or_else(|| LuaError::runtime(format_args!("table expected")))?;
     let top = state.top_idx();
-    let key = state.get_at(top - 1);
+    let key = normalize_float_only_next_key(state, state.get_at(top - 1));
     match t.next(key)? {
         Some((next_key, next_val)) => {
             state.set_at(top - 1, next_key);

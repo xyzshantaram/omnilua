@@ -3694,14 +3694,15 @@ impl LuaState {
     /// reference on any path that inspects the subtype.
     pub fn str_to_num(&mut self, s: &[u8]) -> Option<(LuaValue, usize)> {
         let mut out = LuaValue::Nil;
-        let sz = crate::object::str2num(s, &mut out);
+        let float_only =
+            self.global().lua_version.number_model() == lua_types::NumberModel::FloatOnly;
+        let sz = if float_only {
+            crate::object::str2num_float_only(s, &mut out)
+        } else {
+            crate::object::str2num(s, &mut out)
+        };
         if sz == 0 {
             return None;
-        }
-        if self.global().lua_version.number_model() == lua_types::NumberModel::FloatOnly {
-            if let LuaValue::Int(i) = out {
-                out = LuaValue::Float(i as f64);
-            }
         }
         Some((out, sz))
     }

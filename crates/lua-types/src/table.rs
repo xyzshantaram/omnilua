@@ -595,20 +595,6 @@ impl TableInner {
         if matches!(key, LuaValue::Nil) {
             return Ok(0);
         }
-        let normalised_key;
-        let key = match key {
-            LuaValue::Float(f) => {
-                let f = *f;
-                let k = f as i64;
-                if k as f64 == f {
-                    normalised_key = LuaValue::Int(k);
-                    &normalised_key
-                } else {
-                    key
-                }
-            }
-            _ => key,
-        };
         let i = if let LuaValue::Int(k) = key {
             Self::array_index(*k)
         } else {
