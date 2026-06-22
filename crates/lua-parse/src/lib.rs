@@ -2059,6 +2059,21 @@ fn mark_vararg_table_needed(fs: &mut FuncState) {
     }
 }
 
+/// Lua 5.1 only: clear the K bit on this function's `arg`-building VARARGPACK so
+/// the VM skips materializing the implicit `arg` table. Mirrors lparser.c's
+/// `fs->f->is_vararg &= ~VARARG_NEEDSARG` at the `...` callsite: when the body
+/// actually uses `...`, stock 5.1 leaves `arg` declared but never fills it.
+fn clear_arg_table_needed(fs: &mut FuncState) {
+    for inst in fs.f.code.iter_mut() {
+        let mut op = lua_code::opcodes::Instruction(inst.raw());
+        if op.opcode() == Some(lua_code::opcodes::OpCode::VarArgPack) {
+            op.set_arg_k(0);
+            *inst = lua_types::opcode::Instruction::new(op.0);
+            break;
+        }
+    }
+}
+
 /// Minimal `luaK_exp2anyreg`: ensure `e` ends up in *some* register. If `e`
 /// is already `VNONRELOC` and its register is at or above `nactvar`, keep it
 /// there; otherwise discharge to the next free register.
@@ -4383,8 +4398,15 @@ fn parlist(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
     // Pre-5.5 versions do not reserve that local, and a name after `...` stays
     // a parse error because the loop breaks as soon as it sees `...`.
     let is_v55 = state.global().lua_version == lua_types::LuaVersion::V55;
+    // Lua 5.1 (`LUA_COMPAT_VARARG`) gives every vararg function an implicit local
+    // named `arg`, a `table.pack`-style table of the extra arguments (`arg.n` is
+    // the count). It is declared as an ordinary local right after the fixed
+    // parameters, mirroring `parlist`'s `new_localvarliteral(ls, "arg", ...)`
+    // plus `VARARG_HASARG | VARARG_NEEDSARG`. 5.2 removed it, so this is V51-only.
+    let is_v51 = state.global().lua_version == lua_types::LuaVersion::V51;
     let mut has_vararg_local = false;
     let mut has_vararg_name = false;
+    let mut has_arg_local = false;
     let mut vararg_name_vidx: Option<i32> = None;
     if ls.t.token != b')' as TokenKind {
         loop {
@@ -4411,6 +4433,11 @@ fn parlist(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
                         let name = state.intern_str(b"(vararg table)")?;
                         new_local_var(ls, state, name)?;
                         has_vararg_local = true;
+                    } else if is_v51 {
+                        let name = state.intern_str(b"arg")?;
+                        new_local_var(ls, state, name)?;
+                        has_vararg_local = true;
+                        has_arg_local = true;
                     }
                 }
                 _ => {
@@ -4456,6 +4483,24 @@ fn parlist(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
         // Record the vararg-table register so `OP_VARARG` unpacks live from this
         // table (shared storage), making `t` mutations visible through `...`.
         ls.fs.as_mut().unwrap().f.vararg_table_reg = Some(reg as u8);
+    }
+    // Materialize the Lua 5.1 implicit `arg` table the same way, but with the K
+    // bit set so VARARGPACK builds the table unconditionally at entry (it is the
+    // default; `simpleexp`'s `...` arm clears the bit when the body actually uses
+    // `...`, matching C's `is_vararg &= ~VARARG_NEEDSARG`). Unlike the 5.5 named
+    // form, `arg` is an ordinary local with no `vararg_table_reg` aliasing, so
+    // `...` keeps reading the raw extra args independently of `arg`.
+    if has_arg_local {
+        let reg = nvarstack(ls, ls.fs.as_ref().unwrap()) - 1;
+        let inst = lua_code::opcodes::Instruction::abck(
+            lua_code::opcodes::OpCode::VarArgPack,
+            reg as u32,
+            0,
+            0,
+            1,
+        );
+        let line = ls.fs.as_ref().unwrap().previousline;
+        emit_inst(ls.fs.as_mut().unwrap(), line, inst);
     }
     Ok(())
 }
@@ -4719,6 +4764,9 @@ fn simpleexp(ls: &mut LexState, state: &mut LuaState, v: &mut ExprDesc) -> Resul
                     &mut ls.lex,
                     b"cannot use '...' outside a vararg function",
                 ));
+            }
+            if state.global().lua_version == lua_types::LuaVersion::V51 {
+                clear_arg_table_needed(ls.fs.as_mut().unwrap());
             }
             let line = ls.lastline;
             let inst =
