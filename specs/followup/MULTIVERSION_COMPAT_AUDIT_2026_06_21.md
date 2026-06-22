@@ -383,3 +383,11 @@ Precise remaining diagnoses captured for: gc weak-value clear ordering (state.rs
 - **db/errors wording** (debug.rs+auxlib.rs): flipped **db.lua@5.2**; 4 version-gated wording fixes (5.2 unqualified traceback name, metamethod `__`-prefix per version, 5.1 nups excludes synthetic _ENV, 5.4+-only call-error attribution). db.lua@5.1 advanced 184→279. errors.lua chains blocked on lua-parse (5.1 empty-statement `;`, 5.2/5.3 CALL line attribution).
 
 Tally: 5.1 52%, 5.2 **83%**, 5.3 85%, 5.4/5.5 100%. Next: lua-parse (errors.lua on 3 versions) + finalizer (gc.lua trace_impls/api.rs).
+
+### Iteration-speed audit (2026-06-22)
+
+Measured the agent inner loop to kill slow loops:
+- **Warm edit→build→snippet is already ~1.1s** — `cargo build -p omnilua-cli` after editing *any* crate (even root `lua-types`) is ~0.8–0.9s; `diff_one.sh` is 0.2s. Not the bottleneck. (A per-crate `cargo test -p lua-vm --no-run` is *slower* at 3.5s — building the inline-test harness exceeds the thin CLI binary — so do NOT switch the inner loop to per-crate tests.)
+- **The killer was the 60s hang timeout.** Exactly one file hangs: **db.lua@5.3** (infinite loop — the `repeat until name` / CIST_FIN finalizer-frame-level bug). Every progress re-run ate the full 60–65s; everything else fails fast (0.0s). 10 reruns = 10+ wasted minutes on one file.
+- **Fix:** `harness/quick_file.sh <ver> <base>` — whole-file check with an 8s cap, classifying PASS / FAIL\<msg\> / HANG. A HANG is a "still failing" signal; never wait 60s for it. Develop on `diff_one` snippets (0.2s); use quick_file for occasional advance checks; only the final gate uses the long timeout. Each worktree has its own `target/` (cold build once per agent) and `[profile.dev] opt-level=1` is deliberate (keeps the debug binary fast enough to run the oracle) — left as-is.
+- **Known inner-loop quarantine:** db.lua@5.3 hangs until the CIST_FIN finalizer-frame fix lands; treat its timeout as FAIL, don't grind against it.
