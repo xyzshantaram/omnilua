@@ -2238,6 +2238,19 @@ pub struct LuaState {
     // types.tsv: lua_State.openupval → Vec<GcRef<UpVal>>
     pub openupval: Vec<GcRef<UpVal>>,
 
+    /// Per-thread mirror of C 5.3's per-open-upvalue `touched` flag
+    /// (`lfunc.h` `UpVal.u.open.touched`). Set when this thread creates or
+    /// writes an open upvalue; consulted only by the legacy (5.1/5.2/5.3)
+    /// `remarkupvals` pass in [`trace_reachable_threads`]. In those versions
+    /// an unmarked thread's touched open upvalues have their values re-marked
+    /// **once** during the atomic phase, then the flag is cleared (mirroring
+    /// C clearing `touched` and dropping the thread from `g->twups`). This is
+    /// what makes a cycle reachable only through a suspended thread survive
+    /// one extra collection before being finalized. From 5.4 the C condition
+    /// became `!iswhite(uv)` instead of `touched`, so this flag is never read
+    /// for modern versions and the baked 5.4/5.5 behavior is unchanged.
+    pub legacy_open_upval_touched: std::cell::Cell<bool>,
+
     // types.tsv: lua_State.tbclist → Vec<StackIdx>
     pub tbclist: Vec<StackIdx>,
 
@@ -3261,6 +3274,7 @@ impl LuaState {
     /// Allocate an open upvalue referring to a thread's stack slot.
     pub fn new_upval_open(&mut self, thread_id: usize, level: StackIdx) -> GcRef<UpVal> {
         self.mark_gc_check_needed();
+        self.legacy_open_upval_touched.set(true);
         GcRef::new(UpVal::open(thread_id, level))
     }
     /// Mirrors `luaS_newlstr`: short strings are interned globally so equal
@@ -4473,6 +4487,8 @@ fn trace_reachable_threads(
         }
     }
 
+    remark_legacy_open_upvalues(global, marker);
+
     #[cfg(debug_assertions)]
     debug_assert!(
         uncovered_borrowed.len() <= global.suspended_parent_stacks.len(),
@@ -4486,6 +4502,84 @@ fn trace_reachable_threads(
         uncovered_borrowed,
         global.suspended_parent_stacks.len()
     );
+}
+
+/// Legacy (5.1/5.2/5.3) `remarkupvals` (lgc.c). After the main mark phase has
+/// settled which threads are reachable, an unmarked thread's *touched* open
+/// upvalues have their pointed-to stack values re-marked exactly once, then the
+/// thread's touched flag is cleared — mirroring C marking each touched upvalue's
+/// value and removing the thread from `g->twups`.
+///
+/// This re-mark resurrects an object reachable only through a suspended thread's
+/// cycle for one extra collection. Concretely, a `co <-> closure <-> table`
+/// cycle with a `__gc` on the table is *not* finalized after the first
+/// `collectgarbage()` (the touched open upvalue keeps the table marked, and the
+/// table transitively re-marks the thread); on the next collection the flag is
+/// already cleared, nothing re-marks the table, and it is separated to be
+/// finalized. That two-collection delay is exactly what 5.3's `gc.lua` asserts
+/// (`assert(not collected)` after the first collect).
+///
+/// From 5.4 the C condition became `!iswhite(uv)` rather than `touched`, so a
+/// white open upvalue on an unmarked thread is never re-marked and the same
+/// cycle is finalized after a single collect. Modern versions therefore skip
+/// this pass entirely, leaving the baked 5.4/5.5 behavior untouched.
+fn remark_legacy_open_upvalues(global: &GlobalState, marker: &mut lua_gc::Marker) {
+    use lua_gc::Trace;
+
+    let legacy = matches!(
+        global.lua_version,
+        lua_types::LuaVersion::V51 | lua_types::LuaVersion::V52 | lua_types::LuaVersion::V53
+    );
+    if !legacy {
+        return;
+    }
+
+    let mut remarked_any = false;
+    for (id, entry) in global.threads.iter() {
+        if entry.value.id != *id {
+            continue;
+        }
+        if thread_entry_marked_alive(marker, *id, entry) {
+            continue;
+        }
+        let Ok(thread) = entry.state.try_borrow() else {
+            continue;
+        };
+        if thread.openupval.is_empty() || !thread.legacy_open_upval_touched.get() {
+            continue;
+        }
+        thread.legacy_open_upval_touched.set(false);
+        for uv in thread.openupval.iter() {
+            let Some((_tid, idx)) = uv.try_open_payload() else {
+                continue;
+            };
+            let slot = idx.0 as usize;
+            if slot < thread.stack.len() {
+                thread.stack[slot].val.trace(marker);
+                remarked_any = true;
+            }
+        }
+    }
+
+    if !remarked_any {
+        return;
+    }
+    marker.drain_gray_queue();
+
+    loop {
+        let visited_before = marker.visited_count();
+        for (id, entry) in global.threads.iter() {
+            if thread_entry_marked_alive(marker, *id, entry) {
+                if let Ok(thread) = entry.state.try_borrow() {
+                    thread.trace(marker);
+                }
+            }
+        }
+        marker.drain_gray_queue();
+        if marker.visited_count() == visited_before {
+            break;
+        }
+    }
 }
 
 fn thread_entry_marked_alive(
@@ -5926,6 +6020,7 @@ pub fn new_thread(state: &mut LuaState, initial_body: Option<LuaValue>) -> Resul
         ci: CallInfoIdx(0),
         call_info: Vec::new(),
         openupval: Vec::new(),
+        legacy_open_upval_touched: std::cell::Cell::new(false),
         tbclist: Vec::new(),
         global: global_rc.clone(),
         hook: None,
@@ -6234,6 +6329,7 @@ pub fn new_state() -> Option<LuaState> {
         ci: CallInfoIdx(0),
         call_info: Vec::new(),
         openupval: Vec::new(),
+        legacy_open_upval_touched: std::cell::Cell::new(false),
         tbclist: Vec::new(),
         global: global_rc.clone(),
         hook: None,
