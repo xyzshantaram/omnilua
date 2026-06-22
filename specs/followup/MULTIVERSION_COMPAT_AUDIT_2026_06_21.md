@@ -425,3 +425,8 @@ Tally: 5.1 **62%** (13/21), 5.2 100%, 5.3 **93%** (25/27), 5.4 100%, 5.5 100%.
 - **closure.lua@5.1** documented-no-edit: true first divergence is `setfenv(0,a)` in a coroutine clobbering shared `GlobalState.globals`; needs per-thread `l_gt` (state.rs + base.rs + api.rs + load path).
 Tally: 5.1 **71%** (15/21), 5.2 100%, 5.3 93%, 5.4 100%, 5.5 100%.
 Remaining 5.1 (6, all cross-crate, all V51-gated-safe): calls (reader F6), closure + locals (5.1 fenv/per-thread-env model), db@336 (tail-call frame synthesis), errors (xpcall+stackoverflow hang), gc@228 (collect-time userdata finalizability).
+
+### Loop wave 9 (2026-06-22) — 5.1 to 81%
+- **closure.lua@5.1 + locals.lua@5.1** both flipped: completed the 5.1 fenv environment model (V51-only). (A) per-thread `l_gt` via `GlobalState.thread_globals` (coroutine `setfenv(0,t)` no longer clobbers main globals; `get_global_table` resolves through the running thread); (B) per-closure env via `GlobalState.closure_envs` (closures with no `_ENV` upvalue can still carry a `setfenv` env). Both side-maps are GC roots, pruned after collection, inert on 5.2-5.5.
+Tally: 5.1 **81%** (17/21), 5.2 100%, 5.3 93%, 5.4 100%, 5.5 100%.
+Remaining 5.1 (4): db@336 (tail-call frame synthesis), gc@228 (collect-time userdata finalizability), calls@250 (reader-streaming F6, 10-file — supervised), errors (xpcall+C-stack-overflow hang — supervised).
