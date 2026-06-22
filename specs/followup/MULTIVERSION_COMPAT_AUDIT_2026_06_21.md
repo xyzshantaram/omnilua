@@ -397,3 +397,12 @@ Measured the agent inner loop to kill slow loops:
 - **proto-cache trace**: flipped **gc.lua@5.2** (drop white proto.cache, C traverseproto fidelity); gc.lua@5.3 advanced 428→502.
 Tally: 5.1 52%, 5.2 **88%**, 5.3 **89%**, 5.4/5.5 100%.
 New known hang: errors.lua@5.1 (xpcall+C-stack-overflow+traceback loop on legacy path). Remaining VM-side links: db.lua@5.1 getlocal base-shift (debug.rs/tagmethods adjust_varargs), gc.lua@5.1:228 collect-time userdata finalizability + gc.lua@5.3:502 coroutine-cycle finalization (state.rs), errors.lua@5.2:352 lexer invalid-byte token name (lua-lex).
+
+### Loop wave 5 (2026-06-22) — 5.2 reaches 100%
+- **errors.lua@5.2** flipped (lexer: 5.2 invalid-byte near-token `char(N)` vs 5.3+ `<\N>`).
+- **nextvar.lua@5.1+5.2** flipped (float-only next-key normalization, version-gated in `api::next`; reverted an unconditional table.rs normalization that regressed 5.4/5.5 `next(t,2.0)`).
+- **math.lua@5.2** flipped (oversized-hex `tonumber` via float-only `str2num_float_only`, strtod-only like 5.1/5.2; 5.3+ keep wrapped Int).
+- Wave ran in ~8 min (fast-loop rule working).
+
+**MILESTONE: 5.2, 5.4, 5.5 all at 100% (0 our-bugs).** Tally: 5.1 **57%** (12/21), 5.2 **100%**, 5.3 **89%** (24/27), 5.4 100%, 5.5 100%.
+Remaining: 5.3 (3) = files@415, gc@502 (coroutine-cycle finalization, state.rs), all@131 (harness cwd); 5.1 (9) = calls/closure/db/errors(hang)/events/files/gc/locals/vararg + the documented VM-side links (getlocal base-shift, collect-time userdata finalizability, metamethod same-ref, reader streaming).
