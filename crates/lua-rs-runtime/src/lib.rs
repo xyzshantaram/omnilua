@@ -3678,6 +3678,67 @@ impl Function {
     }
 }
 
+impl Table {
+    /// Append `value` at position `#t + 1` (like `table.insert(t, value)`).
+    pub fn push<V: IntoLua>(&self, value: V) -> Result<()> {
+        let n = self.len()?;
+        self.raw_set(n + 1, value)
+    }
+
+    /// Insert `value` at 1-based `pos`, shifting later elements up by one (like
+    /// `table.insert(t, pos, value)`). `pos` must be in `1..=#t + 1`.
+    pub fn insert<V: IntoLua>(&self, pos: u64, value: V) -> Result<()> {
+        let n = self.len()?;
+        if pos < 1 || pos > n + 1 {
+            return Err(LuaError::runtime(format_args!(
+                "bad position {pos} to 'insert' (out of bounds)"
+            ))
+            .into());
+        }
+        let mut i = n;
+        while i >= pos {
+            let moved: Value = self.raw_get(i)?;
+            self.raw_set(i + 1, moved)?;
+            i -= 1;
+        }
+        self.raw_set(pos, value)
+    }
+
+    /// Remove and return the element at 1-based `pos`, shifting later elements
+    /// down by one (like `table.remove(t, pos)`). Returns `nil` when `pos` is
+    /// outside `1..=#t`.
+    pub fn remove(&self, pos: u64) -> Result<Value> {
+        let n = self.len()?;
+        if n == 0 || pos < 1 || pos > n {
+            return Ok(Value::Nil);
+        }
+        let removed: Value = self.raw_get(pos)?;
+        let mut i = pos;
+        while i < n {
+            let moved: Value = self.raw_get(i + 1)?;
+            self.raw_set(i, moved)?;
+            i += 1;
+        }
+        self.raw_set(n, Value::Nil)?;
+        Ok(removed)
+    }
+
+    /// Remove and return the last element (like `table.remove(t)`); `nil` when
+    /// the table is empty.
+    pub fn pop(&self) -> Result<Value> {
+        let n = self.len()?;
+        self.remove(n)
+    }
+
+    /// Remove every key, leaving the table empty.
+    pub fn clear(&self) -> Result<()> {
+        for (k, _v) in self.raw_pairs()? {
+            self.raw_set(k, Value::Nil)?;
+        }
+        Ok(())
+    }
+}
+
 fn coerce_int(dst: &Lua, i: i64) -> Value {
     match dst.version().number_model() {
         NumberModel::FloatOnly => Value::Number(i as f64),
