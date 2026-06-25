@@ -214,8 +214,11 @@ impl From<Error> for LuaError {
 }
 
 impl fmt::Display for Error {
+    /// Render the human-readable error payload (via [`LuaError::message_lossy`]),
+    /// not the `Debug` form — so `format!("{err}")` gives an embedder the message
+    /// text (e.g. `input:1: boom`) rather than `Runtime(Str(GcRef(..)))`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.inner, f)
+        f.write_str(&self.inner.message_lossy())
     }
 }
 
@@ -1693,6 +1696,35 @@ impl Chunk {
             .map(|raw| Value::from_raw(&self.lua, raw))
             .collect::<Result<Vec<_>>>()?;
         T::from_lua_multi(values, &self.lua)
+    }
+
+    /// Compile this chunk once into a reusable [`Function`] without running it.
+    ///
+    /// `exec`/`eval` parse the source on every call; `into_function` parses and
+    /// compiles a single time, so the resulting function can be invoked many
+    /// times (each call re-runs the chunk's top level with the supplied
+    /// arguments bound to `...`). A syntax error surfaces here, at compile time,
+    /// rather than on each call.
+    pub fn into_function(self) -> Result<Function> {
+        let raw = self.lua.with_state(|state| {
+            let saved_top = state.top_idx();
+            let status = load_buffer(state, &self.source, &self.name)
+                .map_err(|err| self.lua.capture_error_in_state(state, err))?;
+            if status != 0 {
+                let err = state.pop();
+                let captured =
+                    self.lua.capture_error_in_state(state, LuaError::from_value(err));
+                state.set_top_idx(saved_top);
+                return Err(captured);
+            }
+            let raw = state.pop();
+            state.set_top_idx(saved_top);
+            Ok(raw)
+        })?;
+        match Value::from_raw(&self.lua, raw)? {
+            Value::Function(f) => Ok(f),
+            other => Err(type_error_value(&other, "function")),
+        }
     }
 }
 
@@ -3451,6 +3483,265 @@ fn scoped_userdata_invalid_error() -> Error {
 
 fn integer_out_of_range_error() -> Error {
     Error::from(LuaError::runtime(format_args!("integer out of range")))
+}
+
+/// The object identity of a reference-typed raw value, as a `usize` token —
+/// the same mapping `lua_topointer` uses. Reference types (string, table,
+/// function, userdata, thread, light userdata) yield `Some`; the value types
+/// (nil, boolean, integer, number) yield `None` because they have no identity.
+fn raw_value_pointer(raw: &RawLuaValue) -> Option<usize> {
+    match raw {
+        RawLuaValue::Function(RawLuaClosure::LightC(f)) => Some(*f as usize),
+        RawLuaValue::LightUserData(p) => Some(*p as usize),
+        RawLuaValue::Str(s) => Some(GcRef::identity(s)),
+        RawLuaValue::Table(t) => Some(GcRef::identity(t)),
+        RawLuaValue::Function(RawLuaClosure::Lua(f)) => Some(GcRef::identity(f)),
+        RawLuaValue::Function(RawLuaClosure::C(f)) => Some(GcRef::identity(f)),
+        RawLuaValue::UserData(u) => Some(GcRef::identity(u)),
+        RawLuaValue::Thread(t) => Some(GcRef::identity(t)),
+        _ => None,
+    }
+}
+
+/// Resolve a handle's underlying object identity. Errors only if the rooted
+/// value is somehow not a reference type, which would mean a corrupted handle.
+fn handle_pointer(root: &RootedValue, expected: &str) -> Result<usize> {
+    let raw = root.raw()?;
+    raw_value_pointer(&raw).ok_or_else(|| type_error_raw(&raw, expected))
+}
+
+impl Table {
+    /// A stable identity token for this table: equal across every handle that
+    /// refers to the same underlying table, distinct between different tables.
+    /// Mirrors `lua_topointer`. Usable as a `HashMap`/`HashSet` key for
+    /// "is this the same object" lookups — e.g. cycle detection when walking a
+    /// table graph.
+    pub fn to_pointer(&self) -> Result<usize> {
+        handle_pointer(&self.root, "table")
+    }
+}
+
+impl PartialEq for Table {
+    fn eq(&self, other: &Self) -> bool {
+        matches!((self.to_pointer(), other.to_pointer()), (Ok(a), Ok(b)) if a == b)
+    }
+}
+
+impl Eq for Table {}
+
+impl Function {
+    /// A stable identity token for this function. See [`Table::to_pointer`].
+    pub fn to_pointer(&self) -> Result<usize> {
+        handle_pointer(&self.root, "function")
+    }
+}
+
+impl PartialEq for Function {
+    fn eq(&self, other: &Self) -> bool {
+        matches!((self.to_pointer(), other.to_pointer()), (Ok(a), Ok(b)) if a == b)
+    }
+}
+
+impl Eq for Function {}
+
+impl Thread {
+    /// A stable identity token for this thread. See [`Table::to_pointer`].
+    pub fn to_pointer(&self) -> Result<usize> {
+        handle_pointer(&self.root, "thread")
+    }
+}
+
+impl PartialEq for Thread {
+    fn eq(&self, other: &Self) -> bool {
+        matches!((self.to_pointer(), other.to_pointer()), (Ok(a), Ok(b)) if a == b)
+    }
+}
+
+impl Eq for Thread {}
+
+impl AnyUserData {
+    /// A stable identity token for this userdata. See [`Table::to_pointer`].
+    pub fn to_pointer(&self) -> Result<usize> {
+        handle_pointer(&self.root, "userdata")
+    }
+}
+
+impl PartialEq for AnyUserData {
+    fn eq(&self, other: &Self) -> bool {
+        matches!((self.to_pointer(), other.to_pointer()), (Ok(a), Ok(b)) if a == b)
+    }
+}
+
+impl Eq for AnyUserData {}
+
+impl LuaString {
+    /// A stable identity token for the interned string object. Note that string
+    /// *equality* ([`PartialEq`]) compares bytes, not identity, matching Lua's
+    /// `==` on strings.
+    pub fn to_pointer(&self) -> Result<usize> {
+        handle_pointer(&self.root, "string")
+    }
+}
+
+impl PartialEq for LuaString {
+    fn eq(&self, other: &Self) -> bool {
+        matches!((self.as_bytes(), other.as_bytes()), (Ok(a), Ok(b)) if a == b)
+    }
+}
+
+impl Eq for LuaString {}
+
+impl Value {
+    /// The object identity of this value as a `usize`, or `None` for the value
+    /// types (nil, boolean, integer, number) that have no identity. Mirrors
+    /// `lua_topointer`.
+    pub fn to_pointer(&self) -> Result<Option<usize>> {
+        Ok(match self {
+            Value::Table(t) => Some(t.to_pointer()?),
+            Value::Function(f) => Some(f.to_pointer()?),
+            Value::String(s) => Some(s.to_pointer()?),
+            Value::UserData(u) => Some(u.to_pointer()?),
+            Value::Thread(t) => Some(t.to_pointer()?),
+            Value::LightUserData(p) => Some(*p as usize),
+            _ => None,
+        })
+    }
+}
+
+impl Lua {
+    /// The Lua registry table — a store that scripts cannot reach (unlike
+    /// globals), used to hold host-owned values across calls.
+    fn registry_table(&self) -> Result<Table> {
+        let raw = self.with_state(|state| state.registry_value());
+        match Value::from_raw(self, raw)? {
+            Value::Table(t) => Ok(t),
+            other => Err(type_error_value(&other, "table")),
+        }
+    }
+
+    /// Store a value in the registry under a string name, where scripts cannot
+    /// see it. Retrieve it later with [`Lua::named_registry_value`]. Because
+    /// handles root themselves, this also keeps the value alive across calls.
+    pub fn set_named_registry_value<V: IntoLua>(
+        &self,
+        name: impl AsRef<[u8]>,
+        value: V,
+    ) -> Result<()> {
+        self.registry_table()?.raw_set(name.as_ref(), value)
+    }
+
+    /// Read a value previously stored with [`Lua::set_named_registry_value`].
+    /// A name that was never set (or was cleared) reads as `nil`.
+    pub fn named_registry_value<V: FromLua>(&self, name: impl AsRef<[u8]>) -> Result<V> {
+        self.registry_table()?.raw_get(name.as_ref())
+    }
+
+    /// Remove a value from the registry, allowing it to be collected.
+    pub fn unset_named_registry_value(&self, name: impl AsRef<[u8]>) -> Result<()> {
+        self.registry_table()?.raw_set(name.as_ref(), Value::Nil)
+    }
+}
+
+fn coerce_int(dst: &Lua, i: i64) -> Value {
+    match dst.version().number_model() {
+        NumberModel::FloatOnly => Value::Number(i as f64),
+        NumberModel::Dual => Value::Integer(i),
+    }
+}
+
+/// Wrap a function living in `src` as a function callable in `dst`. Invoking it
+/// marshals the arguments back into `src`, calls the original, and marshals the
+/// results forward into `dst`.
+fn bridge_function(dst: &Lua, src: &Lua, f: Function) -> Result<Function> {
+    let src = src.clone();
+    dst.create_function(move |dst, args: Variadic<Value>| {
+        let mut seen = HashMap::new();
+        let mut into_src = Vec::with_capacity(args.len());
+        for a in args.into_iter() {
+            into_src.push(marshal_value(&src, dst, &a, &mut seen)?);
+        }
+        let rets: Variadic<Value> = f.call(Variadic::from(into_src))?;
+        let mut seen = HashMap::new();
+        let mut out = Vec::with_capacity(rets.len());
+        for r in rets.into_iter() {
+            out.push(marshal_value(dst, &src, &r, &mut seen)?);
+        }
+        Ok(Variadic::from(out))
+    })
+}
+
+/// Deep-copy `v` (which lives in `src`) into `dst`, creating fresh objects in
+/// `dst`. `seen` maps a source table's identity to its already-created `dst`
+/// copy so cyclic and shared tables are reproduced once. See
+/// [`Lua::marshal_from`].
+fn marshal_value(
+    dst: &Lua,
+    src: &Lua,
+    v: &Value,
+    seen: &mut HashMap<usize, Table>,
+) -> Result<Value> {
+    Ok(match v {
+        Value::Nil => Value::Nil,
+        Value::Boolean(b) => Value::Boolean(*b),
+        Value::Integer(i) => coerce_int(dst, *i),
+        Value::Number(n) => Value::Number(*n),
+        Value::LightUserData(p) => Value::LightUserData(*p),
+        Value::String(s) => Value::String(dst.create_string(s.as_bytes()?)?),
+        Value::Table(t) => {
+            let id = t.to_pointer()?;
+            if let Some(existing) = seen.get(&id) {
+                Value::Table(existing.clone())
+            } else {
+                let out = dst.create_table()?;
+                seen.insert(id, out.clone());
+                for (k, val) in t.raw_pairs()? {
+                    let mk = marshal_value(dst, src, &k, seen)?;
+                    let mv = marshal_value(dst, src, &val, seen)?;
+                    out.raw_set(mk, mv)?;
+                }
+                Value::Table(out)
+            }
+        }
+        Value::Function(f) => Value::Function(bridge_function(dst, src, f.clone())?),
+        Value::UserData(_) => {
+            return Err(LuaError::runtime(format_args!(
+                "userdata cannot cross an instance boundary"
+            ))
+            .into())
+        }
+        Value::Thread(_) => {
+            return Err(LuaError::runtime(format_args!(
+                "thread cannot cross an instance boundary"
+            ))
+            .into())
+        }
+    })
+}
+
+impl Lua {
+    /// Deep-copy a value out of `src` into this instance.
+    ///
+    /// omniLua can hold several version instances at once, each on its own heap.
+    /// The monomorphic-instance rule forbids *mixing handles* between them; this
+    /// method instead produces a fresh, structurally-equal value in `self`, so no
+    /// handles cross. It is the substrate for incremental version migration.
+    ///
+    /// - Numbers translate to this instance's number model — an integer copied
+    ///   into a float-only (5.1/5.2) instance widens to a float, matching what
+    ///   that version's engine natively holds. Magnitudes above `2^53` lose
+    ///   precision; an exact-or-error policy is tracked in the WebLua
+    ///   number-model seam.
+    /// - Strings copy by bytes; tables copy structurally with cycle detection, so
+    ///   the result is a snapshot, not a shared object.
+    /// - Functions become call proxies (arguments and results are marshalled at
+    ///   each call). The proxy keeps `src` alive, so bridging functions in *both*
+    ///   directions can form a cross-instance reference cycle that leaks; a
+    ///   `Weak`-based fix is tracked in the bridge issue.
+    /// - Userdata and threads cannot cross and produce an error.
+    pub fn marshal_from(&self, src: &Lua, v: &Value) -> Result<Value> {
+        let mut seen = HashMap::new();
+        marshal_value(self, src, v, &mut seen)
+    }
 }
 
 fn type_error_raw(value: &RawLuaValue, expected: &str) -> Error {
