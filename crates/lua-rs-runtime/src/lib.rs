@@ -408,6 +408,9 @@ struct LuaInner {
     /// `Rc<ScopedCell<T>>` and check the cell's validity flag before
     /// dereferencing the pointer it holds.
     userdata_scoped_metatables: RefCell<HashMap<TypeId, GcRef<RawLuaTable>>>,
+    /// How a host `i64` with no exact `f64` representation is lowered when it
+    /// crosses into a float-only (5.1/5.2) instance. See [`LossyIntPolicy`].
+    lossy_int_policy: Cell<LossyIntPolicy>,
 }
 
 struct UserDataCell<T> {
@@ -892,6 +895,17 @@ impl Lua {
         self.inner.version
     }
 
+    /// Set how a host `i64` with no exact `f64` representation is lowered when it
+    /// crosses into a float-only (5.1/5.2) instance. Default [`LossyIntPolicy::WidenLossy`].
+    pub fn set_lossy_int_policy(&self, policy: LossyIntPolicy) {
+        self.inner.lossy_int_policy.set(policy);
+    }
+
+    /// The current [`LossyIntPolicy`] for this instance.
+    pub fn lossy_int_policy(&self) -> LossyIntPolicy {
+        self.inner.lossy_int_policy.get()
+    }
+
     /// Make the `_VERSION` global reflect [`Lua::version`].
     ///
     /// `open_libs` writes the stdlib's compiled-in default (`"Lua 5.4"`); this
@@ -912,6 +926,7 @@ impl Lua {
                 pending_external_unroots: RefCell::new(Vec::new()),
                 userdata_metatables: RefCell::new(HashMap::new()),
                 userdata_scoped_metatables: RefCell::new(HashMap::new()),
+                lossy_int_policy: Cell::new(LossyIntPolicy::default()),
             }),
         }
     }
@@ -1845,7 +1860,10 @@ impl Value {
         match self {
             Value::Nil => Ok(RawLuaValue::Nil),
             Value::Boolean(v) => Ok(RawLuaValue::Bool(*v)),
-            Value::Integer(v) => Ok(RawLuaValue::Int(*v)),
+            Value::Integer(v) => Ok(match lower_host_int(lua.version(), lua.lossy_int_policy(), *v)? {
+                LoweredInt::Int(i) => RawLuaValue::Int(i),
+                LoweredInt::Float(f) => RawLuaValue::Float(f),
+            }),
             Value::Number(v) => Ok(RawLuaValue::Float(*v)),
             Value::String(v) => v.root.raw_for_lua(lua, state),
             Value::Table(v) => v.root.raw_for_lua(lua, state),
@@ -3823,10 +3841,40 @@ impl AnyUserData {
     }
 }
 
-fn coerce_int(dst: &Lua, i: i64) -> Value {
-    match dst.version().number_model() {
-        NumberModel::FloatOnly => Value::Number(i as f64),
-        NumberModel::Dual => Value::Integer(i),
+/// How a host `i64` that has no exact `f64` representation is lowered when it
+/// crosses into a float-only (5.1/5.2) Lua instance, which has no integer subtype.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LossyIntPolicy {
+    /// Default. Widen to the nearest `f64` even when inexact — what a float-only
+    /// Lua natively does with a large integer literal.
+    #[default]
+    WidenLossy,
+    /// Raise a runtime error instead of silently losing precision.
+    ErrorOnInexact,
+}
+
+enum LoweredInt {
+    Int(i64),
+    Float(f64),
+}
+
+/// The host→Lua integer lowering seam — single source of truth. On a dual-subtype
+/// instance (5.3+) an `i64` stays an integer; on a float-only instance (5.1/5.2) it
+/// becomes a float, exactly when representable (`int_fits_float`, |i| ≤ 2^53),
+/// otherwise per `policy`.
+fn lower_host_int(version: LuaVersion, policy: LossyIntPolicy, i: i64) -> Result<LoweredInt> {
+    match version.number_model() {
+        NumberModel::Dual => Ok(LoweredInt::Int(i)),
+        NumberModel::FloatOnly => {
+            if lua_vm::vm::int_fits_float(i) || policy == LossyIntPolicy::WidenLossy {
+                Ok(LoweredInt::Float(i as f64))
+            } else {
+                Err(LuaError::runtime(format_args!(
+                    "integer {i} has no exact representation in this version's float-only number model"
+                ))
+                .into())
+            }
+        }
     }
 }
 
@@ -3864,7 +3912,10 @@ fn marshal_value(
     Ok(match v {
         Value::Nil => Value::Nil,
         Value::Boolean(b) => Value::Boolean(*b),
-        Value::Integer(i) => coerce_int(dst, *i),
+        Value::Integer(i) => match lower_host_int(dst.version(), dst.lossy_int_policy(), *i)? {
+            LoweredInt::Int(i) => Value::Integer(i),
+            LoweredInt::Float(f) => Value::Number(f),
+        },
         Value::Number(n) => Value::Number(*n),
         Value::LightUserData(p) => Value::LightUserData(*p),
         Value::String(s) => Value::String(dst.create_string(s.as_bytes()?)?),
