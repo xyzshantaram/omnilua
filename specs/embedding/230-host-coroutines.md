@@ -126,3 +126,36 @@ Oracle gate: `multiversion_oracle` green, the coroutine official tests
 - Should v1 ship `create_thread` + `resume` + `status` only, deferring
   yield-from-host (a host C function yielding) — which is a separate, harder
   problem? Proposed: yes, defer host-side yield.
+
+## Codex review reconciliation (VERDICT: REVISE — deeper than this batch)
+
+Codex confirmed Option A is the right direction but only after non-trivial work,
+and ruled Option B out entirely. Required before implementation:
+
+- **Runtime `active_state` bookkeeping (High).** A Rust callback that re-enters `Lua`
+  from inside a resumed coroutine uses `LuaInner.active_state` (lib.rs:399/919), which
+  falls back to the *parent*, not the coroutine `LuaState`; a nested `resume` then
+  snapshots/flushes the wrong stack + upvalues. Host resume must set `active_state` to
+  the coroutine state for the duration of the resume.
+- **Reject host-returned `Yield` (High).** A Rust callback returning `LuaError::Yield`
+  via `?` makes `lua_resume` see `Yield` without `lua_yieldk`'s setup (do_.rs:1417/1366)
+  → corruption. v1 translates callback-returned `Yield` to a runtime error.
+- **Root the error payload before cleanup/GC (High).** Mirror `Function::call`
+  (lib.rs:2036) — `capture_error_in_state` the coroutine error before the coroutine
+  stack is cleaned. Test: `error({})` + forced GC + inspect.
+- **Provenance (Medium).** `LuaThread` carries only an `id` (value.rs:150); cross-state
+  ids collide. Guard via `RootedValue::raw_for_lua`; wrapper is same-state-only.
+- **Version checks (Medium).** `create_thread` must mirror `co_create` (rejects C/Rust
+  bodies on 5.1, coro_lib.rs:708).
+- **Dedicated wrapper, not raw `co_resume` (Medium).** `co_resume` leaves results in
+  C-call convention with the arg frame present; add `lua_stdlib::coro_lib::host_resume`
+  around `aux_resume` with saved-top restore + result extraction + error capture;
+  feature-gate on `coroutine`.
+- **Pre-existing bug surfaced (filed separately).** Main thread isn't in
+  `GlobalState.threads` (state.rs:1808), so `aux_resume` reports it dead while
+  `aux_status` says normal → `coroutine.resume(coroutine.running())` returns
+  `"cannot resume dead coroutine"` but the 5.4 oracle expects `"cannot resume
+  non-suspended coroutine"`.
+
+**Conclusion:** #230 is a coordinated VM+stdlib+runtime effort, not part of this
+embedding batch. This spec stands as the design once the above land.

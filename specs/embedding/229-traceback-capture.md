@@ -1,126 +1,110 @@
 # Spec #229 — Stack-traceback capture in the embedding `Error`
 
-Status: design, pre-implementation. The readable-message half shipped in 0.3.5
-(`Error::Display` → `message_lossy`). This spec is the **traceback capture** half.
-Reviewer focus: **don't pollute existing error messages / don't change behavior
-for code that doesn't opt in** (the multiversion oracle and error-wording tests
-assert exact message strings).
+Status: design, **revised after Codex adversarial review (VERDICT: REVISE — all
+findings adopted)**. The readable-message half shipped in 0.3.5. This is the
+traceback **capture** half. Reviewer focus held: **capture must never change the
+error message** for code that opts in OR out.
 
 ## Problem
 
-When a host catches an `Error` from `Chunk::exec/eval` or `Function::call`, it
-gets only the immediate error value — no `debug.traceback()` stack. The CLI has
-tracebacks; the embedding API does not.
+A host catching an `Error` from `Chunk::exec/eval` or `Function::call` gets only the
+immediate error value — no `debug.traceback()` stack.
 
 ## Substrate (verified)
 
-- `lua_vm::api::pcall_k(state, nargs, nresults, errfunc, ctx, k)` (`api.rs:2016`)
-  **supports a message handler**: `errfunc` is a stack index of a handler function
-  (0 = none) invoked **before the stack unwinds** (`do_.rs:133` `run_message_handler`).
-- `lua_stdlib::auxlib::traceback(state, other, msg, level)` (`auxlib.rs:298`) is the
-  `luaL_traceback` equivalent: walks the call stack and leaves the traceback string
-  on `state`'s stack.
-- The CLI pattern (`crates/lua-cli/src/interp.rs:91` `msghandler`, `:385` `docall`):
-  push a C closure handler, call `pcall_k(..., errfunc = base, ...)`. The handler
-  rewrites the error value into `"msg\nstack traceback:\n…"`.
-- Today `Chunk::eval` (lib.rs:1659) and `Function::call` (lib.rs:2003) call
-  `pcall_k(..., errfunc = 0, ...)` — no handler.
-- `Error` (lib.rs:156): `{ inner: LuaError, _root: Option<RootedValue> }`.
+- `pcall_k(state, nargs, nresults, errfunc, ctx, k)` (`api.rs:2016`): `errfunc` =
+  stack index of a message handler run **before unwind** (`do_.rs:133`
+  `run_message_handler`).
+- `auxlib::traceback(state, other, msg, level)` (`auxlib.rs:298`) builds the
+  traceback string on the stack — **returns `Result`** (it allocates).
+- CLI pattern (`interp.rs:91` handler, `:391` insert-below-func + remove-after).
+- `Chunk::eval` (lib.rs:1659/1674) and `Function::call` (lib.rs:2003/2023) compute
+  result counts from `saved_top` and use `errfunc=0` today.
+- The runtime passes Rust state into C closures via upvalues
+  (`create_function`, lib.rs:1153/3401) — re-entrancy-safe per call.
 
-## The hazard
+## Design — per-call upvalue slot, best-effort, message preserved (opt-in)
 
-The CLI handler **overwrites the error value** with `msg + traceback`. If we did
-that on every `Function::call`/`eval`, the error *message* every host (and every
-test) sees would gain a `\nstack traceback:\n…` tail — silently breaking
-error-wording assertions. The multiversion oracle pcalls **inside Lua**, so its
-inner error is unaffected; but `crates/lua-cli/tests/traceback_oracle.rs` and any
-runtime test reading `Error` message text could shift, and embedders relying on a
-clean message would regress.
+Capture must run pre-unwind (handler) and must not alter the error value. Codex
+showed a single `GlobalState` slot cross-wires under nesting and `<close>`. So the
+capture slot is **per protected call**, carried in the handler closure's upvalue.
 
-## Design — opt-in capture via a side channel (message preserved)
-
-Two requirements: (1) capture must run **pre-unwind** (only a message handler can),
-(2) it must **not alter the error value/message**. So the handler builds the
-traceback and stashes it in a side channel, returning the error value **unchanged**.
-Off by default.
-
-### API
+### API (bytes, per the repo rule)
 
 ```rust
 impl Lua {
-    /// Enable/disable capturing a stack traceback into Errors raised by
-    /// protected calls on this instance. Off by default (zero cost, message
-    /// unchanged). Opt-in because it walks the stack on every error.
-    pub fn set_capture_tracebacks(&self, on: bool);
+    pub fn set_capture_tracebacks(&self, on: bool);  // default OFF (zero cost)
     pub fn captures_tracebacks(&self) -> bool;
 }
-
 impl Error {
-    /// The captured `debug.traceback()` stack, if capture was enabled when this
-    /// error was raised. The error *message* (`Display`, `message_lossy`) is
-    /// unchanged whether or not capture is on.
-    pub fn traceback(&self) -> Option<&str>;
+    /// Captured traceback bytes (Lua bytes / source names are not guaranteed
+    /// UTF-8). The error *message* is identical whether capture is on or off.
+    pub fn traceback_bytes(&self) -> Option<&[u8]>;
+    /// Lossy-UTF8 convenience.
+    pub fn traceback_lossy(&self) -> Option<String>;
 }
 ```
+`Error` gains `traceback: Option<Vec<u8>>` (not `String`).
 
-### Mechanism
+### Mechanism (addresses every Codex finding)
 
-- Add `Error.traceback: Option<String>` (third field).
-- Side channel: a `RefCell<Option<Vec<u8>>>` on `GlobalState` (e.g.
-  `pending_traceback`) — **VM-layer change**, plus a `capture_tracebacks: Cell<bool>`
-  flag.
-- Embedding message handler `traceback_msghandler(state)`:
-  - if `!state.global().capture_tracebacks` → return arg 1 unchanged (fast path);
-  - else build the traceback (`auxlib::traceback(state, None, Some(msg_bytes), 1)`),
-    move the resulting string into `global.pending_traceback`, **pop it**, and
-    return arg 1 (the original error value) unchanged.
-- `Chunk::eval/exec`, `Function::call`: when `capture_tracebacks` is on, push
-  `traceback_msghandler` and pass its index as `errfunc`; otherwise keep
-  `errfunc = 0` (no behavior change when off).
-- `capture_error_in_state` (lib.rs:1007): after building the `Error`, take
-  `global.pending_traceback` (clearing it) into `Error.traceback`.
+1. **Per-call slot.** Each protected call that opts in creates a fresh
+   `Rc<RefCell<Option<Vec<u8>>>>`, builds a one-shot C closure handler capturing it
+   (same upvalue mechanism as `create_function`), and installs it as `errfunc`.
+   Nested calls each own their slot — no shared global state, no generation IDs.
+2. **Best-effort, message-preserving handler.** The handler:
+   - reads the error value at arg 1 as **raw bytes only** — if it's a `Str`, take
+     its bytes; otherwise use a fixed type-name placeholder. **No `__tostring`, no
+     metamethods, no user code** (Codex finding 6);
+   - calls `auxlib::traceback`; on **any** error from it, the handler **restores the
+     stack to arg 1 and returns it unchanged** — never `?`, never `ErrErr`
+     (finding 1). On success, it moves the traceback bytes into the per-call slot,
+     **pops the traceback string**, and returns arg 1 **unchanged** (message stays
+     pristine).
+3. **Exact stack choreography** (finding 7), mirroring the CLI: push the handler,
+   `insert` it just below the function+args (so it sits at a fixed `errfunc` index),
+   `pcall_k(..., errfunc=that_index, ...)`, then `remove` it on **both** success and
+   error paths **before** the existing `saved_top`-based result counting runs — so
+   `MULTRET` never counts/returns the handler.
+4. **Attach at the specific call site, not `capture_error_in_state`** (finding 3).
+   Only `Chunk::eval/exec` and `Function::call` (the paths that installed a handler)
+   read their per-call slot in the `Err` arm and set `Error.traceback`.
+   `capture_error_in_state` is unchanged and never touches tracebacks, so syntax/load
+   errors (handler-skipped, do_.rs:1551) can't pick up a stale trace.
+5. **Off by default**: when capture is off, `errfunc=0` exactly as today — byte-for-byte
+   no behavior change.
 
-This keeps `inner`/message pristine; the traceback is strictly additive.
+### Known limitation (finding 2 — `<close>` replacement)
 
-## Alternatives considered
+The handler runs before `close_protected`, which can replace the final error (a
+`<close>` metamethod erroring after the original `error(...)`). In that case the
+captured traceback reflects the **originally raised** error, not the replacement.
+v1 documents this: `traceback_bytes()` is best-effort and corresponds to the error
+at the point the message handler ran. (Detecting replacement reliably needs a VM
+hook we don't add in v1.) A test pins this characterized behavior.
 
-- **Always-on, overwrite the error value (CLI style)** — rejected: changes every
-  error message, breaks wording assertions, no clean message/traceback split.
-- **Post-`pcall` capture** (build traceback in the `Err` arm) — rejected: the stack
-  has already unwound, so the traceback is empty/wrong. Must be a pre-unwind handler.
-
-## Risks for the reviewer
-
-1. The side-channel must be cleared on *every* path (success and failure), or a
-   stale traceback could attach to a later error. capture_error_in_state taking +
-   clearing is the single consumer; confirm no other error path bypasses it.
-2. Re-entrancy: nested protected calls each install a handler; the innermost
-   error's handler runs first and writes the side channel — confirm an outer
-   handler doesn't overwrite the inner traceback before capture reads it. (Likely
-   fine because capture reads immediately after each pcall returns, but verify.)
-3. Coroutine errors: `auxlib::traceback` takes an `other` state for cross-thread —
-   out of scope here (host coroutine = #230); document that captured tracebacks are
-   for the main-thread call path in v1.
-4. Adding a `GlobalState` field is a VM-layer change in a hot struct — confirm it
-   doesn't perturb the dispatch/`legacy_for` hot path (it's cold-path only).
-
-## Test plan
+## Test plan (oracle-backed where possible)
 
 `crates/lua-rs-runtime/tests/traceback_capture.rs`:
-- capture off (default): `Error::traceback()` is `None`; message text byte-identical
-  to today (guards against message pollution).
-- capture on: a Rust→Lua→Rust nested error yields a traceback naming the frames;
-  message text still clean (no `stack traceback` substring in `message_lossy`).
-- toggling on→off→on behaves; side channel doesn't leak a stale traceback to a
-  later error.
+- **capture off (default)**: `traceback_bytes()` is `None`; message bytes
+  byte-identical to today (the anti-pollution guard).
+- **capture on**: Rust→Lua→Rust nested error → traceback names frames; message bytes
+  still clean (no `stack traceback` substring in `message_lossy`).
+- **nested Rust callback re-entry**: inner and outer errors get their **own**
+  tracebacks (per-call slot isolation) — the regression the global slot would cause.
+- **syntax error after a runtime error**: the parse error has `traceback() == None`
+  (no stale leak) — finding 3.
+- **non-UTF8 error bytes / non-string error object with no `__tostring`**: handler
+  produces a placeholder, never runs user code, message preserved — finding 6.
+- **capture-failure best-effort**: simulate `auxlib::traceback` failure path → error
+  message unchanged, `traceback()` is `None` — finding 1.
+- **`<close>` replaces the error**: characterized per the documented limitation.
 
-Oracle gate: `multiversion_oracle` byte-identical (it pcalls inside Lua, must be
-untouched), CLI `traceback_oracle` (16) green, full `cargo test -p omnilua` green.
+Oracle gate: `multiversion_oracle` byte-identical (pcalls inside Lua, untouched),
+CLI `traceback_oracle` (16) green, full `cargo test -p omnilua` green.
 
-## Open questions for the reviewer
+## Open questions resolved by the review
 
-- Is a `GlobalState` side channel the right home, or should the flag/slot live on
-  `LuaInner` (runtime crate) to avoid a VM-layer change? (Handler runs in VM with
-  only `&mut LuaState`, so it needs VM-reachable storage — hence GlobalState.)
-- Should capture default on for `Chunk` (scripts) but off for `Function::call`
-  (hot)? Proposed: uniformly off, opt-in, simplest + zero surprise.
+- Home for the slot → **per-call upvalue**, not `GlobalState` (finding 4).
+- String vs bytes → **bytes** (finding 5).
+- Single consumer → **the call site**, not `capture_error_in_state` (finding 3).

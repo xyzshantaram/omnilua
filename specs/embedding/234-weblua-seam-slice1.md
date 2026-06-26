@@ -133,3 +133,33 @@ behavior is internal to the VM, untouched by this host-boundary seam), full
   until there's a caller? (Leaning: add now, it's the stable surface the spec wants.)
 - Should `set_lossy_int_policy` instead be a `LuaBuilder` option (per WebLua §1.4)?
   We have no builder yet; a setter is the minimal step. Confirm acceptable.
+
+## Codex review reconciliation (VERDICT: REVISE — descope adopted)
+
+The review pared this to a minimal, correct core and caught a latent bug:
+
+- **Right choke point (High).** Lower in `Value::to_raw_for_lua` (lib.rs:1819), the
+  real host→Lua push path — today it pushes `Integer` as `Int` *regardless of
+  version*, so a 5.1 (float-only) instance stores a host `i64` as a true integer (a
+  latent bug). NOT in `IntoLua<i64>` (misses manually-built `Value::Integer`). Reuse
+  the helper from `marshal_value`.
+- **Leave `FromLua<i64>` alone (High).** It already accepts integral floats and
+  rejects non-integral (lib.rs:2892); only out-of-range floats would change. Egress
+  unchanged this slice. (`LuaError::FromLuaConversion` doesn't exist here anyway.)
+- **Exactness check was wrong (High).** `f as i64 == i` accepts inexact values —
+  Rust float→int **saturates** (`i64::MAX as f64 as i64 == i64::MAX`). Reuse the VM's
+  guarded float↔int helper (state.rs:894). Rename `Truncate` (`i64 as f64` rounds).
+- **Don't flip `marshal_from`'s default (Medium).** Silent-widen → error is breaking;
+  strict is **opt-in** via `LossyIntPolicy`, default preserves current behavior.
+- **Defer `Unsupported` (Medium).** Premature (no producer) and the WebLua example is
+  oracle-wrong — absent 5.1 stdlib globals must fail as a normal Lua runtime error,
+  not a typed feature error. Also defer `#[non_exhaustive]` until a real producer.
+- **No new error variant yet (Medium).** The `ErrorOnInexact` path raises a normal
+  `LuaError::runtime` (correct `pcall`/`to_status`/`into_value` semantics for free).
+- **Engine slicing confirmed coherent.** The playbook (§117) reads a runtime version
+  flag at production sites, not a `dyn` Engine — so the seam is a flag-read at
+  `to_raw_for_lua`. `enum Engine` stays deferred.
+
+**Revised slice 1 = ** `LossyIntPolicy` (default `WidenLossy`) + a shared,
+guarded `lower_host_int` helper used by `to_raw_for_lua` + `marshal_value`. Nothing
+else (no variants, no `FromLua`/`IntoLua` changes, no `Unsupported`).

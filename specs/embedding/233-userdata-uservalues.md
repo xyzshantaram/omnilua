@@ -118,3 +118,21 @@ userdata/barrier surface.
   `uv` (it must, or even the stdlib `setiuservalue` path would leak/UAF).
 - Any path where `set_i_uservalue`'s barrier is skipped (e.g. the userdata itself
   is white/unlinked at set time)? The C invariant is the parent is already linked.
+
+## Codex review reconciliation (VERDICT: REVISE — adopted)
+
+Central store path **confirmed sound** (`set_i_uservalue` → `barrier_back` →
+generational backward barrier before child dispatch, state.rs:4444). Three fixes:
+
+1. **GC accounting (High).** A non-empty preallocated `uv` must charge the heap:
+   `LuaUserData::buffer_bytes()` includes `uv` capacity (userdata.rs:61) and the VM
+   constructor calls `account_buffer` (api.rs:870); the runtime constructor skips it
+   only because `uv` is empty today (lib.rs:1285). The new path must call
+   `userdata.account_buffer(userdata.buffer_bytes() as isize)` **under the heap guard**.
+2. **Checked index (Medium).** Use `i32::try_from(n)` (reject overflow) before the VM
+   helper — `n as i32` lets a huge `usize` wrap to a valid slot. Cap `nuvalue` too.
+3. **Real barrier test (High).** The "set/drop/`gc_collect`/read-back" test is
+   meaningless — a full collect marks `uv` via `Trace` even with the barrier removed.
+   Gate on the **GC canaries** (`harness/canaries/gc/run_canaries.sh`, which include
+   `canary_j_testc_sweep_uservalue_barrier.lua` — black/old-userdata + white/young-child),
+   and add an API test that exercises set-then-step rather than full-collect.
