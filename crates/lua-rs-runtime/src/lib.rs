@@ -130,6 +130,11 @@ pub use lua_vm::state::{DynLibId, DynamicSymbol, OsExecuteReason, OsExecuteResul
 #[cfg(feature = "derive")]
 pub use lua_rs_derive::{lua_methods, LuaUserData};
 
+#[cfg(feature = "serde")]
+mod serde_impl;
+#[cfg(feature = "serde")]
+pub use serde_impl::LuaSerdeExt;
+
 /// The embedding error type returned by every fallible public method.
 ///
 /// This wraps the inner [`LuaError`] enum (still re-exported and matchable via
