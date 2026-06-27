@@ -32,6 +32,37 @@ use serde::ser::{
 
 use crate::{lower_host_int, Error, LoweredInt, Lua, LuaError, Result, Table, Value};
 
+/// The canonical "null" marker. Lua tables cannot store `nil` as a value, so a
+/// `None` / unit / JSON `null` in a *nested* position would silently delete the
+/// table slot (corrupting sequences and dropping map keys). Instead those
+/// serialize to this sentinel — a light-userdata at the address of a private
+/// static, recognized on the way back. Mirrors `mlua`'s `Lua::null`.
+static NULL_SENTINEL: u8 = 0;
+
+/// The null sentinel as a [`Value`].
+fn null_value() -> Value {
+    Value::LightUserData(&NULL_SENTINEL as *const u8 as *mut core::ffi::c_void)
+}
+
+/// Whether `value` is the null sentinel from [`null_value`].
+fn is_null(value: &Value) -> bool {
+    matches!(value, Value::LightUserData(p) if std::ptr::eq(*p as *const u8, &NULL_SENTINEL))
+}
+
+/// Extract a host `i64` from an integer or an exactly-integral finite float —
+/// the float case is how 5.1/5.2 (float-only) store integers. Mirrors the
+/// `FromLua for i64` rule.
+fn as_i64(value: &Value) -> Result<i64> {
+    match value {
+        Value::Integer(i) => Ok(*i),
+        Value::Number(n) if n.is_finite() && n.fract() == 0.0 => Ok(*n as i64),
+        other => Err(serde_error(format_args!(
+            "expected an integer, found Lua {}",
+            value_type_name(other)
+        ))),
+    }
+}
+
 impl ser::Error for Error {
     fn custom<T: Display>(msg: T) -> Self {
         LuaError::runtime(format_args!("{msg}")).into()
@@ -58,6 +89,11 @@ pub trait LuaSerdeExt {
     fn from_value<T>(&self, value: Value) -> Result<T>
     where
         T: DeserializeOwned;
+
+    /// The null sentinel (see the module docs): a non-`nil` marker for JSON
+    /// `null` / `None` so it can be stored in a table slot. Deserializing it
+    /// yields `None` / unit / `null` again.
+    fn null(&self) -> Value;
 }
 
 impl LuaSerdeExt for Lua {
@@ -73,6 +109,10 @@ impl LuaSerdeExt for Lua {
         T: DeserializeOwned,
     {
         T::deserialize(LuaDeserializer { lua: self, value })
+    }
+
+    fn null(&self) -> Value {
+        null_value()
     }
 }
 
@@ -175,8 +215,10 @@ impl<'a> Serializer for LuaSerializer<'a> {
         self.string(v)
     }
 
+    /// `None` serializes to the null sentinel, not `nil`, so it survives in a
+    /// nested table slot (a `nil` value would delete the slot).
     fn serialize_none(self) -> Result<Value> {
-        Ok(Value::Nil)
+        Ok(null_value())
     }
 
     fn serialize_some<T>(self, value: &T) -> Result<Value>
@@ -187,11 +229,11 @@ impl<'a> Serializer for LuaSerializer<'a> {
     }
 
     fn serialize_unit(self) -> Result<Value> {
-        Ok(Value::Nil)
+        Ok(null_value())
     }
 
     fn serialize_unit_struct(self, _name: &'static str) -> Result<Value> {
-        Ok(Value::Nil)
+        Ok(null_value())
     }
 
     fn serialize_unit_variant(
@@ -541,6 +583,9 @@ impl<'a, 'de> Deserializer<'de> for LuaDeserializer<'a> {
     where
         V: Visitor<'de>,
     {
+        if is_null(&self.value) {
+            return visitor.visit_unit();
+        }
         match self.value {
             Value::Nil => visitor.visit_unit(),
             Value::Boolean(b) => visitor.visit_bool(b),
@@ -578,9 +623,10 @@ impl<'a, 'de> Deserializer<'de> for LuaDeserializer<'a> {
     where
         V: Visitor<'de>,
     {
-        match self.value {
-            Value::Nil => visitor.visit_none(),
-            _ => visitor.visit_some(self),
+        if matches!(self.value, Value::Nil) || is_null(&self.value) {
+            visitor.visit_none()
+        } else {
+            visitor.visit_some(self)
         }
     }
 
@@ -588,13 +634,70 @@ impl<'a, 'de> Deserializer<'de> for LuaDeserializer<'a> {
     where
         V: Visitor<'de>,
     {
-        match self.value {
-            Value::Nil => visitor.visit_unit(),
-            other => Err(serde_error(format_args!(
-                "expected nil for unit, found Lua {}",
-                value_type_name(&other)
-            ))),
+        if matches!(self.value, Value::Nil) || is_null(&self.value) {
+            visitor.visit_unit()
+        } else {
+            Err(serde_error(format_args!(
+                "expected nil or the null sentinel for unit, found Lua {}",
+                value_type_name(&self.value)
+            )))
         }
+    }
+
+    fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_i64(as_i64(&self.value)?)
+    }
+
+    fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_i64(as_i64(&self.value)?)
+    }
+
+    fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_i64(as_i64(&self.value)?)
+    }
+
+    fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_i64(as_i64(&self.value)?)
+    }
+
+    fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_i64(as_i64(&self.value)?)
+    }
+
+    fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_i64(as_i64(&self.value)?)
+    }
+
+    fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_i64(as_i64(&self.value)?)
+    }
+
+    fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_i64(as_i64(&self.value)?)
     }
 
     fn deserialize_unit_struct<V>(self, _name: &'static str, visitor: V) -> Result<V::Value>
@@ -748,7 +851,7 @@ impl<'a, 'de> Deserializer<'de> for LuaDeserializer<'a> {
     }
 
     serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string identifier
+        bool i128 u128 f32 f64 char str string identifier
     }
 }
 

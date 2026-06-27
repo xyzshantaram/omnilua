@@ -53,7 +53,7 @@ fn struct_with_vec_option_and_nesting_roundtrips() {
 }
 
 #[test]
-fn none_field_is_omitted_then_defaults_back_to_none() {
+fn none_field_uses_null_sentinel_not_nil_and_roundtrips() {
     let lua = Lua::new();
     let original = sample_outer();
     let value = lua.to_value(&original).expect("to_value");
@@ -62,9 +62,62 @@ fn none_field_is_omitted_then_defaults_back_to_none() {
         other => panic!("expected table, got {other:?}"),
     };
     let absent: Value = table.get("absent").expect("get absent");
-    assert!(matches!(absent, Value::Nil), "None field must be nil/absent");
+    assert!(
+        !matches!(absent, Value::Nil),
+        "None must be the null sentinel, not nil (a nil value would be dropped)"
+    );
+    assert!(matches!(absent, Value::LightUserData(_)), "expected the null sentinel");
     let back: Outer = lua.from_value(value).expect("from_value");
     assert_eq!(back.absent, None);
+}
+
+#[test]
+fn nested_none_in_sequences_roundtrips() {
+    let lua = Lua::new();
+    let cases: Vec<Vec<Option<i64>>> = vec![
+        vec![None],
+        vec![Some(1), None],
+        vec![None, Some(2)],
+        vec![Some(1), None, Some(3)],
+        vec![None, None, Some(3)],
+    ];
+    for case in cases {
+        let back: Vec<Option<i64>> = roundtrip(&lua, &case);
+        assert_eq!(case, back, "Vec<Option<_>> with interior None must round-trip");
+    }
+}
+
+#[test]
+fn unit_elements_in_sequence_roundtrip() {
+    let lua = Lua::new();
+    let units: Vec<()> = vec![(), (), ()];
+    let back: Vec<()> = roundtrip(&lua, &units);
+    assert_eq!(units, back);
+}
+
+#[test]
+fn map_with_none_values_roundtrips() {
+    let lua = Lua::new();
+    let mut map: HashMap<String, Option<i64>> = HashMap::new();
+    map.insert("a".to_string(), Some(1));
+    map.insert("b".to_string(), None);
+    let back: HashMap<String, Option<i64>> = roundtrip(&lua, &map);
+    assert_eq!(map, back);
+}
+
+#[test]
+fn integers_roundtrip_on_float_only_versions() {
+    for version in [LuaVersion::V51, LuaVersion::V52] {
+        let lua = Lua::new_versioned(version);
+        let v = lua.to_value(&42i64).expect("to_value scalar");
+        let scalar: i64 = lua.from_value(v).expect("from_value i64 on float-only");
+        assert_eq!(scalar, 42, "scalar integer must round-trip on a float-only version");
+
+        let cfg = sample_outer();
+        let sv = lua.to_value(&cfg).expect("to_value struct");
+        let back: Outer = lua.from_value(sv).expect("from_value struct on float-only");
+        assert_eq!(cfg, back, "struct with integer fields must round-trip on a float-only version");
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -149,8 +202,10 @@ fn serde_json_value_roundtrips() {
         "count": 7,
         "ratio": 0.5,
         "enabled": true,
+        "maybe": null,
         "tags": ["x", "y", "z"],
-        "nested": { "k": 1 }
+        "holes": [1, null, 3],
+        "nested": { "k": 1, "absent": null }
     });
     let value = lua.to_value(&json).expect("to_value");
     let back: serde_json::Value = lua.from_value(value).expect("from_value");
