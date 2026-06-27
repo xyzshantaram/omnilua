@@ -18,6 +18,16 @@
 //!   `{ "Variant" = payload }`.
 //! - host integers cross the version number-model seam through
 //!   [`crate::LossyIntPolicy`], identical to every other host→Lua integer.
+//!
+//! Known limitations:
+//! - An *empty* serde array is distinguished from an empty map only by the
+//!   array-marker metatable ([`LuaSerdeExt::array_metatable`]); since
+//!   [`crate::Lua::marshal_from`] copies raw pairs without metatables, an empty
+//!   array marshaled to another instance comes back as an empty map. Non-empty
+//!   arrays are unaffected (the dense-key heuristic recovers them). Preserving
+//!   the marker across `marshal_from` is a follow-up.
+//! - A `u64` larger than `i64::MAX` has no exact Lua integer and is rejected
+//!   rather than silently widened to a float.
 
 use std::fmt::Display;
 
@@ -636,6 +646,23 @@ fn table_seq_values(table: &Table) -> Result<Vec<Value>> {
     Ok(out)
 }
 
+/// Values of a table that a caller explicitly asked to read as a sequence. A
+/// marked array or a dense `1..=n` (or empty) table is accepted; a table with
+/// non-array keys is rejected rather than silently dropping those entries.
+fn require_sequence_values(lua: &Lua, table: &Table) -> Result<Vec<Value>> {
+    if is_marked_array(lua, table)? {
+        return table_seq_values(table);
+    }
+    let pairs = table.raw_pairs()?;
+    if pairs.is_empty() || sequence_len(&pairs).is_some() {
+        table_seq_values(table)
+    } else {
+        Err(serde_error(
+            "expected a Lua array (dense 1..n integer keys); found a table with non-array keys",
+        ))
+    }
+}
+
 impl<'a, 'de> Deserializer<'de> for LuaDeserializer<'a> {
     type Error = Error;
 
@@ -813,7 +840,7 @@ impl<'a, 'de> Deserializer<'de> for LuaDeserializer<'a> {
         match self.value {
             Value::Table(t) => visitor.visit_seq(SeqAccessor {
                 lua: self.lua,
-                items: table_seq_values(&t)?.into_iter(),
+                items: require_sequence_values(self.lua, &t)?.into_iter(),
             }),
             other => Err(serde_error(format_args!(
                 "expected table for sequence, found Lua {}",

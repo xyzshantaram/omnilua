@@ -283,6 +283,28 @@ fn unrepresentable_numbers_are_rejected_not_corrupted() {
     );
 }
 
+#[test]
+fn explicit_sequence_target_rejects_non_array_tables() {
+    let lua = Lua::new();
+
+    let map_table = lua.create_table().unwrap();
+    map_table.set("foo", 1i64).unwrap();
+    let r: Result<Vec<i64>, _> = lua.from_value(Value::Table(map_table));
+    assert!(r.is_err(), "a map table must not deserialize into Vec by dropping its keys");
+
+    let mixed = lua.create_table().unwrap();
+    mixed.set(1i64, 10i64).unwrap();
+    mixed.set("foo", 2i64).unwrap();
+    let r: Result<Vec<i64>, _> = lua.from_value(Value::Table(mixed));
+    assert!(r.is_err(), "a mixed array/map table must not silently truncate into Vec");
+
+    let dense = lua.create_table().unwrap();
+    dense.set(1i64, 10i64).unwrap();
+    dense.set(2i64, 20i64).unwrap();
+    let ok: Vec<i64> = lua.from_value(Value::Table(dense)).unwrap();
+    assert_eq!(ok, vec![10, 20], "a genuine dense array still deserializes into Vec");
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // PORT STATUS
 //   source:        (no C analog — serde integration tests)
