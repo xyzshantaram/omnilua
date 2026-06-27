@@ -4,6 +4,40 @@ All notable changes to `lua-rs` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-06-26
+
+### Added — embedding-API parity tier: host coroutines, registry keys, GC control, lazy iteration
+
+Completes the `mlua`-shaped host surface so ported `mlua` code finds its idioms,
+all driving the corresponding Lua builtins so behavior is identical to running
+the same code purely in Lua (per-version nuances and provenance come for free).
+
+- **Host-driven coroutines** (#230): `Lua::create_thread(Function)`,
+  `Thread::resume::<A, R>(args)`, `Thread::status() -> ThreadStatus`. The host
+  can create, step, and observe a coroutine without dropping into Lua-level
+  `coroutine.*`. Provenance-checked to the parent instance.
+- **Keyed registry** (#226): `Lua::create_registry_value` / `registry_value` /
+  `remove_registry_value` with the anonymous `RegistryKey` token, alongside the
+  existing named registry. Provenance-checked.
+- **GC control surface** (#231): `Lua::gc() -> GcControl` with
+  `collect`/`step(kb)`/`stop`/`restart`/`count() -> f64`/`is_running()`,
+  matching `collectgarbage(...)` and its per-version option roster.
+- **Lazy table iteration** (#232): `Table::pairs` (honors `__pairs` where the
+  running version does — 5.2–5.5) and `Table::raw_pairs_iter`, yielding one
+  pair at a time via the new `TablePairs` iterator instead of materializing a
+  `Vec` (the eager `raw_pairs()` is unchanged).
+
+### Fixed
+
+- **`coroutine.resume(coroutine.running())` on the main thread** (#239) now
+  reports `cannot resume non-suspended coroutine` (5.2–5.5) instead of
+  `cannot resume dead coroutine`. The main thread is never stored in the thread
+  registry, so the resume registry-miss path is special-cased to the
+  version-aware non-suspended message, matching the reference.
+
+Gate: `cargo test --workspace` green, official 5.4 suite 44/44, the
+multi-version oracle green across 5.1–5.5.
+
 ## [0.3.4] - 2026-06-24
 
 ### Added — feature-gated standard library for lean / sandboxed embeds
