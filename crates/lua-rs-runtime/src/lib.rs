@@ -1161,6 +1161,33 @@ impl Lua {
         Ok(LuaString { root })
     }
 
+    /// Fetch a function from the `coroutine` standard library table, e.g.
+    /// `create` / `resume` / `status`. The host-driven [`Thread`] API drives
+    /// these builtins so its behavior is identical to running the same
+    /// coroutine purely in Lua — the registry-tested `aux_resume` path, the
+    /// per-version nuances (5.1 rejecting C-function bodies), and provenance
+    /// checks all come for free. The trade-off is that a script which
+    /// reassigns `coroutine.resume` will be observed by the host; hosts that
+    /// need tamper-proof coroutines should drive them before yielding control
+    /// to untrusted Lua.
+    fn coroutine_builtin(&self, name: &str) -> Result<Function> {
+        let coroutine: Table = self.globals().get("coroutine")?;
+        coroutine.get(name)
+    }
+
+    /// Create a new coroutine that will run `func`, as if by
+    /// `coroutine.create(func)`. The returned [`Thread`] is provenance-bound to
+    /// this instance; resuming it from a different [`Lua`] errors cleanly.
+    pub fn create_thread(&self, func: Function) -> Result<Thread> {
+        let create = self.coroutine_builtin("create")?;
+        match create.call::<_, Value>(func)? {
+            Value::Thread(thread) => Ok(thread),
+            _ => Err(Error::from(LuaError::runtime(format_args!(
+                "coroutine.create did not return a thread"
+            )))),
+        }
+    }
+
     pub fn create_function<A, R, F>(&self, func: F) -> Result<Function>
     where
         A: FromLuaMulti + 'static,
@@ -2430,6 +2457,40 @@ pub struct Thread {
     root: RootedValue,
 }
 
+/// The lifecycle state of a coroutine, mirroring the four strings
+/// `coroutine.status` returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadStatus {
+    /// Suspended at a `yield` or freshly created — resumable.
+    Suspended,
+    /// Currently running — the thread that observed its own status.
+    Running,
+    /// Active but has resumed another coroutine, so it cannot be resumed.
+    Normal,
+    /// Finished or errored — not resumable.
+    Dead,
+}
+
+impl ThreadStatus {
+    fn from_status_bytes(bytes: &[u8]) -> Result<Self> {
+        match bytes {
+            b"suspended" => Ok(ThreadStatus::Suspended),
+            b"running" => Ok(ThreadStatus::Running),
+            b"normal" => Ok(ThreadStatus::Normal),
+            b"dead" => Ok(ThreadStatus::Dead),
+            other => Err(Error::from(LuaError::runtime(format_args!(
+                "coroutine.status returned an unknown status: {}",
+                String::from_utf8_lossy(other)
+            )))),
+        }
+    }
+
+    /// Whether a coroutine in this state can be resumed.
+    pub fn is_resumable(self) -> bool {
+        matches!(self, ThreadStatus::Suspended)
+    }
+}
+
 /// Variable argument or return list converted element-by-element.
 ///
 /// This mirrors mlua's `Variadic<T>` enough for dynamic callback bridges:
@@ -3691,6 +3752,50 @@ impl Thread {
     /// A stable identity token for this thread. See [`Table::to_pointer`].
     pub fn to_pointer(&self) -> Result<usize> {
         handle_pointer(&self.root, "thread")
+    }
+
+    /// Resume this coroutine with `args`, as if by `coroutine.resume(self,
+    /// ...)`. On a normal yield or return, the yielded/returned values are
+    /// converted to `R`. If the coroutine raises, the error is returned as an
+    /// `Err` carrying the Lua error value — matching the `false, err` form
+    /// `coroutine.resume` produces, surfaced here as a `Result`.
+    pub fn resume<A, R>(&self, args: A) -> Result<R>
+    where
+        A: IntoLuaMulti,
+        R: FromLuaMulti,
+    {
+        let lua = self.root.lua.clone();
+        let resume = lua.coroutine_builtin("resume")?;
+        let mut call_args = Vec::new();
+        call_args.push(Value::Thread(self.clone()));
+        call_args.extend(args.into_lua_multi(&lua)?);
+        let mut returns = resume
+            .call::<_, Variadic<Value>>(Variadic::from(call_args))?
+            .into_vec();
+        let ok = match returns.first() {
+            Some(Value::Boolean(ok)) => *ok,
+            _ => {
+                return Err(Error::from(LuaError::runtime(format_args!(
+                    "coroutine.resume did not return a status boolean"
+                ))))
+            }
+        };
+        returns.remove(0);
+        if ok {
+            R::from_lua_multi(returns, &lua)
+        } else {
+            let err_val = returns.into_iter().next().unwrap_or(Value::Nil);
+            let raw = lua.with_state(|state| err_val.to_raw_for_lua(&lua, state))?;
+            Err(Error::from(LuaError::from_value(raw)))
+        }
+    }
+
+    /// This coroutine's lifecycle state, as `coroutine.status(self)` reports it.
+    pub fn status(&self) -> Result<ThreadStatus> {
+        let lua = self.root.lua.clone();
+        let status = lua.coroutine_builtin("status")?;
+        let name = status.call::<_, LuaString>(Value::Thread(self.clone()))?;
+        ThreadStatus::from_status_bytes(&name.as_bytes()?)
     }
 }
 
