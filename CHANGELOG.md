@@ -4,6 +4,25 @@ All notable changes to `lua-rs` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-06-27
+
+### Added — async host functions (`async` feature)
+
+`Lua::create_async_function` registers a Rust `async` function callable from Lua;
+`Function::call_async` / `Chunk::eval_async` / `exec_async` drive Lua from Rust
+while awaiting host async functions. Built on the coroutine machinery (no VM/GC/
+unsafe changes): an async function yields a per-function capability token
+(light-userdata, unforgeable by Lua and version-invariant), and the driver awaits
+the registered Rust future with no VM borrow held — rooting of the suspended
+coroutine is inherited from the coroutine path. The genuine `coroutine.*`
+primitives are captured at construction into the script-inaccessible registry, so
+global reassignment cannot bypass or break async dispatch (important for the
+untrusted-script case). Executor-agnostic and `!Send` (use a single-threaded
+executor such as tokio's `LocalSet`); pure-std, no new dependencies; the `async`
+feature enables `coroutine`. A future error propagates to the Rust caller (the
+coroutine is left suspended); native-only (no wasm executor). Implements
+`specs/embedding/async-integration.md`.
+
 ## [0.4.1] - 2026-06-27
 
 ### Added — serde integration (`LuaSerdeExt`)
