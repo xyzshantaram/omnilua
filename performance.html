@@ -35,7 +35,7 @@
   <main class="frame" id="top">
     <section class="hero" style="padding-bottom:36px">
       <h1 class="rise" style="font-size:clamp(40px,7vw,80px)">omniLua vs<br><em>reference&nbsp;C</em></h1>
-      <p class="sub rise d1">omniLua runs at about 1.37× the wall-clock time of reference C across the tracked workloads, or 1.3× with PGO. It's a bytecode interpreter, not a JIT, so it isn't LuaJIT-fast. Memory safety costs almost nothing; the gap to C comes from how values are represented and dispatched.</p>
+      <p class="sub rise d1">About 1.37× the wall-clock time of reference C across the tracked workloads (1.3× with PGO). Memory safety costs almost nothing — the gap is value representation and dispatch.</p>
     </section>
 
     <section style="padding-top:0;border-top:0">
@@ -52,7 +52,7 @@
         <h2>The numbers</h2>
         <span class="sec-rule"></span>
       </div>
-      <p class="sec-intro">Ratio = omniLua ÷ reference C on the same workload; lower is better, parity is <code>1.00×</code>. The headline below is the latest benchmarked commit by workload; the trajectory charts under it plot every commit — zoom each with its own y-max and window controls (the earliest commits are pre-optimization, so zoom out to see them), hover a point for the commit, click a legend chip to mute a series.</p>
+      <p class="sec-intro">Ratio = omniLua ÷ reference C on the same workload. Lower is better; <code>1.00×</code> is parity.</p>
 
       <div class="chart-block" id="snapshot">
         <h3>Latest commit, by workload</h3>
@@ -88,9 +88,7 @@
         <div class="chart-legend" id="rss-legend"></div>
       </div>
 
-      <p class="methodology">
-        <b>Provenance.</b> omniLua ÷ reference PUC-Rio Lua&nbsp;5.4.7, best wall-clock of interleaved ref/omniLua pairs per commit (<code>harness/bench/compare.sh</code>), recorded to the evidence ledger and plotted in the charts above. The earliest commits show large ratios (pre-optimization) — clip them with the y-max control. At the latest benchmarked commit the wall geomean is ≈1.37× across the tracked workloads; three beat C outright — the table-bulk benchmarks, where omniLua's table representation pays off. The slowest rows are GC- and call-heavy (<code>gc_pressure</code>, <code>binarytrees</code>, <code>closure_ops</code>). Perf claims follow <code>docs/MEASUREMENT_PROTOCOL.md</code>.
-      </p>
+      <p class="methodology">omniLua ÷ reference Lua&nbsp;5.4.7, best of interleaved runs per commit. Three workloads beat C (table-bulk); the slowest are GC- and call-heavy. Method: <code>docs/MEASUREMENT_PROTOCOL.md</code>.</p>
     </section>
 
     <section id="gap">
@@ -98,41 +96,29 @@
         <h2>Where the gap is</h2>
         <span class="sec-rule"></span>
       </div>
-      <p class="sec-intro">Safe Rust is often assumed to be slow because of bounds checks and borrow guards. We measured that by removing them, and it isn't where the time goes.</p>
+      <p class="sec-intro">We removed the bounds checks and borrow guards to measure them. That's not where the time goes.</p>
 
       <div class="decomp">
         <div class="d zero">
           <div class="d-tax">~0%</div>
           <h3>Safety tax</h3>
-          <p>Removing bounds checks and <code>RefCell</code> guards recovers almost no wall time, so memory safety isn't the cost. There's no <code>unsafe</code> outside the GC, the dynamic-library loader, and the wasm pointer ABI.</p>
+          <p>Bounds checks and <code>RefCell</code> guards cost almost no wall time. No <code>unsafe</code> outside the GC, the loader, and the wasm ABI.</p>
         </div>
         <div class="d">
           <div class="d-tax">16 vs 8</div>
           <h3>Representation</h3>
-          <p>Each Lua value is <code>16</code> bytes where C packs <code>8</code>, because NaN-boxing isn't done yet. That wider value is copied on every register move, and it's the biggest part of the roughly 2.3× instruction-count gap on the hot path. NaN-boxing would close most of it.</p>
+          <p>Each value is <code>16</code> bytes where C packs <code>8</code> (no NaN-boxing yet) — most of the ~2.3× instruction gap on the hot path.</p>
         </div>
         <div class="d">
           <div class="d-tax">dispatch</div>
-          <h3>Dispatch &amp; layout</h3>
-          <p>The rest is interpreter dispatch and code layout — the gap between a <code>match</code> loop and C's computed-goto threading. PGO recovers part of it; the remainder tracks the representation work above.</p>
+          <h3>Dispatch</h3>
+          <p>A <code>match</code> loop versus C's computed-goto threading. PGO recovers some of it.</p>
         </div>
       </div>
 
-      <p class="lead" style="margin-top:44px">The gap to C is representation and dispatch, and both have known fixes. Neither is the price of safety.</p>
-    </section>
-
-    <section id="not">
-      <div class="sec-head">
-        <h2>Not a JIT</h2>
-        <span class="sec-rule"></span>
-      </div>
-      <div class="aside">
-        <p>omniLua is a bytecode interpreter, not a JIT, and it isn't faster than reference C. If you need LuaJIT speed or a mature C binding, use <a href="https://github.com/mlua-rs/mlua">mlua</a>. What omniLua gives you instead is the same runtime natively and on <code>wasm32</code>, in safe Rust, at a competitive speed.</p>
-      </div>
-      <div class="hero-cta" style="margin-top:34px">
+      <div class="hero-cta" style="margin-top:40px">
         <a class="btn" href="./index.html#playground">Try it in the playground ▸</a>
       </div>
-      <p class="methodology" style="margin-top:24px">The benchmark harness measures the omniLua / reference-C ratio (wall + RSS), not absolute throughput — the ratio is the only fair number across machines. Methodology: <code>harness/bench/compare.sh</code>; perf claims follow the frozen-baseline interleaved A/B protocol in <code>docs/MEASUREMENT_PROTOCOL.md</code>.</p>
     </section>
   </main>
 
