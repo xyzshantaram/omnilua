@@ -40,7 +40,7 @@
 
     <section style="padding-top:0;border-top:0">
       <div class="stats rise d2">
-        <div class="stat"><div class="s-num">1.37<span class="x">×</span></div><div class="s-lbl">wall-time geomean<br>dashboard workloads, stock</div></div>
+        <div class="stat"><div class="s-num">1.37<span class="x">×</span></div><div class="s-lbl">wall-time geomean<br>tracked workloads, stock</div></div>
         <div class="stat win"><div class="s-num">0.42<span class="x">×</span></div><div class="s-lbl">table_ops_long<br>2.4× faster than C</div></div>
         <div class="stat win"><div class="s-num">~0<span class="x">%</span></div><div class="s-lbl">safety tax<br>bounds + RefCell guards</div></div>
         <div class="stat"><div class="s-num">1.72<span class="x">×</span></div><div class="s-lbl">peak memory geomean<br>vs reference C</div></div>
@@ -89,7 +89,7 @@
       </div>
 
       <p class="methodology">
-        <b>Provenance.</b> omniLua ÷ reference PUC-Rio Lua&nbsp;5.4.7, best wall-clock of interleaved ref/omniLua pairs per commit (<code>harness/bench/compare.sh</code>), recorded to the evidence ledger and plotted live above; the standalone <a href="./harness/bench/history/">dashboard</a> renders the same data with per-commit detail. The earliest commits show large ratios (pre-optimization) — clip them with the y-max control. At the latest benchmarked commit the wall geomean is ≈1.37× across the tracked workloads; three beat C outright — the table-bulk benchmarks, where omniLua's table representation pays off. The slowest rows are GC- and call-heavy (<code>gc_pressure</code>, <code>binarytrees</code>, <code>closure_ops</code>). Perf claims follow <code>docs/MEASUREMENT_PROTOCOL.md</code>.
+        <b>Provenance.</b> omniLua ÷ reference PUC-Rio Lua&nbsp;5.4.7, best wall-clock of interleaved ref/omniLua pairs per commit (<code>harness/bench/compare.sh</code>), recorded to the evidence ledger and plotted in the charts above. The earliest commits show large ratios (pre-optimization) — clip them with the y-max control. At the latest benchmarked commit the wall geomean is ≈1.37× across the tracked workloads; three beat C outright — the table-bulk benchmarks, where omniLua's table representation pays off. The slowest rows are GC- and call-heavy (<code>gc_pressure</code>, <code>binarytrees</code>, <code>closure_ops</code>). Perf claims follow <code>docs/MEASUREMENT_PROTOCOL.md</code>.
       </p>
     </section>
 
@@ -130,8 +130,7 @@
         <p>omniLua is a bytecode interpreter, not a JIT, and it isn't faster than reference C. If you need LuaJIT speed or a mature C binding, use <a href="https://github.com/mlua-rs/mlua">mlua</a>. What omniLua gives you instead is the same runtime natively and on <code>wasm32</code>, in safe Rust, at a competitive speed.</p>
       </div>
       <div class="hero-cta" style="margin-top:34px">
-        <a class="btn" href="./harness/bench/history/">Live per-commit dashboard ↗</a>
-        <a class="btn ghost" href="./index.html#playground">Try it in the playground ▸</a>
+        <a class="btn" href="./index.html#playground">Try it in the playground ▸</a>
       </div>
       <p class="methodology" style="margin-top:24px">The benchmark harness measures the omniLua / reference-C ratio (wall + RSS), not absolute throughput — the ratio is the only fair number across machines. Methodology: <code>harness/bench/compare.sh</code>; perf claims follow the frozen-baseline interleaved A/B protocol in <code>docs/MEASUREMENT_PROTOCOL.md</code>.</p>
     </section>
