@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>omniLua — performance</title>
-  <meta name="description" content="omniLua benchmarks vs reference C: ~1.37× wall-time geomean across the tracked workloads, faster than C on three of them, and a safety tax of roughly zero. The residual gap is value representation and dispatch, not memory safety.">
+  <meta name="description" content="omniLua benchmarks vs reference C: about 1.37× wall-time geomean across the tracked workloads, faster than C on three of them. Memory safety costs almost nothing; the gap comes from value representation and dispatch.">
   <meta property="og:title" content="omniLua — performance">
-  <meta property="og:description" content="Competitive with reference C, not LuaJIT. The safety tax is ~0% of wall time; the residual gap is representation, not safety.">
+  <meta property="og:description" content="omniLua benchmarks vs reference C: about 1.37× wall time, faster on three workloads, with memory safety costing almost nothing.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://ianm199.github.io/omnilua/performance.html">
   <meta property="og:image" content="https://ianm199.github.io/omnilua/assets/og.png">
@@ -33,8 +33,8 @@
 
   <main class="frame" id="top">
     <section class="hero" style="padding-bottom:36px">
-      <h1 class="rise" style="font-size:clamp(40px,7vw,80px)">Performance,<br><em>measured.</em></h1>
-      <p class="sub rise d1">omniLua is competitive with reference C, not faster than it, and not LuaJIT. What it <b>is</b> able to say precisely: the cost of memory safety is roughly zero, and the residual gap to C is value representation and dispatch — both recoverable, neither structural to safety.</p>
+      <h1 class="rise" style="font-size:clamp(40px,7vw,80px)">omniLua vs<br><em>reference&nbsp;C</em></h1>
+      <p class="sub rise d1">omniLua runs at about 1.37× the wall-clock time of reference C across the tracked workloads, or 1.3× with PGO. It's a bytecode interpreter, not a JIT, so it isn't LuaJIT-fast. Memory safety costs almost nothing; the gap to C comes from how values are represented and dispatched.</p>
     </section>
 
     <section style="padding-top:0;border-top:0">
@@ -48,7 +48,6 @@
 
     <section id="numbers">
       <div class="sec-head">
-        <span class="sec-num">§&nbsp;01</span>
         <h2>The numbers</h2>
         <span class="sec-rule"></span>
       </div>
@@ -95,22 +94,21 @@
 
     <section id="gap">
       <div class="sec-head">
-        <span class="sec-num">§&nbsp;02</span>
         <h2>Where the gap is</h2>
         <span class="sec-rule"></span>
       </div>
-      <p class="sec-intro">A common assumption is that safe Rust is slow because of bounds checks and runtime borrow guards. We ablated exactly that. It is not where the time goes.</p>
+      <p class="sec-intro">Safe Rust is often assumed to be slow because of bounds checks and borrow guards. We measured that by removing them, and it isn't where the time goes.</p>
 
       <div class="decomp">
         <div class="d zero">
           <div class="d-tax">~0%</div>
           <h3>Safety tax</h3>
-          <p>Removing bounds checks and <code>RefCell</code> guards recovers roughly zero reliable wall time. Memory safety is not the cost. The unsafe budget stays at zero outside the GC, the dynamic-library loader, and the wasm pointer ABI.</p>
+          <p>Removing bounds checks and <code>RefCell</code> guards recovers almost no wall time, so memory safety isn't the cost. There's no <code>unsafe</code> outside the GC, the dynamic-library loader, and the wasm pointer ABI.</p>
         </div>
         <div class="d">
           <div class="d-tax">16 vs 8</div>
           <h3>Representation</h3>
-          <p>Each Lua value is <code>16</code> bytes where C packs <code>8</code> (NaN-boxing not yet done). That wider value — copied through every register move — is the largest share of the residual ≈2.3× instruction-count gap on the hot path. It is a known, recoverable lever.</p>
+          <p>Each Lua value is <code>16</code> bytes where C packs <code>8</code>, because NaN-boxing isn't done yet. That wider value is copied on every register move, and it's the biggest part of the roughly 2.3× instruction-count gap on the hot path. NaN-boxing would close most of it.</p>
         </div>
         <div class="d">
           <div class="d-tax">dispatch</div>
@@ -119,17 +117,16 @@
         </div>
       </div>
 
-      <p class="lead" style="margin-top:44px">The headline, stated plainly: <em style="font-style:italic;color:var(--accent)">the residual gap to C is representation, not safety.</em> That is the difference between a wall the project is stuck behind and a lever it has not yet pulled.</p>
+      <p class="lead" style="margin-top:44px">The gap to C is representation and dispatch, and both have known fixes. Neither is the price of safety.</p>
     </section>
 
     <section id="not">
       <div class="sec-head">
-        <span class="sec-num">§&nbsp;03</span>
-        <h2>What it is not</h2>
+        <h2>Not a JIT</h2>
         <span class="sec-rule"></span>
       </div>
       <div class="aside">
-        <p>This is <b>not LuaJIT</b>, and it is not faster than reference C in general — it is a faithful bytecode interpreter that happens to be pure, safe Rust. If you need LuaJIT-class throughput or a decades-mature binding, use <a href="https://github.com/mlua-rs/mlua">mlua</a>. omniLua's argument is reach and safety at a competitive constant factor: the same runtime native and on <code>wasm32</code>, with the cost of that safety measured at roughly nothing.</p>
+        <p>omniLua is a bytecode interpreter, not a JIT, and it isn't faster than reference C. If you need LuaJIT speed or a mature C binding, use <a href="https://github.com/mlua-rs/mlua">mlua</a>. What omniLua gives you instead is the same runtime natively and on <code>wasm32</code>, in safe Rust, at a competitive speed.</p>
       </div>
       <div class="hero-cta" style="margin-top:34px">
         <a class="btn" href="./harness/bench/history/">Live per-commit dashboard ↗</a>
@@ -148,7 +145,7 @@
         <a href="https://www.npmjs.com/package/omnilua">npm ↗</a>
         <a href="https://docs.rs/omnilua">docs.rs ↗</a>
       </div>
-      <p class="honesty">≈1.37× geomean of reference-C wall time across the tracked workloads (≈1.3× with PGO) — competitive, not faster, and not LuaJIT. Numbers are tracked per-commit; the safety tax is measured, not assumed.</p>
+      <p class="fineprint">About 1.37× reference-C wall time across the tracked workloads (1.3× with PGO), tracked per commit.</p>
       <p class="colophon">omniLua is a port of <a href="https://www.lua.org/">Lua</a>, created by Roberto Ierusalimschy, Luiz Henrique de Figueiredo, and Waldemar Celes at PUC-Rio. Lua and this port are both distributed under the MIT license. <em>Set in Fraunces, Spectral &amp; IBM&nbsp;Plex&nbsp;Mono.</em></p>
     </div>
   </footer>

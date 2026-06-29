@@ -1,13 +1,12 @@
 # omnilua
 
-Run Lua in the browser or Node, with no C interpreter to bundle and no native
-build step. `omnilua` is a pure-Rust Lua runtime compiled to WebAssembly — you
-ship one `.wasm` file and a small JS wrapper, and it runs the same Lua your
-backend does.
+`omnilua` runs Lua in the browser or Node. It's a pure-Rust Lua runtime compiled
+to WebAssembly, so you ship one `.wasm` file and a small JS wrapper — no C
+interpreter to bundle and no native build step. It runs the same Lua as the
+native crate.
 
-If your app — or your game — ships a wasm build, a C-backed Lua binding can't
-follow it. omniLua is pure Rust: the same scripting runtime compiles natively
-and to `wasm32-unknown-unknown`, with no Emscripten and no toolchain gymnastics.
+A C-backed Lua binding can't compile to `wasm32-unknown-unknown`. omnilua is
+pure Rust, so it does, with no Emscripten.
 
 ## Install
 
@@ -15,14 +14,14 @@ and to `wasm32-unknown-unknown`, with no Emscripten and no toolchain gymnastics.
 npm install omnilua
 ```
 
-The package ships the `.wasm` artifact plus an ES-module wrapper. There is no
+The package ships the `.wasm` file and an ES-module wrapper. There's no
 postinstall build and no native dependency.
 
 ## Use it
 
-You give the runtime a host environment (virtual files, env vars, a stdout
-sink), then run Lua source through it. The runtime keeps one Lua state alive
-across `exec` calls until you `reset()`.
+Give the runtime a host environment (virtual files, env vars, a stdout sink),
+then run Lua source through it. The runtime keeps one Lua state alive across
+`exec` calls until you `reset()`.
 
 ```js
 import { loadLuaRs, luaRsWasmUrl } from "omnilua";
@@ -41,8 +40,8 @@ lua.exec(`
 `);
 ```
 
-`exec` throws on a Lua error. When you want to inspect the failure instead of
-catching an exception, use `tryExec`:
+`exec` throws on a Lua error. To inspect the failure instead of catching an
+exception, use `tryExec`:
 
 ```js
 const result = lua.tryExec('error("boom")');
@@ -50,8 +49,8 @@ console.log(result.ok);    // false
 console.log(result.error); // the Lua error text
 ```
 
-In Node without a bundler, read the packaged `.wasm` with the `/node` entry
-point, which otherwise behaves identically:
+In Node without a bundler, use the `/node` entry point. It reads the packaged
+`.wasm` and otherwise behaves the same:
 
 ```js
 import { loadLuaRsNode } from "omnilua/node";
@@ -64,11 +63,10 @@ lua.exec('print("hello from node")');
 
 ## Running untrusted scripts
 
-Bound CPU and memory and strip host access before running scripts you don't
-trust. Limits are enforced on every thread (coroutines included) and **cannot be
-caught** with `pcall`. Call `setLimits` once, then run as usual; `lastTrip`
-reports which limit (if any) stopped a run, and `sandboxReset` refills the
-budget.
+Set CPU and memory limits and strip host access before running scripts you don't
+trust. The limits apply to every thread, including coroutines, and can't be
+caught with `pcall`. Call `setLimits` once, then run as usual. `lastTrip` reports
+which limit stopped a run, and `sandboxReset` refills the budget.
 
 ```js
 lua.setLimits({
@@ -86,12 +84,10 @@ lua.sandboxReset(); // refill the budget for the next run
 
 Omit a limit (or pass `0`) to leave that dimension unbounded.
 
-## Which Lua version
+## Choosing a Lua version
 
-omniLua's defining feature — running 5.1, 5.2, 5.3, 5.4, and 5.5 from one core,
-selected per instance — is now live in this package. **All five backends ship
-inside the single `.wasm` file**; you pick the version when you load it, with no
-second download and no recompile:
+All five versions — 5.1, 5.2, 5.3, 5.4, and 5.5 — ship in the one `.wasm` file.
+Pick the version when you load it; there's no second download and no recompile:
 
 ```js
 import { loadLuaRs, luaRsWasmUrl } from "omnilua";
@@ -99,30 +95,24 @@ import { loadLuaRs, luaRsWasmUrl } from "omnilua";
 const { lua: lua51 } = await loadLuaRs(luaRsWasmUrl, { version: "5.1" });
 const { lua: lua54 } = await loadLuaRs(luaRsWasmUrl, { version: "5.4" });
 
-lua51.tryExec("print(3 / 3)"); // 1     — float-only model (5.1)
-lua54.tryExec("print(3 / 3)"); // 1.0   — dual-subtype model (5.4)
+lua51.tryExec("print(3 / 3)"); // 1     (5.1 has no integer type)
+lua54.tryExec("print(3 / 3)"); // 1.0   (5.4 has integers)
 ```
 
-`version` accepts `"5.1"`, `"5.2"`, `"5.3"`, `"5.4"`, or `"5.5"`; the default is
-`"5.4"`. You can also switch an existing runtime in place — `lua.setVersion("5.2")`
-rebuilds it on that backend (resetting state), and `lua.currentVersion()` reports
-which version it speaks. The version determines the standard-library roster too:
-`bit32` only exists on 5.2, `utf8`/`string.pack` only on 5.3+, and so on. The
-[playground](https://ianm199.github.io/omnilua/) drives exactly this API to run
-one snippet across all five versions side by side.
+`version` accepts `"5.1"` through `"5.5"`; the default is `"5.4"`.
+`lua.setVersion("5.2")` switches an existing runtime, resetting its state, and
+`lua.currentVersion()` reports the current one. The version also sets the
+standard-library roster: `bit32` is 5.2 only, `utf8` and `string.pack` are 5.3+,
+and so on. The [playground](https://ianm199.github.io/omnilua/) uses this API to
+run one snippet across all five versions.
 
-Carrying every backend in one module costs almost nothing: the core already
-multiplexes all five versions, so wiring up per-instance selection added under a
-kilobyte to the `.wasm` (≈1.16 MB total). There is no per-version bundle to pick
-between — one file is every Lua.
+## Size
 
-## Size expectations
-
-You ship one WebAssembly module (the Lua runtime — lexer, parser, VM, GC, and
-standard library) plus a few kilobytes of JS wrapper. There is no Emscripten
-glue and no separate `liblua`. Serve the `.wasm` with `Content-Type:
-application/wasm` and gzip/brotli compression and let the browser stream-compile
-it; `loadLuaRs(luaRsWasmUrl)` fetches it for you.
+You ship one WebAssembly module — lexer, parser, VM, GC, and standard library,
+about 1.16 MB — plus a few kilobytes of JS. There's no Emscripten glue and no
+separate `liblua`. Serve the `.wasm` with `Content-Type: application/wasm` and
+gzip or brotli, and the browser stream-compiles it; `loadLuaRs(luaRsWasmUrl)`
+fetches it for you.
 
 ## Links
 
@@ -130,11 +120,10 @@ it; `loadLuaRs(luaRsWasmUrl)` fetches it for you.
   [github.com/ianm199/omnilua](https://github.com/ianm199/omnilua)
 - Live playground (all five Lua versions):
   [ianm199.github.io/omnilua](https://ianm199.github.io/omnilua/)
-- Embedding in Rust (the native crate): [`omnilua` on
-  crates.io](https://crates.io/crates/omnilua)
+- Embedding in Rust (the native crate):
+  [`omnilua` on crates.io](https://crates.io/crates/omnilua)
 
 ## License
 
 A port of [Lua](https://www.lua.org/) (PUC-Rio). Lua and this port are both
-MIT-licensed.
-</content>
+MIT licensed.
