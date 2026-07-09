@@ -1868,6 +1868,34 @@ impl Lua {
         self.with_state(|state| state.gc().full_collect());
     }
 
+    /// DIAGNOSTIC (temporary): number of live GC-tracked objects on the
+    /// collectable owner lists. For leak investigation only.
+    #[doc(hidden)]
+    pub fn diag_allgc_count(&self) -> usize {
+        self.with_state(|state| state.global().heap.allgc_count())
+    }
+
+    /// DIAGNOSTIC (temporary): number of live external roots (each live Rust
+    /// `Function`/`Table`/etc. handle holds one). For leak investigation only.
+    #[doc(hidden)]
+    pub fn diag_external_root_count(&self) -> usize {
+        self.with_state(|state| state.global().external_roots.len())
+    }
+
+    /// DIAGNOSTIC (temporary): number of external-root keys queued for deferred
+    /// unrooting (handles dropped while the state was borrowed). For leak
+    /// investigation only.
+    #[doc(hidden)]
+    pub fn diag_pending_unroot_count(&self) -> usize {
+        self.inner.pending_external_unroots.borrow().len()
+    }
+
+    /// DIAGNOSTIC (temporary): type names of all live external-root values.
+    #[doc(hidden)]
+    pub fn diag_live_root_types(&self) -> Vec<&'static str> {
+        self.with_state(|state| state.global().external_roots.diag_live_type_names())
+    }
+
     /// A handle to this instance's garbage collector, mirroring mlua's GC
     /// control surface. The methods drive the `collectgarbage` builtin, so they
     /// match `collectgarbage(...)` exactly — including the per-version option

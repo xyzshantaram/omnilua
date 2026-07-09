@@ -1527,6 +1527,15 @@ impl ExternalRootSet {
         }
     }
 
+    /// DIAGNOSTIC (temporary): type names of all live external-root values.
+    #[doc(hidden)]
+    pub fn diag_live_type_names(&self) -> Vec<&'static str> {
+        self.slots
+            .iter()
+            .filter_map(|s| s.value.as_ref().map(|v| v.type_name()))
+            .collect()
+    }
+
     pub fn replace(&mut self, key: ExternalRootKey, value: LuaValue) -> Option<LuaValue> {
         let slot = self.slots.get_mut(key.index)?;
         if slot.generation != key.generation || slot.value.is_none() {
