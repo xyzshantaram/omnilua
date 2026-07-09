@@ -1427,6 +1427,16 @@ pub struct Heap {
     /// linked through `header.next` (unused once unlinked from the owner
     /// list). Freed for real in `drop_all`.
     quarantined: Cell<Option<NonNull<GcBox<dyn Trace>>>>,
+    /// Intrusive list of "uncollected" allocations: objects that must never be
+    /// swept during the heap's life (bootstrap roots — interned strings,
+    /// tagmethod tables, stdlib metatables — allocated before the world is
+    /// consistent, plus any legacy `GcRef::new` call with no active heap
+    /// guard). They are deliberately kept off the collectable owner lists so
+    /// the sweeper never touches them, but they ARE owned by the heap and are
+    /// freed in [`drop_all`], so dropping the `Heap` (and thus the `Lua` VM)
+    /// reclaims them instead of leaking until process exit. Linked through
+    /// `header.next`.
+    uncollected: Cell<Option<NonNull<GcBox<dyn Trace>>>>,
     /// Multiplier on bytes_used to set next threshold after collection.
     pause_multiplier: Cell<usize>,
     /// State machine for the incremental collector.
@@ -1434,6 +1444,17 @@ pub struct Heap {
     /// If true, `step` and `barrier` are no-ops (for bootstrap before the
     /// world is consistent).
     paused: Cell<bool>,
+    /// True only while the VM is bootstrapping (installing the parser hook,
+    /// standard libraries, tagmethod tables, interned strings) and the world is
+    /// not yet consistent. Set by [`begin_bootstrap`](Self::begin_bootstrap) at
+    /// the start of `lua_open` and cleared by [`end_bootstrap`](Self::end_bootstrap)
+    /// once the runtime finishes wiring up. While set, heap-routed
+    /// [`GcRef::new`] allocations are parked on the `uncollected` list so the
+    /// incremental collector never sweeps these permanent roots — but they are
+    /// still owned by the heap and freed on drop (no leak). Defaults to `false`
+    /// so a bare [`Heap::new`] used outside a full VM behaves normally
+    /// (allocations under a `HeapGuard` are collectable).
+    bootstrapping: Cell<bool>,
     /// Counter of completed collections performed (for diagnostics).
     collections: Cell<usize>,
     /// Counter of completed young-generation collections.
@@ -1499,9 +1520,11 @@ impl Heap {
             stress: std::env::var_os("LUA_RS_GC_STRESS").is_some_and(|v| v == "1"),
             quarantine: std::env::var_os("LUA_RS_GC_QUARANTINE").is_some_and(|v| v == "1"),
             quarantined: Cell::new(None),
+            uncollected: Cell::new(None),
             pause_multiplier: Cell::new(200), // 200% = collect when bytes 2x threshold
             state: Cell::new(GcState::Pause),
             paused: Cell::new(true), // start paused; caller enables when world is consistent
+            bootstrapping: Cell::new(false), // set by begin_bootstrap() during lua_open
             collections: Cell::new(0),
             minor_collections: Cell::new(0),
             full_collections: Cell::new(0),
@@ -1523,6 +1546,33 @@ impl Heap {
 
     pub fn is_paused(&self) -> bool {
         self.paused.get()
+    }
+
+    /// Enter bootstrap mode: heap-routed [`GcRef::new`] allocations are parked
+    /// on the permanent `uncollected` list rather than the collectable owner
+    /// list. Called at the very start of `lua_open`, before any standard
+    /// library, parser hook, tagmethod table or interned string is created,
+    /// because the collector cannot safely sweep while the world is being built
+    /// up. Paired with [`end_bootstrap`](Self::end_bootstrap).
+    pub fn begin_bootstrap(&self) {
+        self.bootstrapping.set(true);
+    }
+
+    /// End bootstrap mode: subsequent [`GcRef::new`] allocations join the
+    /// normal collectable owner list instead of the permanent `uncollected`
+    /// list. Called once the VM's standard libraries are fully installed and
+    /// the world is consistent. Independent of [`unpause`] because the GC is
+    /// unpaused partway through `lua_open`, while library installation (and its
+    /// permanent root allocations) continues afterwards.
+    pub fn end_bootstrap(&self) {
+        self.bootstrapping.set(false);
+    }
+
+    /// Whether the VM is still bootstrapping (before [`end_bootstrap`]).
+    /// While true, heap-routed allocations should be parked as uncollected
+    /// permanent roots. See [`allocate_uncollected`](Self::allocate_uncollected).
+    pub fn is_bootstrapping(&self) -> bool {
+        self.bootstrapping.get()
     }
 
     /// Allocate a new `GcBox<T>` and prepend it to the allgc chain.
@@ -1548,6 +1598,33 @@ impl Heap {
     /// Bytes currently retained by GC-tracked objects (rough estimate).
     pub fn bytes_used(&self) -> usize {
         self.bytes.get()
+    }
+
+    /// Allocate a new `GcBox<T>` that is owned by the heap but kept off every
+    /// collectable owner list, so the sweeper never reclaims it during the
+    /// heap's life. Used for bootstrap roots and legacy `GcRef::new` calls made
+    /// with no active heap guard. Unlike the old free-standing
+    /// `Gc::new_uncollected` (which leaked until process exit), the box is
+    /// linked onto the heap's `uncollected` list and freed in [`drop_all`], so
+    /// dropping the `Heap`/`Lua` reclaims it.
+    pub fn allocate_uncollected<T: Trace + 'static>(&self, value: T) -> Gc<T> {
+        let size = std::mem::size_of::<GcBox<T>>();
+        // Flags `0` (no HDR_COLLECTED): matches the previous `new_uncollected`
+        // semantics so any code that inspects the collected flag behaves the
+        // same as before this list existed.
+        let boxed = Box::new(GcBox {
+            header: GcHeader::new_white(size, Color::White0, 0),
+            value,
+        });
+        boxed.header.next.set(self.uncollected.get());
+        let raw: *mut GcBox<T> = Box::into_raw(boxed);
+        let ptr: NonNull<GcBox<T>> = NonNull::new(raw).expect("Box::into_raw is non-null");
+        let dyn_ptr: NonNull<GcBox<dyn Trace>> = ptr;
+        self.uncollected.set(Some(dyn_ptr));
+        Gc {
+            ptr,
+            _marker: PhantomData,
+        }
     }
 
     /// Adjust the heap's pacer byte counter by a signed delta, saturating at
@@ -2821,6 +2898,7 @@ impl Heap {
         self.drop_list(&self.finobj);
         self.drop_list(&self.tobefnz);
         self.drop_list(&self.quarantined);
+        self.drop_list(&self.uncollected);
         self.bytes.set(0);
         self.objects.set(0);
     }

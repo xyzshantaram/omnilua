@@ -25,12 +25,16 @@ pub struct GcRef<T: Trace + 'static>(pub Gc<T>);
 
 impl<T: Trace + 'static> GcRef<T> {
     /// Allocate a new GC-tracked value. If a `HeapGuard` is active (set by
-    /// `state.run()` / `pcall_k`), the new allocation joins that heap's
-    /// allgc chain. Otherwise it allocates "uncollected" — leaks until
-    /// process exit, same as the old `Rc::new` behavior.
+    /// `state.run()` / `pcall_k`), the new allocation normally joins that
+    /// heap's allgc chain. During bootstrap (before the heap's first
+    /// `unpause`), or when no `HeapGuard` is active, the value is allocated
+    /// "uncollected": kept off every collectable owner list so the sweeper
+    /// never reclaims it during the VM's life, yet still owned by the heap and
+    /// freed when the heap drops (no process-lifetime leak).
     pub fn new(value: T) -> Self {
         let gc = lua_gc::with_current_heap(|heap| match heap {
-            Some(heap) => heap.allocate(value),
+            Some(heap) if !heap.is_bootstrapping() => heap.allocate(value),
+            Some(heap) => heap.allocate_uncollected(value),
             None => Gc::new_uncollected(value),
         });
         GcRef(gc)

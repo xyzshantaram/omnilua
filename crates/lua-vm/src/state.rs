@@ -6524,7 +6524,39 @@ pub fn new_state() -> Option<LuaState> {
     // error_sites.tsv: luaD_rawrunprotected → state.run_protected(|s| f(s, ud))
     // PORT NOTE: We call lua_open directly since we're not using the protected-call
     // machinery yet (ldo.c is not ported). Errors from lua_open propagate as Err.
-    match lua_open(&mut main_thread) {
+    //
+    // A HeapGuard is active for the whole of `lua_open` so that the bootstrap
+    // allocations (parser hook, standard libraries, tagmethod tables, interned
+    // strings) route through the heap instead of the old guard-less
+    // `Gc::new_uncollected` path — which allocated boxes that were never owned
+    // by any heap list and therefore leaked until process exit (visible as
+    // ~29KB lost per `Lua::new()`/drop under valgrind). Bootstrap mode is
+    // entered for the duration of `lua_open` so these permanent-root
+    // allocations are parked on the heap's `uncollected` list: never swept
+    // during the VM's life, but freed when the `Heap` (and thus the `Lua` VM)
+    // drops. Bootstrap is ended before returning so a bare `new_state()` (used
+    // by the low-level GC tests) hands back a heap in normal collectable mode;
+    // the higher-level `Lua::new` path re-enters bootstrap around its own
+    // library-installation steps.
+    let open_result = {
+        {
+            let g = main_thread.global();
+            g.heap.begin_bootstrap();
+        }
+        let result = {
+            let _heap_guard = {
+                let g = main_thread.global();
+                lua_gc::HeapGuard::push(&g.heap)
+            };
+            lua_open(&mut main_thread)
+        };
+        {
+            let g = main_thread.global();
+            g.heap.end_bootstrap();
+        }
+        result
+    };
+    match open_result {
         Ok(()) => {}
         Err(_) => {
             close_state(&mut main_thread);

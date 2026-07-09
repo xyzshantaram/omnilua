@@ -962,10 +962,24 @@ impl Lua {
         }
         let mut state = new_state().ok_or(LuaError::Memory)?;
         state.global_mut().lua_version = version;
-        install_parser_hook(&mut state);
-        hooks.install(&mut state);
-        open_libs(&mut state)?;
-        lua_vm::api::configure_startup_gc_mode(&mut state);
+        // Keep a HeapGuard active across the remaining bootstrap steps
+        // (parser hook, host hooks, standard libraries) so their permanent-root
+        // allocations route through the heap's `uncollected` list rather than
+        // the guard-less `Gc::new_uncollected` path that leaked until process
+        // exit. `end_bootstrap` then flips the heap to normal collectable
+        // allocation for all subsequent user allocations.
+        {
+            let _bootstrap_guard = {
+                let g = state.global();
+                g.heap.begin_bootstrap();
+                lua_gc::HeapGuard::push(&g.heap)
+            };
+            install_parser_hook(&mut state);
+            hooks.install(&mut state);
+            open_libs(&mut state)?;
+            lua_vm::api::configure_startup_gc_mode(&mut state);
+            state.global().heap.end_bootstrap();
+        }
         let lua = Self::from_initialized_state(state, version);
         lua.sync_version_global()?;
         Ok(lua)
@@ -2002,6 +2016,15 @@ impl Chunk {
     /// rather than on each call.
     pub fn into_function(self) -> Result<Function> {
         let raw = self.lua.with_state(|state| {
+            // A heap guard must be active for the whole load so that objects
+            // allocated *after* the parser hook returns — notably the `_ENV`
+            // upvalue that `lua_vm::api::load` closes over the loaded chunk —
+            // route through the collectable owner list. Without it `GcRef::new`
+            // takes the guard-less `Gc::new_uncollected` path (see
+            // `lua_types::gc::GcRef::new`), which never joins any heap list and
+            // is therefore never freed, leaking the loaded closure and every
+            // object its `_ENV` transitively retains.
+            let _heap_guard = heap_guard(state);
             let saved_top = state.top_idx();
             let status = load_buffer(state, &self.source, &self.name)
                 .map_err(|err| self.lua.capture_error_in_state(state, err))?;
