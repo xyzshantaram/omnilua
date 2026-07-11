@@ -1,8 +1,41 @@
 # Changelog
 
-All notable changes to `lua-rs` are documented here. The format follows
+All notable changes to `omniLua` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.4.4] - 2026-07-12
+
+### Fixed — GC ownership of bootstrap allocations (#249, #250)
+
+Creating and dropping many `Lua` VMs no longer leaks. GC objects allocated
+during VM bootstrap (registry, stdlib install, tagmethod tables, interned
+strings) fell back to a detached allocation whenever no `HeapGuard` was
+active — invisible to both sweep and `Heap::drop_all` — so each
+`Lua::new()`/drop cycle leaked ~29KB for the life of the process, and every
+`load(..).into_function()` leaked the chunk's `_ENV` upvalue. Bootstrap
+allocations now live on a heap-owned never-swept list freed at heap
+teardown, and `lua_vm::api::load` holds its own guard so chunk allocations
+are collector-owned. Reported, diagnosed, and fix-designed by
+@xyzshantaram.
+
+### Added — strict-guard mode and embedding leak canaries (#251)
+
+The bug class behind #249 is now mechanically detectable.
+`OMNILUA_GC_STRICT_GUARD=1` turns the GC's silent no-active-heap fallback
+arms (detached allocation, sweep-blind weak handles, dropped pacer charges)
+into panics with backtraces; `harness/strict_guard_check.sh` runs the
+workspace under it. A counting-global-allocator canary asserts net-zero
+live bytes and a zero detached-allocation delta across VM, chunk,
+coroutine, and callback churn. The strict sweep found and fixed three more
+gaps: `Lua::with_state` (the embedding funnel) now activates the state's
+heap — guard-less weak-cache handles created there could outlive their
+swept targets — and `LuaRuntime::install_sandbox` and the hlua shim's
+stdlib install run guarded. The last pre-heap per-VM leak (~112B) is gone:
+`new_state` builds the `Heap` first and allocates its placeholders on the
+heap-owned list. Bootstrap windows are RAII (`BootstrapScope`), sound with
+no unsafe. Follow-ups: #252 (heap shared ownership), #253 (LuaError owned
+message bytes).
 
 ## [0.4.3] - 2026-06-29
 
