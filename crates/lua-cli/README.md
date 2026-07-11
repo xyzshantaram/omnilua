@@ -26,9 +26,9 @@ select another.
 
 ## What it is
 
-A from-scratch reimplementation of PUC-Rio Lua (lexer, parser, bytecode
-compiler, register VM, garbage collector, coroutines, standard library) with no
-C dependency. It runs the unmodified upstream Lua 5.4.7 test suite against the
+A pure-Rust port of PUC-Rio Lua — a C-to-Rust translation of the reference
+implementation (lexer, parser, bytecode compiler, register VM, garbage
+collector, coroutines, standard library) with no C dependency. It runs the unmodified upstream Lua 5.4.7 test suite against the
 binary and passes 44/44, and it runs the stock LuaRocks 3.11.1 client for
 pure-Lua rocks. It is competitive with reference C (about 1.45x geomean wall
 time on a stock build, ~1.3x with PGO), not faster, and is not LuaJIT.

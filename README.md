@@ -109,5 +109,7 @@ omniLua is an interpreter and runs at roughly 1.4× the time of reference C, or
 
 ## License
 
-omniLua is an independent reimplementation of [Lua](https://www.lua.org/)
-(PUC-Rio) and is MIT licensed. See [LICENSE](LICENSE).
+omniLua is an AI-assisted port (a derivative work — a translation from C to
+Rust) of the PUC-Rio reference implementation of [Lua](https://www.lua.org/)
+5.4.7, extended from that base to run 5.1–5.5. Both Lua and this port are MIT
+licensed. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
