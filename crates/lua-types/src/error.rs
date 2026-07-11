@@ -40,8 +40,10 @@ pub enum LuaError {
 
 impl LuaError {
     // ── Generic message constructors ─────────────────────────────────────
-    // Allocation-free: the message stays owned bytes until into_value()
-    // materializes it under the VM's active heap (#253).
+
+    /// Build a runtime error whose message is owned bytes — no GC
+    /// allocation happens here; [`into_value`](LuaError::into_value)
+    /// materializes the string when the error enters a VM (#253).
     pub fn runtime(args: fmt::Arguments<'_>) -> Self {
         LuaError::RuntimeMsg(format!("{}", args).into_bytes().into_boxed_slice())
     }
@@ -148,18 +150,11 @@ impl LuaError {
         }
     }
 
-    /// Convert the error into the Lua value that gets pushed/propagated.
-    ///
-    /// This is the VM-entry boundary for the `*Msg` variants: the owned
-    /// bytes become a real GC string here, via `GcRef::new`, which requires
-    /// an active `HeapGuard`. Every call site that pushes an error object
-    /// runs inside a guarded region (`pcall_k`, `api::load`, `with_state`),
-    /// so the allocation is always collector-owned — this is what lets the
-    /// guard-less detached allocation arm be removed entirely (#253).
     /// The message bytes, when this error carries a textual message —
     /// either a GC string payload or the owned bytes of a not-yet-
     /// materialized `*Msg` variant. The canonical accessor for host-side
     /// message extraction; callers needing a fallback keep their own.
+    /// Never allocates, never panics.
     pub fn message_bytes(&self) -> Option<&[u8]> {
         match self {
             LuaError::Runtime(LuaValue::Str(s)) | LuaError::Syntax(LuaValue::Str(s)) => {
@@ -170,6 +165,23 @@ impl LuaError {
         }
     }
 
+    /// Convert the error into the Lua value that gets pushed/propagated.
+    ///
+    /// This is the VM-entry boundary for the `*Msg` variants: the owned
+    /// bytes become a real GC string here, via `GcRef::new`, which requires
+    /// an active `HeapGuard`. Every in-tree call site that pushes an error
+    /// object runs inside a guarded region (`pcall_k`, `api::load`,
+    /// `with_state`, `lua_resume`, `reset_thread`), so the allocation is
+    /// always collector-owned — this is what lets the guard-less detached
+    /// allocation arm be removed entirely (#253).
+    ///
+    /// # Panics
+    ///
+    /// Panics for `RuntimeMsg`/`SyntaxMsg` payloads when no `HeapGuard` is
+    /// active. Host code that only needs the message text should use
+    /// [`message_bytes`](LuaError::message_bytes) or
+    /// [`message_lossy`](LuaError::message_lossy) instead — those never
+    /// allocate and never panic.
     pub fn into_value(self) -> LuaValue {
         match self {
             LuaError::Runtime(v) | LuaError::Syntax(v) => v,

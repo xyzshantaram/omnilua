@@ -6261,6 +6261,13 @@ pub fn new_thread(state: &mut LuaState, initial_body: Option<LuaValue>) -> Resul
 /// // }
 /// ```
 pub fn reset_thread(state: &mut LuaState, status: i32) -> i32 {
+    // Public low-level entry point: the __close error path under
+    // close_protected() materializes error messages, which requires an
+    // active heap (issue #253 review). Self-sufficient like lua_resume.
+    let _heap_guard = {
+        let g = state.global.borrow();
+        lua_gc::HeapGuard::push(&g.heap)
+    };
     state.ci = CallInfoIdx(0);
     let ci_idx = 0usize;
 
