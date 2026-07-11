@@ -1427,6 +1427,23 @@ pub struct Heap {
     /// linked through `header.next` (unused once unlinked from the owner
     /// list). Freed for real in `drop_all`.
     quarantined: Cell<Option<NonNull<GcBox<dyn Trace>>>>,
+    /// Intrusive list of boxes allocated via [`allocate_uncollected`](Self::allocate_uncollected)
+    /// — heap-owned so `drop_all` frees them, but never linked into
+    /// `head`/`finobj`/`tobefnz` so sweep never visits them (issue #249: this
+    /// is what makes "never collected during the VM's life" not mean "leaked
+    /// past the VM's life"). Distinct from the true process-lifetime
+    /// `Gc::new_uncollected` boxes, which carry no heap reference at all
+    /// (allocated before any `Heap` exists, or with no `HeapGuard` active).
+    uncollected: Cell<Option<NonNull<GcBox<dyn Trace>>>>,
+    /// While true, [`allocate`](Self::allocate) routes through
+    /// [`allocate_uncollected`](Self::allocate_uncollected) instead of the
+    /// normal collectable `head` list. Set around VM construction
+    /// (`new_state()` / stdlib install), where objects may not yet be
+    /// reachable from a self-consistent root set even though `paused` has
+    /// already been cleared partway through — so a step triggered by
+    /// allocation pressure during setup must not sweep them. Off by default:
+    /// a bare `Heap::new()` (low-level GC tests) allocates normally.
+    bootstrapping: Cell<bool>,
     /// Multiplier on bytes_used to set next threshold after collection.
     pause_multiplier: Cell<usize>,
     /// State machine for the incremental collector.
@@ -1499,6 +1516,8 @@ impl Heap {
             stress: std::env::var_os("LUA_RS_GC_STRESS").is_some_and(|v| v == "1"),
             quarantine: std::env::var_os("LUA_RS_GC_QUARANTINE").is_some_and(|v| v == "1"),
             quarantined: Cell::new(None),
+            uncollected: Cell::new(None),
+            bootstrapping: Cell::new(false),
             pause_multiplier: Cell::new(200), // 200% = collect when bytes 2x threshold
             state: Cell::new(GcState::Pause),
             paused: Cell::new(true), // start paused; caller enables when world is consistent
@@ -1525,8 +1544,32 @@ impl Heap {
         self.paused.get()
     }
 
-    /// Allocate a new `GcBox<T>` and prepend it to the allgc chain.
+    /// Enter bootstrap mode: [`allocate`](Self::allocate) routes new boxes
+    /// through [`allocate_uncollected`](Self::allocate_uncollected) instead of
+    /// the normal collectable list until [`end_bootstrap`](Self::end_bootstrap)
+    /// is called. See the `bootstrapping` field doc for why this exists
+    /// separately from `paused`.
+    pub fn begin_bootstrap(&self) {
+        self.bootstrapping.set(true);
+    }
+
+    /// Leave bootstrap mode; subsequent `allocate` calls join the normal
+    /// collectable `head` list.
+    pub fn end_bootstrap(&self) {
+        self.bootstrapping.set(false);
+    }
+
+    pub fn is_bootstrapping(&self) -> bool {
+        self.bootstrapping.get()
+    }
+
+    /// Allocate a new `GcBox<T>` and prepend it to the allgc chain. While
+    /// [`is_bootstrapping`](Self::is_bootstrapping) is true, delegates to
+    /// [`allocate_uncollected`](Self::allocate_uncollected) instead.
     pub fn allocate<T: Trace + 'static>(&self, value: T) -> Gc<T> {
+        if self.bootstrapping.get() {
+            return self.allocate_uncollected(value);
+        }
         let size = std::mem::size_of::<GcBox<T>>();
         let boxed = Box::new(GcBox {
             header: GcHeader::new_white(size, self.current_white.get(), HDR_COLLECTED),
@@ -1539,6 +1582,33 @@ impl Heap {
         self.head.set(Some(dyn_ptr));
         self.bytes.set(self.bytes.get() + size);
         self.objects.set(self.objects.get() + 1);
+        Gc {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Allocate a `GcBox<T>` owned by this heap but linked onto neither
+    /// `head`, `finobj`, nor `tobefnz` — sweep never visits it, so it is
+    /// never collected while the heap is alive (matching `Gc::new_uncollected`
+    /// semantics for permanent roots), but it *is* linked onto the heap's
+    /// `uncollected` list, so [`drop_all`](Self::drop_all) frees it when the
+    /// heap shuts down instead of leaking it past the heap's lifetime.
+    ///
+    /// Does not charge `bytes`/`objects` — those drive collection pacing and
+    /// diagnostics for the collectable set; an object that sweep never visits
+    /// would inflate them permanently.
+    pub fn allocate_uncollected<T: Trace + 'static>(&self, value: T) -> Gc<T> {
+        let size = std::mem::size_of::<GcBox<T>>();
+        let boxed = Box::new(GcBox {
+            header: GcHeader::new_white(size, self.current_white.get(), 0),
+            value,
+        });
+        boxed.header.next.set(self.uncollected.get());
+        let raw: *mut GcBox<T> = Box::into_raw(boxed);
+        let ptr: NonNull<GcBox<T>> = NonNull::new(raw).expect("Box::into_raw is non-null");
+        let dyn_ptr: NonNull<GcBox<dyn Trace>> = ptr;
+        self.uncollected.set(Some(dyn_ptr));
         Gc {
             ptr,
             _marker: PhantomData,
@@ -2821,6 +2891,7 @@ impl Heap {
         self.drop_list(&self.finobj);
         self.drop_list(&self.tobefnz);
         self.drop_list(&self.quarantined);
+        self.drop_list(&self.uncollected);
         self.bytes.set(0);
         self.objects.set(0);
     }
@@ -3971,6 +4042,98 @@ mod tests {
             }
         }
         assert_eq!(h2.bytes_used(), bytes_full);
+    }
+
+    // ── issue #249: guard-less/bootstrap allocations must not outlive Heap::drop ──
+
+    /// Sets an `Rc<Cell<bool>>` flag when the value it wraps drops, so a test
+    /// can observe whether a box was actually freed.
+    struct DropFlag(std::rc::Rc<Cell<bool>>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+    struct Tracked(#[allow(dead_code)] DropFlag);
+    impl Trace for Tracked {
+        fn trace(&self, _m: &mut Marker) {}
+    }
+
+    #[test]
+    fn allocate_uncollected_survives_collection_but_is_freed_on_heap_drop() {
+        let heap = Heap::new();
+        heap.unpause();
+        let dropped = std::rc::Rc::new(Cell::new(false));
+        let _gc = heap.allocate_uncollected(Tracked(DropFlag(dropped.clone())));
+
+        // Not on head/finobj/tobefnz, so a full collection with no roots at
+        // all must not touch it.
+        heap.full_collect(&OneRoot(None));
+        assert!(
+            !dropped.get(),
+            "allocate_uncollected box must survive a full collection while the heap is alive"
+        );
+
+        drop(heap);
+        assert!(
+            dropped.get(),
+            "allocate_uncollected box must be freed once its heap drops (issue #249)"
+        );
+    }
+
+    #[test]
+    fn bootstrapping_routes_allocate_to_the_uncollected_list() {
+        let heap = Heap::new();
+        heap.unpause();
+        assert!(!heap.is_bootstrapping());
+
+        heap.begin_bootstrap();
+        let dropped = std::rc::Rc::new(Cell::new(false));
+        let _gc = heap.allocate(Tracked(DropFlag(dropped.clone())));
+
+        // Routed through allocate_uncollected: invisible to the normal
+        // collectable count and immune to a same-cycle collection.
+        assert_eq!(
+            heap.allgc_count(),
+            0,
+            "a bootstrap allocation must not join the normal collectable list"
+        );
+        heap.full_collect(&OneRoot(None));
+        assert!(
+            !dropped.get(),
+            "a bootstrap allocation must survive collection while bootstrapping is active"
+        );
+
+        heap.end_bootstrap();
+        drop(heap);
+        assert!(
+            dropped.get(),
+            "a bootstrap allocation must still be freed when the heap drops"
+        );
+    }
+
+    #[test]
+    fn end_bootstrap_restores_normal_sweepable_allocation() {
+        let heap = Heap::new();
+        heap.unpause();
+        heap.begin_bootstrap();
+        heap.end_bootstrap();
+
+        let dropped = std::rc::Rc::new(Cell::new(false));
+        let _gc = heap.allocate(Tracked(DropFlag(dropped.clone())));
+        assert_eq!(heap.allgc_count(), 1);
+
+        heap.full_collect(&OneRoot(None));
+        // Not a drop-flag assertion: under LUA_RS_GC_QUARANTINE=1, sweep
+        // unlinks the box and parks it (poisoned) instead of freeing it
+        // immediately, so its value's Drop doesn't run until heap teardown.
+        // `allgc_count` reflects the unlink either way — quarantine mode
+        // settles owner-list accounting the same as a real free.
+        assert_eq!(
+            heap.allgc_count(),
+            0,
+            "after end_bootstrap, an unreachable allocation must be swept normally"
+        );
     }
 }
 

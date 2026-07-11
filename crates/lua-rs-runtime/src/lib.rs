@@ -960,12 +960,7 @@ impl Lua {
             ))
             .into());
         }
-        let mut state = new_state().ok_or(LuaError::Memory)?;
-        state.global_mut().lua_version = version;
-        install_parser_hook(&mut state);
-        hooks.install(&mut state);
-        open_libs(&mut state)?;
-        lua_vm::api::configure_startup_gc_mode(&mut state);
+        let state = bootstrap_state(hooks, version)?;
         let lua = Self::from_initialized_state(state, version);
         lua.sync_version_global()?;
         Ok(lua)
@@ -3844,6 +3839,34 @@ fn heap_guard(state: &LuaState) -> lua_gc::HeapGuard {
     lua_gc::HeapGuard::push(&global.heap)
 }
 
+/// Shared bootstrap sequence for [`Lua::with_hooks_versioned`] and
+/// [`LuaRuntime::with_hooks_versioned`]: build the raw state, install the
+/// parser hook and host hooks, and open the standard libraries.
+///
+/// `new_state()` already bootstraps and closes its own setup (registry/string
+/// pool/tagmethods — see its doc comment) so direct callers get a normally-
+/// allocating heap. Stdlib install allocates plenty more permanent-for-the-
+/// VM's-life objects (library tables, C closures), so this re-opens a
+/// bootstrap window of its own around `hooks.install`/`open_libs`: those
+/// objects land on the heap's never-swept-but-freed-on-drop list (issue
+/// #249) rather than the normal collectable list, safe regardless of
+/// whether a step fires mid-install, and still freed once the `Lua`/
+/// `LuaRuntime` this state backs is dropped.
+fn bootstrap_state(hooks: HostHooks, version: LuaVersion) -> Result<LuaState> {
+    let mut state = new_state().ok_or(LuaError::Memory)?;
+    state.global_mut().lua_version = version;
+    {
+        state.global().heap.begin_bootstrap();
+        let _bootstrap_guard = heap_guard(&state);
+        install_parser_hook(&mut state);
+        hooks.install(&mut state);
+        open_libs(&mut state)?;
+        lua_vm::api::configure_startup_gc_mode(&mut state);
+        state.global().heap.end_bootstrap();
+    }
+    Ok(state)
+}
+
 fn callback_args(state: &mut LuaState, lua: &Lua) -> std::result::Result<Vec<Value>, LuaError> {
     let func_idx = state.current_call_info().func;
     let nargs = state.top_idx().0.saturating_sub(func_idx.0 + 1);
@@ -4575,12 +4598,7 @@ impl LuaRuntime {
             ))
             .into());
         }
-        let mut state = new_state().ok_or(LuaError::Memory)?;
-        state.global_mut().lua_version = version;
-        install_parser_hook(&mut state);
-        hooks.install(&mut state);
-        open_libs(&mut state)?;
-        lua_vm::api::configure_startup_gc_mode(&mut state);
+        let state = bootstrap_state(hooks, version)?;
         Ok(Self { state })
     }
 
@@ -4878,6 +4896,135 @@ mod tests {
 
     fn external_root_count(lua: &Lua) -> usize {
         lua.with_state(|state| state.global().external_roots.len())
+    }
+
+    fn allgc_count(lua: &Lua) -> usize {
+        lua.with_state(|state| state.global().heap.allgc_count())
+    }
+
+    // ── issue #249: guard-less allocations must not leak past Heap::drop ──
+
+    /// `new_state()`/stdlib install allocate the registry, globals/loaded
+    /// tables, every stdlib function and library table, tagmethod name
+    /// strings, and the interned short-string cache — all through
+    /// `Heap::allocate` with no `HeapGuard` active before this fix, which
+    /// fell back to `Gc::new_uncollected` (a box with no heap reference at
+    /// all, freed only at process exit). With the fix, `new_state()` and
+    /// stdlib install run inside the heap's bootstrap window, so those
+    /// objects land on the heap-owned-but-never-swept `uncollected` list
+    /// instead: still never collected while the VM runs (preserving the
+    /// existing "permanent root" semantics), but freed by `Heap::drop_all`
+    /// alongside every other heap-owned object.
+    ///
+    /// This can't observe the "freed on drop" half directly through the
+    /// public API (there is nothing left to inspect once `Lua` drops); it
+    /// instead asserts the mechanism that makes that possible: bootstrap
+    /// output must NOT be sitting on the normal collectable list (`head`),
+    /// which is what `Heap::allocate` would do without the fix's bootstrap
+    /// routing. `lua-gc`'s own unit tests
+    /// (`allocate_uncollected_survives_collection_but_is_freed_on_heap_drop`,
+    /// `bootstrapping_routes_allocate_to_the_uncollected_list`) cover the
+    /// "freed on drop" half directly with a drop-flag type.
+    #[test]
+    fn bootstrap_output_does_not_join_the_normal_collectable_list() {
+        let lua = Lua::new();
+        // Stdlib install alone creates dozens of library tables and function
+        // closures (base/string/table/math/os/io/coroutine/utf8/...); if any
+        // of that landed on `head` this would be in the hundreds, not single
+        // digits. What's left comes from the small amount of normal-path
+        // work after bootstrap ends (`_VERSION` sync).
+        assert!(
+            allgc_count(&lua) < 20,
+            "bootstrap allocations must be routed off the normal collectable \
+             list (got {} live objects on head just from Lua::new())",
+            allgc_count(&lua)
+        );
+    }
+
+    /// Precise regression for the issue's `lua_vm::api::load -> new_upval_closed`
+    /// finding: after `load` injects the `_ENV` upvalue, it must be on the
+    /// heap's normal collectable list like everything else the parse produced
+    /// — not a detached `Gc::new_uncollected` box invisible to the collector.
+    ///
+    /// Calls `lua_vm::api::load` directly (bypassing `Chunk`) with no
+    /// `HeapGuard` pushed by the test, exactly mirroring how `Chunk::exec`/
+    /// `eval`/`into_function` and `LuaRuntime::exec` call into it: whatever
+    /// guard exists during the `_ENV` injection must come from `load` itself.
+    ///
+    /// `load` leaves the parsed closure on the stack (matching `lua_load`'s
+    /// contract), so it's still reachable when we force a collection
+    /// immediately after — this isolates "is it heap-tracked" from "is it
+    /// swept while still needed". The expected post-collection count (proto +
+    /// closure + the source/chunkname string(s) the parser interns + the
+    /// `_ENV` upvalue) was captured against this fix; the placeholder upvalue
+    /// `load` overwrites is genuine garbage and is correctly swept away.
+    #[test]
+    fn load_env_upvalue_is_heap_tracked_not_detached() {
+        let lua = Lua::new();
+        let before = allgc_count(&lua);
+        lua.with_state(|state| {
+            let mut once = Some(b"return 1".to_vec());
+            let reader: lua_vm::zio::ChunkReader = Box::new(move |_state| Ok(once.take()));
+            let status = lua_vm::api::load(state, reader, Some(b"=test"), None).unwrap();
+            assert_eq!(status, lua_types::LuaStatus::Ok);
+        });
+
+        lua.with_state(|state| state.gc().full_collect());
+        let after_collect = allgc_count(&lua);
+        assert_eq!(
+            after_collect,
+            before + 5,
+            "load()'s _ENV upvalue must survive a collection alongside the \
+             rest of the parsed chunk (before={before}, after_collect={after_collect}); \
+             a lower count than expected means the _ENV upvalue (or something \
+             else load() allocates) fell back to a detached, heap-invisible \
+             allocation instead of joining the collectable list (issue #249)"
+        );
+    }
+
+    /// Regression for the issue's second repro: `Chunk::into_function()`
+    /// (and by the same code path, `exec`/`eval`) compiles a chunk via
+    /// `lua_vm::api::load`, which used to close the parsed closure's `_ENV`
+    /// upvalue with no `HeapGuard` active — `new_upval_closed` fell back to
+    /// `Gc::new_uncollected`, permanently detached from the heap. Loading
+    /// many chunks without keeping them therefore leaked one closure + one
+    /// upvalue per call, for the life of the process, regardless of how many
+    /// `Lua` instances were dropped.
+    ///
+    /// With the fix, `api::load` holds its own `HeapGuard`, so the closure
+    /// and its `_ENV` upvalue join the normal collectable list and are freed
+    /// like any other unreachable Lua value the next time the collector
+    /// runs. Assert that directly: load many chunks, keep none of them, and
+    /// confirm a full collection sweeps them back down near baseline instead
+    /// of the live count growing with the loop.
+    #[test]
+    fn repeated_into_function_does_not_leak_env_upvalue_closures() {
+        let lua = Lua::new();
+        let baseline = allgc_count(&lua);
+
+        for i in 0..200 {
+            let f = lua
+                .load(format!("local x = {i} return x"))
+                .into_function()
+                .expect("chunk should compile");
+            drop(f);
+        }
+
+        let after_loop = allgc_count(&lua);
+        assert!(
+            after_loop > baseline,
+            "sanity: loading 200 chunks should have allocated something \
+             (baseline {baseline}, after loop {after_loop})"
+        );
+
+        lua.with_state(|state| state.gc().full_collect());
+        let after_collect = allgc_count(&lua);
+        assert!(
+            after_collect <= baseline + 20,
+            "closures/_ENV upvalues from into_function() must be reachable \
+             by the collector once unreferenced, not stuck outside the heap \
+             (baseline {baseline}, after full_collect {after_collect})"
+        );
     }
 
     struct Counter {

@@ -2123,6 +2123,17 @@ pub fn load(
     chunkname: Option<&[u8]>,
     mode: Option<&[u8]>,
 ) -> Result<LuaStatus, LuaError> {
+    // issue #249: top-level embedding entry points (Chunk::exec/eval/
+    // into_function, LuaRuntime::exec, auxlib::load_file/load_buffer) call
+    // into `load` without an active HeapGuard, so the `_ENV` upvalue this
+    // function closes over the loaded chunk below would otherwise allocate
+    // "uncollected" (never freed). Stacked, so calls from an already-active
+    // pcall_k/execute context (e.g. the Lua-level `load()` builtin) are
+    // unaffected — same heap, guard just nests.
+    let _heap_guard = {
+        let g = state.global.borrow();
+        lua_gc::HeapGuard::push(&g.heap)
+    };
     let name = chunkname.unwrap_or(b"?");
     let z = crate::zio::ZIO::new(reader);
     let status = state.protected_parser(z, name, mode);
