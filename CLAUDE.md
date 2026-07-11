@@ -38,11 +38,11 @@ read it before touching version-specific behavior.
 
 ### Build & run
 ```bash
-cargo build -p lua-cli -q             # debug CLI → target/debug/lua-rs
-target/debug/lua-rs script.lua        # run a file
-target/debug/lua-rs -e 'print(1+2)'   # one-liner
-target/debug/lua-rs                   # REPL (no args)
-LUA_RS_VERSION=5.1 target/debug/lua-rs script.lua   # pick a version (5.1–5.5; default 5.4)
+cargo build -p omnilua-cli -q         # debug CLI → target/debug/omnilua
+target/debug/omnilua script.lua       # run a file
+target/debug/omnilua -e 'print(1+2)'  # one-liner
+target/debug/omnilua                  # REPL (no args)
+OMNILUA_VERSION=5.1 target/debug/omnilua script.lua  # pick a version (5.1–5.5; default 5.4)
 ```
 
 ### The iteration ladder — climb only as far as the question forces
@@ -54,6 +54,15 @@ LUA_RS_VERSION=5.1 target/debug/lua-rs script.lua   # pick a version (5.1–5.5;
 | 4 | `harness/canaries/gc/run_canaries.sh` | a GC / metamethod / table change didn't break the collector |
 | 5 | `harness/run_official_test.sh reference/lua-c/testes/<t>.lua` | one real program (5.4) |
 | 6 | `harness/run_official_all.sh` + `cargo test --workspace` + `specs/oracle/check.sh` ×5 | the PR gate |
+
+A GC-lifecycle, heap-guard, VM-construction, or embedding-entry-point change
+also runs **`harness/strict_guard_check.sh`** (the workspace under
+`OMNILUA_GC_STRICT_GUARD=1`, where the GC's silent no-active-heap fallback
+arms panic with a backtrace — the never-freed dual of
+`LUA_RS_GC_QUARANTINE`'s freed-too-early). The embedding leak canaries
+(`crates/lua-rs-runtime/tests/leak_canaries.rs`, a counting global allocator
+asserting net-zero live bytes across VM/chunk/coroutine/callback churn) run
+with the normal workspace tests.
 
 Start one rung lower than feels right; if the cheap rung is silent, that's your
 answer. Per-version detail: `specs/MULTIVERSION_PLAYBOOK.md §3`.
@@ -74,7 +83,7 @@ oracle scripts use `/tmp/lua-refs/bin/lua5.x` (all five versions), pinned in
 `specs/oracle/CONTRACT.md`; rebuild them from there if `/tmp` was cleared.
 
 ### Benchmarks
-`harness/bench/` measures the **lua-rs / reference-C ratio** (wall + RSS), not
+`harness/bench/` measures the **omniLua / reference-C ratio** (wall + RSS), not
 absolute throughput — the ratio is the only fair number. Any perf **claim**
 must follow **`docs/MEASUREMENT_PROTOCOL.md`** (frozen-baseline interleaved
 A/B, Ir/branch-sim arbiters, drop-if-neutral) — wall time alone does not
@@ -97,7 +106,7 @@ workload, then `git bisect run` a script that thresholds the best-of-N wall time
    reported line (`nl -ba harness/impl/official/<test>.combined.lua | sed -n
    'A,Bp'`). If the harness says `unknown`, check process behavior + tail output.
 2. **Turn the failure into a tiny repro before editing runtime code.** Use
-   `target/debug/lua-rs -e '...'`; for a non-5.4 bug use
+   `target/debug/omnilua -e '...'`; for a non-5.4 bug use
    `specs/oracle/diff_one.sh <ver> '...'`. Print the actual `(expected, actual)`
    for message-matching tests. Use `/tmp` copies to instrument an official test —
    never leave instrumentation in `reference/` or `harness/impl/official/`.
@@ -110,10 +119,10 @@ workload, then `git bisect run` a script that thresholds the best-of-N wall time
    version's reference, not just the one you're on.
 5. **Watch for harness/environment bugs.** Tests that inspect source names or line
    numbers must run from a real file path. Temp-file names must be unique across
-   parallel `lua-rs` processes (pid + counter).
+   parallel `omnilua` processes (pid + counter).
 6. **Keep debugging out of the final diff.** Remove `print`/`eprintln!`, scratch
    files, one-off test edits. Build before final verification:
-   `cargo build -p lua-cli -q`.
+   `cargo build -p omnilua-cli -q`.
 
 ## Code style (mechanically enforced by `.claude/hooks/`)
 

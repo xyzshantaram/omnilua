@@ -31,7 +31,9 @@
                     # reference-only partial ports were removed from src/ so
                     # this ceiling tracks only active heap.rs unsafe. Each
                     # block remains a raw-pointer op required by the current
-                    # mark-and-sweep architecture.
+                    # mark-and-sweep architecture. (BootstrapScope holds
+                    # the depth cell via Rc — no unsafe, sound past heap
+                    # death.)
 "lua-coro"   = 0    # no active unsafe implementation; raise only with a
                     # future stackful coroutine backend.
 "lua-cli"    = 6    # libloading dynlib backend (5) + os.date local-offset FFI (localtime_r/localtime_s, #90).

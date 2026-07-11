@@ -134,6 +134,55 @@ impl Drop for HeapGuard {
     }
 }
 
+/// RAII handle for a heap bootstrap window; created by
+/// [`Heap::bootstrap_scope`], ends the window on drop. Exists so error paths
+/// (`?` during stdlib install, `lua_open` failure) cannot leave the heap
+/// stuck in bootstrap mode the way a manual `end_bootstrap` call can.
+///
+/// Sound with no lifetime and no unsafe: the scope shares ownership of the
+/// heap's depth counter (`Rc<Cell<usize>>`), so a scope that outlives its
+/// heap decrements a still-live cell instead of dereferencing a dead heap —
+/// the count on a dead heap is meaningless but harmless. (Contrast with
+/// [`HeapGuard::push`]'s raw-pointer contract, tracked for the same
+/// treatment in the heap-ownership follow-up.)
+pub struct BootstrapScope {
+    depth: std::rc::Rc<Cell<usize>>,
+}
+
+impl Drop for BootstrapScope {
+    fn drop(&mut self) {
+        let depth = self.depth.get();
+        debug_assert!(depth > 0, "BootstrapScope dropped with zero depth");
+        self.depth.set(depth.saturating_sub(1));
+    }
+}
+
+thread_local! {
+    static DETACHED_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// True when `OMNILUA_GC_STRICT_GUARD=1`: the silent no-active-heap fallback
+/// arms (`GcRef::new` → detached allocation, `GcRef::downgrade` →
+/// forever-upgrading weak handle, `GcRef::account_buffer` → dropped charge)
+/// panic with a backtrace instead of degrading, so every guard-coverage gap
+/// self-reports under the existing test suites. The dual of
+/// `LUA_RS_GC_QUARANTINE`: quarantine turns freed-too-early into a loud
+/// failure, strict-guard turns never-freed into one (issue #249's class).
+pub fn strict_guard_mode() -> bool {
+    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STRICT.get_or_init(|| std::env::var_os("OMNILUA_GC_STRICT_GUARD").is_some_and(|v| v == "1"))
+}
+
+/// Total detached ([`Gc::new_uncollected`]) allocations made on this thread
+/// since it started. Leak canaries assert a zero delta across embedding
+/// scenarios. This counter deliberately lives outside the heap's own
+/// bookkeeping: detached boxes never touch `bytes`/`objects`, which is
+/// exactly the blind spot that hid issue #249 — a mechanism must not be
+/// verified with bookkeeping it maintains itself.
+pub fn detached_allocations() -> usize {
+    DETACHED_ALLOCATIONS.with(|c| c.get())
+}
+
 /// Runs `f` with a reference to the currently-active heap, or `None` if no
 /// `HeapGuard` is in scope.
 ///
@@ -710,6 +759,13 @@ pub struct GcHeader {
 const HDR_FINALIZED: u8 = 1;
 const HDR_COLLECTED: u8 = 2;
 const HDR_GRAY_LISTED: u8 = 4;
+/// Set on every box a `Heap` owns — both the sweepable `allocate` path and
+/// the never-swept `allocate_uncollected` bootstrap path — and never on
+/// detached `Gc::new_uncollected` boxes. Distinct from `HDR_COLLECTED`
+/// (sweepable only): strict-guard checks need "will this box ever be freed
+/// by a heap" (bootstrap boxes die in `drop_all`, so a guard-less weak
+/// handle to one dangles after heap teardown), not "is it sweepable".
+const HDR_HEAP_OWNED: u8 = 16;
 /// Set by sweep under `LUA_RS_GC_QUARANTINE=1` instead of freeing the box.
 /// Debug builds assert this bit is clear on every `Gc` dereference and on
 /// every `Marker::mark_box` visit, turning use-after-sweep into a
@@ -825,6 +881,7 @@ impl<T: Trace + 'static> Gc<T> {
     /// without joining a heap owner list, it will never be swept (so
     /// effectively leaks until process exit — same as Rc behavior).
     pub fn new_uncollected(value: T) -> Self {
+        DETACHED_ALLOCATIONS.with(|c| c.set(c.get() + 1));
         let size = std::mem::size_of::<T>();
         let boxed = Box::new(GcBox {
             header: GcHeader::new_white(size, Color::White0, 0),
@@ -876,6 +933,25 @@ impl<T: ?Sized> Gc<T> {
 
     fn header(&self) -> &GcHeader {
         &self.as_box().header
+    }
+
+    /// True iff this box is linked into a sweepable heap owner list
+    /// (`HDR_COLLECTED` set) — the collector may free it during the owning
+    /// heap's lifetime. Detached (`new_uncollected`) boxes and heap-owned
+    /// bootstrap (`allocate_uncollected`) boxes report false.
+    pub fn is_heap_tracked(self) -> bool {
+        self.header().collected()
+    }
+
+    /// True iff some `Heap` will free this box — during collection
+    /// (`allocate`) or at teardown in `drop_all` (`allocate_uncollected`).
+    /// Only detached `Gc::new_uncollected` boxes report false. Strict-guard
+    /// mode keys on this: a guard-less weak handle or dropped buffer charge
+    /// is hazardous for any heap-owned box (a bootstrap box's weak handle
+    /// dangles after heap teardown just the same), while the detached
+    /// process-lifetime path is the sanctioned legacy behavior.
+    pub fn is_heap_owned(self) -> bool {
+        self.header().flag(HDR_HEAP_OWNED)
     }
 
     pub fn color(self) -> Color {
@@ -1435,15 +1511,19 @@ pub struct Heap {
     /// `Gc::new_uncollected` boxes, which carry no heap reference at all
     /// (allocated before any `Heap` exists, or with no `HeapGuard` active).
     uncollected: Cell<Option<NonNull<GcBox<dyn Trace>>>>,
-    /// While true, [`allocate`](Self::allocate) routes through
+    /// While non-zero, [`allocate`](Self::allocate) routes through
     /// [`allocate_uncollected`](Self::allocate_uncollected) instead of the
-    /// normal collectable `head` list. Set around VM construction
+    /// normal collectable `head` list. Raised around VM construction
     /// (`new_state()` / stdlib install), where objects may not yet be
     /// reachable from a self-consistent root set even though `paused` has
     /// already been cleared partway through — so a step triggered by
-    /// allocation pressure during setup must not sweep them. Off by default:
-    /// a bare `Heap::new()` (low-level GC tests) allocates normally.
-    bootstrapping: Cell<bool>,
+    /// allocation pressure during setup must not sweep them. A depth rather
+    /// than a flag so windows nest (an outer embedding-layer window survives
+    /// an inner one closing). Zero by default: a bare `Heap::new()`
+    /// (low-level GC tests) allocates normally. Behind an `Rc` so
+    /// [`BootstrapScope`] can decrement it without holding a heap pointer
+    /// (sound even if a scope outlives its heap).
+    bootstrap_depth: std::rc::Rc<Cell<usize>>,
     /// Multiplier on bytes_used to set next threshold after collection.
     pause_multiplier: Cell<usize>,
     /// State machine for the incremental collector.
@@ -1517,7 +1597,7 @@ impl Heap {
             quarantine: std::env::var_os("LUA_RS_GC_QUARANTINE").is_some_and(|v| v == "1"),
             quarantined: Cell::new(None),
             uncollected: Cell::new(None),
-            bootstrapping: Cell::new(false),
+            bootstrap_depth: std::rc::Rc::new(Cell::new(0)),
             pause_multiplier: Cell::new(200), // 200% = collect when bytes 2x threshold
             state: Cell::new(GcState::Pause),
             paused: Cell::new(true), // start paused; caller enables when world is consistent
@@ -1546,33 +1626,59 @@ impl Heap {
 
     /// Enter bootstrap mode: [`allocate`](Self::allocate) routes new boxes
     /// through [`allocate_uncollected`](Self::allocate_uncollected) instead of
-    /// the normal collectable list until [`end_bootstrap`](Self::end_bootstrap)
-    /// is called. See the `bootstrapping` field doc for why this exists
-    /// separately from `paused`.
+    /// the normal collectable list until the matching
+    /// [`end_bootstrap`](Self::end_bootstrap) is called. Prefer the RAII
+    /// [`bootstrap_scope`](Self::bootstrap_scope) — a manual `end_bootstrap`
+    /// is skipped by early returns and error paths. See the `bootstrap_depth`
+    /// field doc for why this exists separately from `paused`.
     pub fn begin_bootstrap(&self) {
-        self.bootstrapping.set(true);
+        self.bootstrap_depth.set(
+            self.bootstrap_depth
+                .get()
+                .checked_add(1)
+                .expect("Heap bootstrap depth overflow"),
+        );
     }
 
-    /// Leave bootstrap mode; subsequent `allocate` calls join the normal
-    /// collectable `head` list.
+    /// Leave one level of bootstrap mode; once the depth returns to zero,
+    /// subsequent `allocate` calls join the normal collectable `head` list.
     pub fn end_bootstrap(&self) {
-        self.bootstrapping.set(false);
+        let depth = self.bootstrap_depth.get();
+        debug_assert!(depth > 0, "Heap::end_bootstrap without begin_bootstrap");
+        self.bootstrap_depth.set(depth.saturating_sub(1));
     }
 
     pub fn is_bootstrapping(&self) -> bool {
-        self.bootstrapping.get()
+        self.bootstrap_depth.get() != 0
+    }
+
+    /// RAII form of [`begin_bootstrap`](Self::begin_bootstrap)/
+    /// [`end_bootstrap`](Self::end_bootstrap): the returned scope ends the
+    /// bootstrap window when dropped, so `?`-style early exits from VM
+    /// construction cannot leave the heap stuck in bootstrap mode.
+    ///
+    /// Safe to hold past the heap's death (see [`BootstrapScope`]).
+    pub fn bootstrap_scope(&self) -> BootstrapScope {
+        self.begin_bootstrap();
+        BootstrapScope {
+            depth: std::rc::Rc::clone(&self.bootstrap_depth),
+        }
     }
 
     /// Allocate a new `GcBox<T>` and prepend it to the allgc chain. While
     /// [`is_bootstrapping`](Self::is_bootstrapping) is true, delegates to
     /// [`allocate_uncollected`](Self::allocate_uncollected) instead.
     pub fn allocate<T: Trace + 'static>(&self, value: T) -> Gc<T> {
-        if self.bootstrapping.get() {
+        if self.is_bootstrapping() {
             return self.allocate_uncollected(value);
         }
         let size = std::mem::size_of::<GcBox<T>>();
         let boxed = Box::new(GcBox {
-            header: GcHeader::new_white(size, self.current_white.get(), HDR_COLLECTED),
+            header: GcHeader::new_white(
+                size,
+                self.current_white.get(),
+                HDR_COLLECTED | HDR_HEAP_OWNED,
+            ),
             value,
         });
         boxed.header.next.set(self.head.get());
@@ -1601,7 +1707,7 @@ impl Heap {
     pub fn allocate_uncollected<T: Trace + 'static>(&self, value: T) -> Gc<T> {
         let size = std::mem::size_of::<GcBox<T>>();
         let boxed = Box::new(GcBox {
-            header: GcHeader::new_white(size, self.current_white.get(), 0),
+            header: GcHeader::new_white(size, self.current_white.get(), HDR_HEAP_OWNED),
             value,
         });
         boxed.header.next.set(self.uncollected.get());
@@ -4110,6 +4216,32 @@ mod tests {
             dropped.get(),
             "a bootstrap allocation must still be freed when the heap drops"
         );
+    }
+
+    /// Pins the ownership-flag semantics the strict-guard checks key on
+    /// (`GcRef::downgrade`/`account_buffer` panic for guard-less operations
+    /// on any heap-owned box): a bootstrap box is heap-owned but not
+    /// sweepable, so treating "not sweepable" as "not hazardous" would let
+    /// a weak handle to it dangle after `drop_all` frees the box at heap
+    /// teardown.
+    #[test]
+    fn ownership_flags_distinguish_all_three_allocation_paths() {
+        let heap = Heap::new();
+        let tracked = heap.allocate(Tracked(DropFlag(std::rc::Rc::new(Cell::new(false)))));
+        assert!(tracked.is_heap_owned());
+        assert!(tracked.is_heap_tracked());
+
+        let bootstrap =
+            heap.allocate_uncollected(Tracked(DropFlag(std::rc::Rc::new(Cell::new(false)))));
+        assert!(
+            bootstrap.is_heap_owned(),
+            "bootstrap boxes die in drop_all — strict-guard hazard checks must see them"
+        );
+        assert!(!bootstrap.is_heap_tracked());
+
+        let detached = Gc::new_uncollected(Tracked(DropFlag(std::rc::Rc::new(Cell::new(false)))));
+        assert!(!detached.is_heap_owned());
+        assert!(!detached.is_heap_tracked());
     }
 
     #[test]

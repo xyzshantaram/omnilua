@@ -1558,6 +1558,19 @@ mod tests {
     use lua_types::LuaVersion;
     use lua_vm::state::new_state;
 
+    /// Activates the state's own heap for the test body and stops the
+    /// collector, mirroring production lexing: `protected_parser` pushes a
+    /// heap context and stops the GC for the whole parse. Both halves
+    /// matter — without the guard the lexer's interned strings fall through
+    /// `GcRef::new`'s detached arm (a panic under `OMNILUA_GC_STRICT_GUARD=1`),
+    /// and without the GC stop a mid-lex step sweeps strings these tests
+    /// hold outside any traced root.
+    fn state_heap_guard(state: &mut lua_vm::state::LuaState) -> lua_gc::HeapGuard {
+        let _ = state.global_mut().stop_gc_internal();
+        let g = state.global();
+        lua_gc::HeapGuard::push(&g.heap)
+    }
+
     /// A `LexState` whose fields are about to be (re)initialised by
     /// [`set_input`]; only `source`/`envn`/`version` need to be real up front.
     fn empty_lexstate(source: GcRef<LuaString>, ver: LuaVersion) -> LexState {
@@ -1583,8 +1596,15 @@ mod tests {
     /// [`TK_EOS`], collecting each token. The lexer is exercised end-to-end (the
     /// same path the parser takes), so these tests pin scanning behaviour without
     /// the full parser/oracle round-trip.
-    fn lex(ver: LuaVersion, src: &[u8]) -> Vec<Token> {
+    /// Returns the state alongside the tokens: `Token` carries
+    /// `GcRef<LuaString>` handles into the state's heap, which frees every
+    /// box when the state drops — a token examined after that reads freed
+    /// memory. (These tests originally got away with it because lexer
+    /// allocations leaked as detached boxes; the issue #249 fix made the
+    /// heap own them, which is what surfaced this.)
+    fn lex(ver: LuaVersion, src: &[u8]) -> (lua_vm::state::LuaState, Vec<Token>) {
         let mut state = new_state().expect("state init");
+        let _heap_guard = state_heap_guard(&mut state);
         state.global_mut().lua_version = ver;
 
         let source = state.intern_str(b"@test").expect("intern source");
@@ -1604,19 +1624,19 @@ mod tests {
                 break;
             }
         }
-        out
+        (state, out)
     }
 
     /// Just the token-kind sequence, dropping the trailing `TK_EOS`.
     fn kinds(ver: LuaVersion, src: &[u8]) -> Vec<i32> {
-        let mut v = lex(ver, src);
+        let (_state, mut v) = lex(ver, src);
         v.pop();
         v.into_iter().map(|t| t.kind).collect()
     }
 
     /// Lex `src` and return the bytes of its single string-literal token.
     fn one_string(ver: LuaVersion, src: &[u8]) -> Vec<u8> {
-        let toks = lex(ver, src);
+        let (_state, toks) = lex(ver, src);
         let str_tok = toks
             .iter()
             .find(|t| t.kind == TK_STRING)
@@ -1631,13 +1651,13 @@ mod tests {
     fn crlf_and_lfcr_pair_into_single_lines() {
         // Three logical lines joined by CRLF; the `+` lands on line 3, so a
         // lex error there must report line 3 (CRLF counts as ONE newline).
-        let toks = lex(LuaVersion::V54, b"a\r\nb\r\n+");
+        let (_state, toks) = lex(LuaVersion::V54, b"a\r\nb\r\n+");
         // a(name) b(name) +  EOS  -> the '+' is a single-byte token on line 3.
         assert_eq!(toks[0].kind, TK_NAME);
         assert_eq!(toks[1].kind, TK_NAME);
         assert_eq!(toks[2].kind, b'+' as i32);
         // LFCR also pairs.
-        let toks2 = lex(LuaVersion::V54, b"a\n\rb");
+        let (_state2, toks2) = lex(LuaVersion::V54, b"a\n\rb");
         assert_eq!(toks2[0].kind, TK_NAME);
         assert_eq!(toks2[1].kind, TK_NAME);
         assert_eq!(toks2[2].kind, TK_EOS);
@@ -1647,6 +1667,7 @@ mod tests {
     fn crlf_line_number_attribution() {
         // The error message must carry line 3 for a malformed numeral there.
         let mut state = new_state().expect("state init");
+        let _heap_guard = state_heap_guard(&mut state);
         state.global_mut().lua_version = LuaVersion::V54;
         let source = state.intern_str(b"@t").unwrap();
         let src = b"\r\n\r\n0x".to_vec();
@@ -1711,35 +1732,35 @@ mod tests {
     #[test]
     fn numeral_int_float_boundary() {
         // Integer literals → TK_INT with the exact i64; floats → TK_FLT.
-        let dec = lex(LuaVersion::V54, b"3");
+        let (_state_dec, dec) = lex(LuaVersion::V54, b"3");
         assert_eq!(dec[0].kind, TK_INT);
         assert!(matches!(dec[0].value, TokenValue::Int(3)));
 
-        let hex = lex(LuaVersion::V54, b"0x10");
+        let (_state_hex, hex) = lex(LuaVersion::V54, b"0x10");
         assert_eq!(hex[0].kind, TK_INT);
         assert!(matches!(hex[0].value, TokenValue::Int(16)));
 
-        let flt = lex(LuaVersion::V54, b"3.0");
+        let (_state_flt, flt) = lex(LuaVersion::V54, b"3.0");
         assert_eq!(flt[0].kind, TK_FLT);
         assert!(matches!(flt[0].value, TokenValue::Float(f) if f == 3.0));
 
-        let expo = lex(LuaVersion::V54, b"1e2");
+        let (_state_expo, expo) = lex(LuaVersion::V54, b"1e2");
         assert_eq!(expo[0].kind, TK_FLT);
         assert!(matches!(expo[0].value, TokenValue::Float(f) if f == 100.0));
 
         // A bare dot followed by digits is a float; a lone dot is the '.' token.
-        let dotnum = lex(LuaVersion::V54, b".5");
+        let (_state_dotnum, dotnum) = lex(LuaVersion::V54, b".5");
         assert_eq!(dotnum[0].kind, TK_FLT);
     }
 
     #[test]
     fn float_only_versions_widen_integer_literals() {
         // 5.1/5.2 have no integer subtype: every numeral lexes as a float.
-        let v51 = lex(LuaVersion::V51, b"3");
+        let (_state_v51, v51) = lex(LuaVersion::V51, b"3");
         assert_eq!(v51[0].kind, TK_FLT);
         assert!(matches!(v51[0].value, TokenValue::Float(f) if f == 3.0));
 
-        let v52 = lex(LuaVersion::V52, b"42");
+        let (_state_v52, v52) = lex(LuaVersion::V52, b"42");
         assert_eq!(v52[0].kind, TK_FLT);
     }
 
@@ -1801,7 +1822,7 @@ mod tests {
 
     #[test]
     fn empty_input_is_just_eos() {
-        let toks = lex(LuaVersion::V54, b"");
+        let (_state, toks) = lex(LuaVersion::V54, b"");
         assert_eq!(toks.len(), 1);
         assert_eq!(toks[0].kind, TK_EOS);
     }
@@ -1810,6 +1831,7 @@ mod tests {
     fn peek_maps_byte_and_eoz() {
         // The internal dispatch shape: a byte maps to Peek::Byte, EOZ to Peek::Eoz.
         let mut state = new_state().unwrap();
+        let _heap_guard = state_heap_guard(&mut state);
         let source = state.intern_str(b"@t").unwrap();
         let mut ls = empty_lexstate(source, LuaVersion::V54);
         ls.current = b'=' as i32;
@@ -1821,6 +1843,7 @@ mod tests {
     #[test]
     fn zio_yields_bytes_then_eoz() {
         let mut state = new_state().expect("state init");
+        let _heap_guard = state_heap_guard(&mut state);
         let mut z = ZIO::from_bytes(b"ab".to_vec());
         assert_eq!(z.getc(&mut state).unwrap(), b'a' as i32);
         assert_eq!(z.getc(&mut state).unwrap(), b'b' as i32);

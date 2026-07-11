@@ -1,13 +1,13 @@
 //! A drop-in subset of the `hlua` 0.4 embedding API, backed by the pure-Rust
-//! lua-rs VM instead of the C library.
+//! omniLua VM instead of the C library.
 //!
 //! The goal is source compatibility: a consumer that does
-//! `use lua_rs_hlua_shim as hlua;` should compile and run against lua-rs without
+//! `use lua_rs_hlua_shim as hlua;` should compile and run against omniLua without
 //! touching its own code. The implemented surface is the part exercised by
 //! `authoscope` — `Lua`, `functionN`, `AnyLuaValue` and friends, `LuaFunction`,
 //! and `StringInLua`. It is intentionally not the whole hlua API.
 //!
-//! Sandboxing note: lua-rs's runtime opens the full standard library, whereas
+//! Sandboxing note: omniLua's runtime opens the full standard library, whereas
 //! hlua consumers typically open only `string`. This is acceptable for a
 //! compatibility spike but widens the sandbox; restricting the opened libraries
 //! is tracked as future work.
@@ -80,10 +80,23 @@ impl<'lua> Lua<'lua> {
     /// Create a new Lua state with the standard libraries installed. Panics
     /// only on allocation failure, matching the effective behaviour of
     /// `hlua::Lua::new()`.
+    ///
+    /// Stdlib install runs inside a heap bootstrap window (guard + scope),
+    /// mirroring the runtime crate's `bootstrap_state`: without it every
+    /// library table and closure allocates detached and outlives the state —
+    /// issue #249's leak class, which stayed live on this lane after the
+    /// main runtime was fixed.
     pub fn new() -> Lua<'lua> {
-        let mut state = new_state().expect("lua-rs state allocation failed");
+        let mut state = new_state().expect("omniLua state allocation failed");
         state.global_mut().parser_hook = Some(parser_hook);
-        open_libs(&mut state).expect("opening lua-rs standard libraries failed");
+        {
+            let _bootstrap_scope = state.global().heap.bootstrap_scope();
+            let _heap_guard = {
+                let g = state.global();
+                lua_gc::HeapGuard::push(&g.heap)
+            };
+            open_libs(&mut state).expect("opening omniLua standard libraries failed");
+        }
         Lua {
             state,
             owned_closures: Vec::new(),
@@ -91,7 +104,7 @@ impl<'lua> Lua<'lua> {
         }
     }
 
-    /// Open the string library. lua-rs already opens the full standard library
+    /// Open the string library. omniLua already opens the full standard library
     /// at construction, so this is a no-op kept for API compatibility.
     pub fn open_string(&mut self) {}
 

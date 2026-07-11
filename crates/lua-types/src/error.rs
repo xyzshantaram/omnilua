@@ -31,24 +31,24 @@ pub enum LuaError {
 impl LuaError {
     // ── Generic message constructors ─────────────────────────────────────
     pub fn runtime(args: fmt::Arguments<'_>) -> Self {
-        LuaError::Runtime(LuaValue::Str(crate::gc::GcRef::new(
+        LuaError::Runtime(LuaValue::Str(crate::gc::GcRef::new_or_detached(
             crate::string::LuaString::from_bytes(format!("{}", args).into_bytes()),
         )))
     }
     pub fn syntax(args: fmt::Arguments<'_>) -> Self {
-        LuaError::Syntax(LuaValue::Str(crate::gc::GcRef::new(
+        LuaError::Syntax(LuaValue::Str(crate::gc::GcRef::new_or_detached(
             crate::string::LuaString::from_bytes(format!("{}", args).into_bytes()),
         )))
     }
     pub fn syntax_at(args: fmt::Arguments<'_>, source: &[u8], line: i32) -> Self {
-        LuaError::Syntax(LuaValue::Str(crate::gc::GcRef::new(
+        LuaError::Syntax(LuaValue::Str(crate::gc::GcRef::new_or_detached(
             crate::string::LuaString::from_bytes(
                 format!("{}:{}: {}", String::from_utf8_lossy(source), line, args).into_bytes(),
             ),
         )))
     }
     pub fn syntax_raw(msg: &[u8]) -> Self {
-        LuaError::Syntax(LuaValue::Str(crate::gc::GcRef::new(
+        LuaError::Syntax(LuaValue::Str(crate::gc::GcRef::new_or_detached(
             crate::string::LuaString::from_bytes(msg.to_vec()),
         )))
     }

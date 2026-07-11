@@ -26,9 +26,43 @@ pub struct GcRef<T: Trace + 'static>(pub Gc<T>);
 impl<T: Trace + 'static> GcRef<T> {
     /// Allocate a new GC-tracked value. If a `HeapGuard` is active (set by
     /// `state.run()` / `pcall_k`), the new allocation joins that heap's
-    /// allgc chain. Otherwise it allocates "uncollected" — leaks until
-    /// process exit, same as the old `Rc::new` behavior.
+    /// allgc chain (or its bootstrap list inside a bootstrap window).
+    /// Otherwise it allocates detached — never freed for the life of the
+    /// process (the issue #249 leak class). The detached arm exists only for
+    /// the handful of pre-heap allocations in `new_state`; every other path
+    /// must have a guard, and `OMNILUA_GC_STRICT_GUARD=1` turns this arm into
+    /// a panic so guard-coverage gaps self-report under the test suites.
     pub fn new(value: T) -> Self {
+        let gc = lua_gc::with_current_heap(|heap| match heap {
+            Some(heap) => heap.allocate(value),
+            None => {
+                if lua_gc::strict_guard_mode() {
+                    panic!(
+                        "OMNILUA_GC_STRICT_GUARD: GcRef::new::<{}> with no active HeapGuard — \
+                         this allocation would be detached and never freed (issue #249 class); \
+                         push a HeapGuard or bootstrap window on the entry path",
+                        std::any::type_name::<T>()
+                    );
+                }
+                Gc::new_uncollected(value)
+            }
+        });
+        GcRef(gc)
+    }
+
+    /// The pre-strict fallback semantics, spelled explicitly: allocate on the
+    /// active heap if one is present, otherwise detached (never freed for the
+    /// life of the process).
+    ///
+    /// DEBT(fallback): the only sanctioned caller is host-side `LuaError`
+    /// message construction (`lua-types/src/error.rs`) — errors are built
+    /// with no VM in scope and `LuaError::Runtime` carries a `LuaValue`, so
+    /// the message must be a GC string even off-heap. Remove by carrying
+    /// owned bytes in `LuaError` until VM entry. Exempt from
+    /// `OMNILUA_GC_STRICT_GUARD` because the call is explicit and auditable;
+    /// volume still surfaces through [`lua_gc::detached_allocations`], which
+    /// the leak canaries assert stays flat.
+    pub(crate) fn new_or_detached(value: T) -> Self {
         let gc = lua_gc::with_current_heap(|heap| match heap {
             Some(heap) => heap.allocate(value),
             None => Gc::new_uncollected(value),
@@ -75,6 +109,12 @@ impl<T: Trace + 'static> GcRef<T> {
     /// Get a weak handle. If this allocation belongs to the currently-active
     /// heap, the weak handle will stop upgrading once sweep removes that exact
     /// heap allocation.
+    ///
+    /// Downgrading a *heap-owned* box with no active `HeapGuard` is a
+    /// latent use-after-free: the resulting handle has no heap identity to
+    /// check, so it keeps upgrading after sweep frees the target.
+    /// `OMNILUA_GC_STRICT_GUARD=1` turns that case into a panic; detached
+    /// (process-lifetime) targets keep the legacy always-upgrades behavior.
     pub fn downgrade(&self) -> GcWeak<T> {
         let identity = self.identity();
         let tracked = lua_gc::with_current_heap(|heap| {
@@ -83,6 +123,14 @@ impl<T: Trace + 'static> GcRef<T> {
                 (HeapRef::from_heap(heap), token)
             })
         });
+        if tracked.is_none() && lua_gc::strict_guard_mode() && self.0.is_heap_owned() {
+            panic!(
+                "OMNILUA_GC_STRICT_GUARD: GcRef::downgrade::<{}> on a heap-owned box with no \
+                 active HeapGuard — the weak handle would upgrade forever, including after \
+                 sweep frees the target (use-after-free); push a HeapGuard on the entry path",
+                std::any::type_name::<T>()
+            );
+        }
         let (heap, allocation_token) = match tracked {
             Some((heap, token)) => (Some(heap), token),
             None => (None, 0),
@@ -104,9 +152,18 @@ impl<T: Trace + 'static> GcRef<T> {
         if delta == 0 {
             return;
         }
-        lua_gc::with_current_heap(|h| {
-            if let Some(h) = h {
-                self.0.account_buffer(h, delta)
+        lua_gc::with_current_heap(|h| match h {
+            Some(h) => self.0.account_buffer(h, delta),
+            None => {
+                if lua_gc::strict_guard_mode() && self.0.is_heap_owned() {
+                    panic!(
+                        "OMNILUA_GC_STRICT_GUARD: account_buffer({delta}) on a heap-owned \
+                         {} with no active HeapGuard — the charge would be silently dropped \
+                         and the pacer would drift from real memory; push a HeapGuard on \
+                         the entry path",
+                        std::any::type_name::<T>()
+                    );
+                }
             }
         })
     }
@@ -208,8 +265,15 @@ mod tests {
         assert_eq!(weak.strong_count(), 0);
     }
 
+    /// Exercises the sanctioned guard-less path on purpose, which is exactly
+    /// what `OMNILUA_GC_STRICT_GUARD=1` exists to forbid — skipped under
+    /// strict mode rather than deleted so the legacy detached semantics stay
+    /// covered in normal runs.
     #[test]
     fn uncollected_weak_refs_keep_process_lifetime_behavior() {
+        if lua_gc::strict_guard_mode() {
+            return;
+        }
         let strong = GcRef::new(Cell0);
         let weak = strong.downgrade();
 
