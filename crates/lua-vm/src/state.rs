@@ -6482,6 +6482,20 @@ pub fn new_state() -> Option<LuaState> {
 
     let global_rc = Rc::new(RefCell::new(global));
 
+    // issue #249: from here through the end of lua_open() below (registry,
+    // string pool, tagmethod tables), route allocations onto the heap's
+    // bootstrap ("uncollected but heap-owned") list rather than the normal
+    // collectable list. The object graph isn't self-consistent for root
+    // tracing yet, and lua_open() clears `paused` partway through, so an
+    // allocation-triggered step during setup must not sweep these objects.
+    // Heap::drop_all() still frees them when the Lua instance drops — they
+    // just never leak past that, unlike the pre-D-1c `Gc::new_uncollected`
+    // fallback. The caller (with_hooks_versioned) extends this bootstrap
+    // window through stdlib install and calls end_bootstrap() once the
+    // runtime is actually open for business.
+    global_rc.borrow().heap.begin_bootstrap();
+    let _bootstrap_guard = lua_gc::HeapGuard::push(&global_rc.borrow().heap);
+
     // macros.tsv: luaC_white → g.current_white()
     let initial_marked = initial_white;
 
@@ -6531,6 +6545,14 @@ pub fn new_state() -> Option<LuaState> {
             return None;
         }
     }
+
+    // End this function's own bootstrap window: registry/string pool/
+    // tagmethod tables are wired into GlobalState fields by now, so this
+    // state is self-consistent for normal collectable tracking. Callers that
+    // continue bootstrapping (stdlib install) re-open a window of their own;
+    // callers that use new_state() directly (low-level GC tests) get a heap
+    // that allocates normally, as before.
+    global_rc.borrow().heap.end_bootstrap();
 
     Some(main_thread)
 }
