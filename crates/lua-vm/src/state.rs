@@ -6380,10 +6380,17 @@ pub fn new_state() -> Option<LuaState> {
     // Build a dummy LuaString for memerrmsg and strcache initialization.
     // This is a chicken-and-egg problem: GlobalState.memerrmsg needs to be initialized
     // before luaS_init, but luaS_init creates the memerrmsg.
-    // We use a placeholder Rc<LuaString> that will be replaced by luaS_init.
-    // TODO(port): this is fragile; Phase B should ensure memerrmsg is properly set by luaS_init.
-    // TODO(D-1c-bridge): allocation outside state context (new_state() free fn — no LuaState yet)
-    let placeholder_str = GcRef::new(LuaString::placeholder());
+    // The heap is created ahead of the GlobalState literal so these two
+    // pre-state allocations (the placeholder string and the main thread
+    // value) can live on its heap-owned uncollected list instead of falling
+    // through GcRef::new's detached arm — this was the last per-VM
+    // process-lifetime leak, and removing it lets LUA_RS_GC_STRICT_GUARD
+    // police the detached arm with zero sanctioned exceptions. Moving the
+    // heap into the literal below is safe: the owner-list heads are Cells
+    // whose GcBox pointees are stable heap allocations.
+    let heap = lua_gc::Heap::new();
+    let placeholder_str = GcRef(heap.allocate_uncollected(LuaString::placeholder()));
+    let main_thread_value = GcRef(heap.allocate_uncollected(lua_types::value::LuaThread::new(0)));
 
     // macros.tsv: bitmask → (1u32 << b); WHITE0BIT = 0 → 1u8
     let initial_white = 1u8 << WHITE0BIT;
@@ -6449,7 +6456,7 @@ pub fn new_state() -> Option<LuaState> {
         panic: None,
         mainthread: None,
         threads: std::collections::HashMap::new(),
-        main_thread_value: GcRef::new(lua_types::value::LuaThread::new(0)),
+        main_thread_value,
         current_thread_id: 0,
         closing_thread_id: None,
         main_thread_id: 0,
@@ -6469,7 +6476,7 @@ pub fn new_state() -> Option<LuaState> {
         test_warn_last_to_cont: false,
         test_warn_buffer: Vec::new(),
         c_functions: Vec::new(),
-        heap: lua_gc::Heap::new(),
+        heap,
         cross_thread_upvals: std::collections::HashMap::new(),
         suspended_parent_stacks: Vec::new(),
         suspended_parent_open_upvals: Vec::new(),
@@ -6490,10 +6497,12 @@ pub fn new_state() -> Option<LuaState> {
     // allocation-triggered step during setup must not sweep these objects.
     // Heap::drop_all() still frees them when the Lua instance drops — they
     // just never leak past that, unlike the pre-D-1c `Gc::new_uncollected`
-    // fallback. The caller (with_hooks_versioned) extends this bootstrap
-    // window through stdlib install and calls end_bootstrap() once the
-    // runtime is actually open for business.
-    global_rc.borrow().heap.begin_bootstrap();
+    // fallback. RAII scope: the lua_open error return below cannot leave the
+    // heap stuck in bootstrap mode. Callers that continue bootstrapping
+    // (stdlib install) open a nested window of their own; callers that use
+    // new_state() directly (low-level GC tests) get a heap that allocates
+    // normally once this scope drops at return.
+    let _bootstrap_scope = global_rc.borrow().heap.bootstrap_scope();
     let _bootstrap_guard = lua_gc::HeapGuard::push(&global_rc.borrow().heap);
 
     // macros.tsv: luaC_white → g.current_white()
@@ -6545,14 +6554,6 @@ pub fn new_state() -> Option<LuaState> {
             return None;
         }
     }
-
-    // End this function's own bootstrap window: registry/string pool/
-    // tagmethod tables are wired into GlobalState fields by now, so this
-    // state is self-consistent for normal collectable tracking. Callers that
-    // continue bootstrapping (stdlib install) re-open a window of their own;
-    // callers that use new_state() directly (low-level GC tests) get a heap
-    // that allocates normally, as before.
-    global_rc.borrow().heap.end_bootstrap();
 
     Some(main_thread)
 }

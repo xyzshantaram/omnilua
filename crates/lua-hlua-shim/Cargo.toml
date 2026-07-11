@@ -16,6 +16,7 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+lua-gc.workspace = true
 lua-types.workspace = true
 lua-vm.workspace = true
 lua-stdlib = { workspace = true, features = ["full"] }

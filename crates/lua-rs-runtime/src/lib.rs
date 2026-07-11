@@ -1063,9 +1063,19 @@ impl Lua {
         lua
     }
 
+    /// Every embedding entry point funnels through here, so this is where
+    /// the state's heap becomes the active allocation target. Without the
+    /// guard, host-side table/userdata/metatable operations run the VM with
+    /// no active heap: allocations fall through `GcRef::new`'s detached arm
+    /// and weak-cache handles created via `GcRef::downgrade` carry no heap
+    /// identity, so they keep upgrading after sweep frees their target —
+    /// the issue #249 bug class, found on the userdata paths by the
+    /// `OMNILUA_GC_STRICT_GUARD=1` sweep. Nesting under `pcall_k`'s own
+    /// guard is harmless (TLS stack push/pop).
     fn with_state<R>(&self, f: impl FnOnce(&mut LuaState) -> R) -> R {
         if let Ok(mut state) = self.inner.state.try_borrow_mut() {
             let _active = self.inner.enter_active(&mut *state);
+            let _heap_guard = heap_guard(&state);
             self.inner.flush_pending_external_unroots(&mut state);
             let result = f(&mut state);
             self.inner.flush_pending_external_unroots(&mut state);
@@ -1075,6 +1085,7 @@ impl Lua {
         let state = self
             .active_state_mut()
             .expect("re-entrant Lua access without an active state");
+        let _heap_guard = heap_guard(state);
         let result = f(state);
         self.inner.flush_pending_external_unroots(state);
         result
@@ -3856,13 +3867,12 @@ fn bootstrap_state(hooks: HostHooks, version: LuaVersion) -> Result<LuaState> {
     let mut state = new_state().ok_or(LuaError::Memory)?;
     state.global_mut().lua_version = version;
     {
-        state.global().heap.begin_bootstrap();
+        let _bootstrap_scope = state.global().heap.bootstrap_scope();
         let _bootstrap_guard = heap_guard(&state);
         install_parser_hook(&mut state);
         hooks.install(&mut state);
         open_libs(&mut state)?;
         lua_vm::api::configure_startup_gc_mode(&mut state);
-        state.global().heap.end_bootstrap();
     }
     Ok(state)
 }
@@ -4641,7 +4651,13 @@ impl LuaRuntime {
     /// to learn which limit, if any, stopped it, and
     /// [`sandbox_reset`](Self::sandbox_reset) to refill the budget before the
     /// next run.
+    /// Runs under the state's heap guard: `strip_globals` interns
+    /// replacement strings and tables through `GcRef::new`, which must not
+    /// fall through to the detached no-heap arm (`LuaRuntime` has no
+    /// `with_state` funnel, so entry points that allocate push the guard
+    /// themselves).
     pub fn install_sandbox(&mut self, config: SandboxConfig) -> Result<()> {
+        let _heap_guard = heap_guard(&self.state);
         apply_sandbox_config(&mut self.state, &config)
     }
 
