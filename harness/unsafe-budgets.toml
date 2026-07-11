@@ -27,14 +27,13 @@
                      #   All four carry `// SAFETY:` notes and are exercised
                      #   under Miri (Stacked + Tree Borrows) via the
                      #   scope_cell_* / scope_fn_cell_* tests, zero UB.
-"lua-gc"     = 14   # production heap/collector substrate. Historical
+"lua-gc"     = 13   # production heap/collector substrate. Historical
                     # reference-only partial ports were removed from src/ so
                     # this ceiling tracks only active heap.rs unsafe. Each
                     # block remains a raw-pointer op required by the current
-                    # mark-and-sweep architecture. +1 (13→14) for
-                    # BootstrapScope::drop's NonNull<Heap> deref — the RAII
-                    # end of a bootstrap window, same pointer contract as
-                    # HeapGuard (heap outlives the scope, single-threaded).
+                    # mark-and-sweep architecture. (BootstrapScope holds
+                    # the depth cell via Rc — no unsafe, sound past heap
+                    # death.)
 "lua-coro"   = 0    # no active unsafe implementation; raise only with a
                     # future stackful coroutine backend.
 "lua-cli"    = 6    # libloading dynlib backend (5) + os.date local-offset FFI (localtime_r/localtime_s, #90).

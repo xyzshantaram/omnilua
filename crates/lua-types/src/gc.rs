@@ -62,7 +62,7 @@ impl<T: Trace + 'static> GcRef<T> {
     /// `OMNILUA_GC_STRICT_GUARD` because the call is explicit and auditable;
     /// volume still surfaces through [`lua_gc::detached_allocations`], which
     /// the leak canaries assert stays flat.
-    pub fn new_or_detached(value: T) -> Self {
+    pub(crate) fn new_or_detached(value: T) -> Self {
         let gc = lua_gc::with_current_heap(|heap| match heap {
             Some(heap) => heap.allocate(value),
             None => Gc::new_uncollected(value),

@@ -139,23 +139,21 @@ impl Drop for HeapGuard {
 /// (`?` during stdlib install, `lua_open` failure) cannot leave the heap
 /// stuck in bootstrap mode the way a manual `end_bootstrap` call can.
 ///
-/// Holds a raw `NonNull<Heap>` under the same documented contract as
-/// [`HeapGuard::push`]: the heap must outlive the scope. Every call site
-/// passes `GlobalState`'s heap, which outlives any scope created during VM
-/// construction by construction; a caller that drops the heap first gets a
-/// dangling deref in this Drop. A future pass moving `Heap` behind shared
-/// ownership would make both this and `HeapGuard` misuse-proof at the type
-/// level — tracked as follow-up work, not fixable for one API alone.
+/// Sound with no lifetime and no unsafe: the scope shares ownership of the
+/// heap's depth counter (`Rc<Cell<usize>>`), so a scope that outlives its
+/// heap decrements a still-live cell instead of dereferencing a dead heap —
+/// the count on a dead heap is meaningless but harmless. (Contrast with
+/// [`HeapGuard::push`]'s raw-pointer contract, tracked for the same
+/// treatment in the heap-ownership follow-up.)
 pub struct BootstrapScope {
-    heap: NonNull<Heap>,
+    depth: std::rc::Rc<Cell<usize>>,
 }
 
 impl Drop for BootstrapScope {
     fn drop(&mut self) {
-        // SAFETY: produced from a live `&Heap` in `Heap::bootstrap_scope`;
-        // the caller keeps the heap alive for the scope's lifetime (it lives
-        // in `GlobalState` behind an `Rc` held by every caller of this API).
-        unsafe { self.heap.as_ref() }.end_bootstrap();
+        let depth = self.depth.get();
+        debug_assert!(depth > 0, "BootstrapScope dropped with zero depth");
+        self.depth.set(depth.saturating_sub(1));
     }
 }
 
@@ -1522,8 +1520,10 @@ pub struct Heap {
     /// allocation pressure during setup must not sweep them. A depth rather
     /// than a flag so windows nest (an outer embedding-layer window survives
     /// an inner one closing). Zero by default: a bare `Heap::new()`
-    /// (low-level GC tests) allocates normally.
-    bootstrap_depth: Cell<usize>,
+    /// (low-level GC tests) allocates normally. Behind an `Rc` so
+    /// [`BootstrapScope`] can decrement it without holding a heap pointer
+    /// (sound even if a scope outlives its heap).
+    bootstrap_depth: std::rc::Rc<Cell<usize>>,
     /// Multiplier on bytes_used to set next threshold after collection.
     pause_multiplier: Cell<usize>,
     /// State machine for the incremental collector.
@@ -1597,7 +1597,7 @@ impl Heap {
             quarantine: std::env::var_os("LUA_RS_GC_QUARANTINE").is_some_and(|v| v == "1"),
             quarantined: Cell::new(None),
             uncollected: Cell::new(None),
-            bootstrap_depth: Cell::new(0),
+            bootstrap_depth: std::rc::Rc::new(Cell::new(0)),
             pause_multiplier: Cell::new(200), // 200% = collect when bytes 2x threshold
             state: Cell::new(GcState::Pause),
             paused: Cell::new(true), // start paused; caller enables when world is consistent
@@ -1657,13 +1657,11 @@ impl Heap {
     /// bootstrap window when dropped, so `?`-style early exits from VM
     /// construction cannot leave the heap stuck in bootstrap mode.
     ///
-    /// The caller must keep the heap alive for the scope's lifetime — in
-    /// practice the heap lives in `GlobalState` behind an `Rc`, which every
-    /// caller of this API already holds.
+    /// Safe to hold past the heap's death (see [`BootstrapScope`]).
     pub fn bootstrap_scope(&self) -> BootstrapScope {
         self.begin_bootstrap();
         BootstrapScope {
-            heap: NonNull::from(self),
+            depth: std::rc::Rc::clone(&self.bootstrap_depth),
         }
     }
 
