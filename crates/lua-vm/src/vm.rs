@@ -3657,6 +3657,7 @@ fn arith_op_checked(
             LuaError::Runtime(LuaValue::Str(s)) => {
                 crate::debug::prefixed_runtime_pub(state, s.as_bytes().to_vec())
             }
+            LuaError::RuntimeMsg(b) => crate::debug::prefixed_runtime_pub(state, b.into_vec()),
             other => other,
         })?;
         state.set_at(ra, LuaValue::Int(result));

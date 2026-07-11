@@ -17,10 +17,20 @@ pub struct LuaThreadClose(pub LuaStatus);
 
 /// The Lua error type. Carries a `LuaValue` payload because Lua errors can
 /// be any value (typically a string).
+///
+/// The `*Msg` variants carry the message as owned bytes instead of a GC
+/// string: host-side code builds errors with no VM (and no active heap) in
+/// scope, and allocating the payload eagerly either required an active
+/// `HeapGuard` or fell back to a detached, never-freed box (the issue #249
+/// leak class — see #253). The bytes are materialized into a real GC string
+/// by [`into_value`](LuaError::into_value) at the moment the error actually
+/// enters a VM, where a heap is active by construction.
 #[derive(Debug, Clone)]
 pub enum LuaError {
     Runtime(LuaValue),
     Syntax(LuaValue),
+    RuntimeMsg(Box<[u8]>),
+    SyntaxMsg(Box<[u8]>),
     Memory,
     Error,
     Yield,
@@ -30,27 +40,23 @@ pub enum LuaError {
 
 impl LuaError {
     // ── Generic message constructors ─────────────────────────────────────
+    // Allocation-free: the message stays owned bytes until into_value()
+    // materializes it under the VM's active heap (#253).
     pub fn runtime(args: fmt::Arguments<'_>) -> Self {
-        LuaError::Runtime(LuaValue::Str(crate::gc::GcRef::new_or_detached(
-            crate::string::LuaString::from_bytes(format!("{}", args).into_bytes()),
-        )))
+        LuaError::RuntimeMsg(format!("{}", args).into_bytes().into_boxed_slice())
     }
     pub fn syntax(args: fmt::Arguments<'_>) -> Self {
-        LuaError::Syntax(LuaValue::Str(crate::gc::GcRef::new_or_detached(
-            crate::string::LuaString::from_bytes(format!("{}", args).into_bytes()),
-        )))
+        LuaError::SyntaxMsg(format!("{}", args).into_bytes().into_boxed_slice())
     }
     pub fn syntax_at(args: fmt::Arguments<'_>, source: &[u8], line: i32) -> Self {
-        LuaError::Syntax(LuaValue::Str(crate::gc::GcRef::new_or_detached(
-            crate::string::LuaString::from_bytes(
-                format!("{}:{}: {}", String::from_utf8_lossy(source), line, args).into_bytes(),
-            ),
-        )))
+        LuaError::SyntaxMsg(
+            format!("{}:{}: {}", String::from_utf8_lossy(source), line, args)
+                .into_bytes()
+                .into_boxed_slice(),
+        )
     }
     pub fn syntax_raw(msg: &[u8]) -> Self {
-        LuaError::Syntax(LuaValue::Str(crate::gc::GcRef::new_or_detached(
-            crate::string::LuaString::from_bytes(msg.to_vec()),
-        )))
+        LuaError::SyntaxMsg(msg.to_vec().into_boxed_slice())
     }
 
     // ── Standard-shape constructors ──────────────────────────────────────
@@ -132,8 +138,8 @@ impl LuaError {
 
     pub fn to_status(&self) -> LuaStatus {
         match self {
-            LuaError::Runtime(_) => LuaStatus::ErrRun,
-            LuaError::Syntax(_) => LuaStatus::ErrSyntax,
+            LuaError::Runtime(_) | LuaError::RuntimeMsg(_) => LuaStatus::ErrRun,
+            LuaError::Syntax(_) | LuaError::SyntaxMsg(_) => LuaStatus::ErrSyntax,
             LuaError::Memory => LuaStatus::ErrMem,
             LuaError::Error => LuaStatus::ErrErr,
             LuaError::Yield => LuaStatus::Yield,
@@ -142,9 +148,34 @@ impl LuaError {
         }
     }
 
+    /// Convert the error into the Lua value that gets pushed/propagated.
+    ///
+    /// This is the VM-entry boundary for the `*Msg` variants: the owned
+    /// bytes become a real GC string here, via `GcRef::new`, which requires
+    /// an active `HeapGuard`. Every call site that pushes an error object
+    /// runs inside a guarded region (`pcall_k`, `api::load`, `with_state`),
+    /// so the allocation is always collector-owned — this is what lets the
+    /// guard-less detached allocation arm be removed entirely (#253).
+    /// The message bytes, when this error carries a textual message —
+    /// either a GC string payload or the owned bytes of a not-yet-
+    /// materialized `*Msg` variant. The canonical accessor for host-side
+    /// message extraction; callers needing a fallback keep their own.
+    pub fn message_bytes(&self) -> Option<&[u8]> {
+        match self {
+            LuaError::Runtime(LuaValue::Str(s)) | LuaError::Syntax(LuaValue::Str(s)) => {
+                Some(s.as_bytes())
+            }
+            LuaError::RuntimeMsg(b) | LuaError::SyntaxMsg(b) => Some(b),
+            _ => None,
+        }
+    }
+
     pub fn into_value(self) -> LuaValue {
         match self {
             LuaError::Runtime(v) | LuaError::Syntax(v) => v,
+            LuaError::RuntimeMsg(b) | LuaError::SyntaxMsg(b) => LuaValue::Str(
+                crate::gc::GcRef::new(crate::string::LuaString::from_bytes(b.into_vec())),
+            ),
             _ => LuaValue::Nil,
         }
     }
@@ -157,6 +188,9 @@ impl LuaError {
     pub fn message_lossy(&self) -> String {
         match self {
             LuaError::Runtime(v) | LuaError::Syntax(v) => lua_value_message_lossy(v),
+            LuaError::RuntimeMsg(b) | LuaError::SyntaxMsg(b) => {
+                String::from_utf8_lossy(b).into_owned()
+            }
             LuaError::Memory => "not enough memory".to_string(),
             LuaError::Error => "error in error handling".to_string(),
             LuaError::Yield => "attempt to yield across a C-call boundary".to_string(),
@@ -179,7 +213,12 @@ fn lua_value_message_lossy(value: &LuaValue) -> String {
 
 impl fmt::Display for LuaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self)
+        match self {
+            LuaError::RuntimeMsg(b) | LuaError::SyntaxMsg(b) => {
+                write!(f, "{}", String::from_utf8_lossy(b))
+            }
+            other => write!(f, "{:?}", other),
+        }
     }
 }
 impl std::error::Error for LuaError {}

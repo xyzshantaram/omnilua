@@ -647,9 +647,9 @@ pub(crate) fn os_execute(state: &mut LuaState) -> Result<usize, LuaError> {
                         }
                         Err(e) => {
                             state.push(LuaValue::Nil);
-                            let msg = match &e {
-                                LuaError::Runtime(LuaValue::Str(s)) => s.as_bytes().to_vec(),
-                                other => format!("{:?}", other).into_bytes(),
+                            let msg = match e.message_bytes() {
+                                Some(b) => b.to_vec(),
+                                None => format!("{:?}", &e).into_bytes(),
                             };
                             let s = state.intern_str(&msg)?;
                             state.push(LuaValue::Str(s));
@@ -684,9 +684,9 @@ pub(crate) fn os_remove(state: &mut LuaState) -> Result<usize, LuaError> {
             }
             Err(e) => {
                 state.push(LuaValue::Nil);
-                let msg = match &e {
-                    LuaError::Runtime(LuaValue::Str(s)) => s.as_bytes().to_vec(),
-                    other => format!("{:?}", other).into_bytes(),
+                let msg = match e.message_bytes() {
+                    Some(b) => b.to_vec(),
+                    None => format!("{:?}", &e).into_bytes(),
                 };
                 let s = state.intern_str(&msg)?;
                 state.push(LuaValue::Str(s));
@@ -717,9 +717,9 @@ pub(crate) fn os_rename(state: &mut LuaState) -> Result<usize, LuaError> {
             }
             Err(e) => {
                 state.push(LuaValue::Nil);
-                let msg = match &e {
-                    LuaError::Runtime(LuaValue::Str(s)) => s.as_bytes().to_vec(),
-                    other => format!("{:?}", other).into_bytes(),
+                let msg = match e.message_bytes() {
+                    Some(b) => b.to_vec(),
+                    None => format!("{:?}", &e).into_bytes(),
                 };
                 let s = state.intern_str(&msg)?;
                 state.push(LuaValue::Str(s));

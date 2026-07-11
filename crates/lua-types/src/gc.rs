@@ -24,48 +24,25 @@ use lua_gc::{Gc, HeapRef, Marker, Trace};
 pub struct GcRef<T: Trace + 'static>(pub Gc<T>);
 
 impl<T: Trace + 'static> GcRef<T> {
-    /// Allocate a new GC-tracked value. If a `HeapGuard` is active (set by
-    /// `state.run()` / `pcall_k`), the new allocation joins that heap's
-    /// allgc chain (or its bootstrap list inside a bootstrap window).
-    /// Otherwise it allocates detached — never freed for the life of the
-    /// process (the issue #249 leak class). The detached arm exists only for
-    /// the handful of pre-heap allocations in `new_state`; every other path
-    /// must have a guard, and `OMNILUA_GC_STRICT_GUARD=1` turns this arm into
-    /// a panic so guard-coverage gaps self-report under the test suites.
+    /// Allocate a new GC-tracked value on the active heap: joins the allgc
+    /// chain under a `HeapGuard` (set by `state.run()` / `pcall_k` /
+    /// `with_state`), or the heap's bootstrap list inside a bootstrap
+    /// window.
+    ///
+    /// Panics if no heap is active. There is no fallback: the old detached
+    /// arm allocated a box no heap ever freed (issue #249's leak class), and
+    /// since #253 moved host-side `LuaError` messages to owned bytes, no
+    /// legitimate guard-less allocation path remains — a panic here is
+    /// always a missing guard on the entry path, and the message says so.
     pub fn new(value: T) -> Self {
         let gc = lua_gc::with_current_heap(|heap| match heap {
             Some(heap) => heap.allocate(value),
-            None => {
-                if lua_gc::strict_guard_mode() {
-                    panic!(
-                        "OMNILUA_GC_STRICT_GUARD: GcRef::new::<{}> with no active HeapGuard — \
-                         this allocation would be detached and never freed (issue #249 class); \
-                         push a HeapGuard or bootstrap window on the entry path",
-                        std::any::type_name::<T>()
-                    );
-                }
-                Gc::new_uncollected(value)
-            }
-        });
-        GcRef(gc)
-    }
-
-    /// The pre-strict fallback semantics, spelled explicitly: allocate on the
-    /// active heap if one is present, otherwise detached (never freed for the
-    /// life of the process).
-    ///
-    /// DEBT(fallback): the only sanctioned caller is host-side `LuaError`
-    /// message construction (`lua-types/src/error.rs`) — errors are built
-    /// with no VM in scope and `LuaError::Runtime` carries a `LuaValue`, so
-    /// the message must be a GC string even off-heap. Remove by carrying
-    /// owned bytes in `LuaError` until VM entry. Exempt from
-    /// `OMNILUA_GC_STRICT_GUARD` because the call is explicit and auditable;
-    /// volume still surfaces through [`lua_gc::detached_allocations`], which
-    /// the leak canaries assert stays flat.
-    pub(crate) fn new_or_detached(value: T) -> Self {
-        let gc = lua_gc::with_current_heap(|heap| match heap {
-            Some(heap) => heap.allocate(value),
-            None => Gc::new_uncollected(value),
+            None => panic!(
+                "GcRef::new::<{}> with no active HeapGuard — a detached allocation \
+                 would never be freed (issue #249 class); push a HeapGuard or \
+                 bootstrap window on the entry path",
+                std::any::type_name::<T>()
+            ),
         });
         GcRef(gc)
     }
@@ -265,20 +242,13 @@ mod tests {
         assert_eq!(weak.strong_count(), 0);
     }
 
-    /// Exercises the sanctioned guard-less path on purpose, which is exactly
-    /// what `OMNILUA_GC_STRICT_GUARD=1` exists to forbid — skipped under
-    /// strict mode rather than deleted so the legacy detached semantics stay
-    /// covered in normal runs.
+    /// The detached fallback is gone (#253): a guard-less allocation is a
+    /// bug on the entry path, and it must fail loudly in every build, not
+    /// leak quietly for the life of the process.
     #[test]
-    fn uncollected_weak_refs_keep_process_lifetime_behavior() {
-        if lua_gc::strict_guard_mode() {
-            return;
-        }
-        let strong = GcRef::new(Cell0);
-        let weak = strong.downgrade();
-
-        assert!(weak.upgrade().is_some());
-        assert_eq!(weak.strong_count(), 1);
+    #[should_panic(expected = "no active HeapGuard")]
+    fn guardless_allocation_panics() {
+        let _ = GcRef::new(Cell0);
     }
 }
 

@@ -118,7 +118,7 @@ fn thread_cannot_cross() {
         .unwrap();
     let err = v51.marshal_from(&v54, &th).unwrap_err();
     assert!(
-        matches!(err.kind(), LuaError::Runtime(_)),
+        matches!(err.kind(), LuaError::Runtime(_) | LuaError::RuntimeMsg(_)),
         "expected a runtime error rejecting the thread, got {err:?}"
     );
 }
