@@ -138,6 +138,14 @@ impl Drop for HeapGuard {
 /// [`Heap::bootstrap_scope`], ends the window on drop. Exists so error paths
 /// (`?` during stdlib install, `lua_open` failure) cannot leave the heap
 /// stuck in bootstrap mode the way a manual `end_bootstrap` call can.
+///
+/// Holds a raw `NonNull<Heap>` under the same documented contract as
+/// [`HeapGuard::push`]: the heap must outlive the scope. Every call site
+/// passes `GlobalState`'s heap, which outlives any scope created during VM
+/// construction by construction; a caller that drops the heap first gets a
+/// dangling deref in this Drop. A future pass moving `Heap` behind shared
+/// ownership would make both this and `HeapGuard` misuse-proof at the type
+/// level — tracked as follow-up work, not fixable for one API alone.
 pub struct BootstrapScope {
     heap: NonNull<Heap>,
 }
@@ -753,6 +761,13 @@ pub struct GcHeader {
 const HDR_FINALIZED: u8 = 1;
 const HDR_COLLECTED: u8 = 2;
 const HDR_GRAY_LISTED: u8 = 4;
+/// Set on every box a `Heap` owns — both the sweepable `allocate` path and
+/// the never-swept `allocate_uncollected` bootstrap path — and never on
+/// detached `Gc::new_uncollected` boxes. Distinct from `HDR_COLLECTED`
+/// (sweepable only): strict-guard checks need "will this box ever be freed
+/// by a heap" (bootstrap boxes die in `drop_all`, so a guard-less weak
+/// handle to one dangles after heap teardown), not "is it sweepable".
+const HDR_HEAP_OWNED: u8 = 16;
 /// Set by sweep under `LUA_RS_GC_QUARANTINE=1` instead of freeing the box.
 /// Debug builds assert this bit is clear on every `Gc` dereference and on
 /// every `Marker::mark_box` visit, turning use-after-sweep into a
@@ -925,11 +940,20 @@ impl<T: ?Sized> Gc<T> {
     /// True iff this box is linked into a sweepable heap owner list
     /// (`HDR_COLLECTED` set) — the collector may free it during the owning
     /// heap's lifetime. Detached (`new_uncollected`) boxes and heap-owned
-    /// bootstrap (`allocate_uncollected`) boxes report false. Strict-guard
-    /// mode uses this to tell a hazardous guard-less operation on a
-    /// collectable box from the sanctioned process-lifetime path.
+    /// bootstrap (`allocate_uncollected`) boxes report false.
     pub fn is_heap_tracked(self) -> bool {
         self.header().collected()
+    }
+
+    /// True iff some `Heap` will free this box — during collection
+    /// (`allocate`) or at teardown in `drop_all` (`allocate_uncollected`).
+    /// Only detached `Gc::new_uncollected` boxes report false. Strict-guard
+    /// mode keys on this: a guard-less weak handle or dropped buffer charge
+    /// is hazardous for any heap-owned box (a bootstrap box's weak handle
+    /// dangles after heap teardown just the same), while the detached
+    /// process-lifetime path is the sanctioned legacy behavior.
+    pub fn is_heap_owned(self) -> bool {
+        self.header().flag(HDR_HEAP_OWNED)
     }
 
     pub fn color(self) -> Color {
@@ -1652,7 +1676,11 @@ impl Heap {
         }
         let size = std::mem::size_of::<GcBox<T>>();
         let boxed = Box::new(GcBox {
-            header: GcHeader::new_white(size, self.current_white.get(), HDR_COLLECTED),
+            header: GcHeader::new_white(
+                size,
+                self.current_white.get(),
+                HDR_COLLECTED | HDR_HEAP_OWNED,
+            ),
             value,
         });
         boxed.header.next.set(self.head.get());
@@ -1681,7 +1709,7 @@ impl Heap {
     pub fn allocate_uncollected<T: Trace + 'static>(&self, value: T) -> Gc<T> {
         let size = std::mem::size_of::<GcBox<T>>();
         let boxed = Box::new(GcBox {
-            header: GcHeader::new_white(size, self.current_white.get(), 0),
+            header: GcHeader::new_white(size, self.current_white.get(), HDR_HEAP_OWNED),
             value,
         });
         boxed.header.next.set(self.uncollected.get());
@@ -4190,6 +4218,32 @@ mod tests {
             dropped.get(),
             "a bootstrap allocation must still be freed when the heap drops"
         );
+    }
+
+    /// Pins the ownership-flag semantics the strict-guard checks key on
+    /// (`GcRef::downgrade`/`account_buffer` panic for guard-less operations
+    /// on any heap-owned box): a bootstrap box is heap-owned but not
+    /// sweepable, so treating "not sweepable" as "not hazardous" would let
+    /// a weak handle to it dangle after `drop_all` frees the box at heap
+    /// teardown.
+    #[test]
+    fn ownership_flags_distinguish_all_three_allocation_paths() {
+        let heap = Heap::new();
+        let tracked = heap.allocate(Tracked(DropFlag(std::rc::Rc::new(Cell::new(false)))));
+        assert!(tracked.is_heap_owned());
+        assert!(tracked.is_heap_tracked());
+
+        let bootstrap =
+            heap.allocate_uncollected(Tracked(DropFlag(std::rc::Rc::new(Cell::new(false)))));
+        assert!(
+            bootstrap.is_heap_owned(),
+            "bootstrap boxes die in drop_all — strict-guard hazard checks must see them"
+        );
+        assert!(!bootstrap.is_heap_tracked());
+
+        let detached = Gc::new_uncollected(Tracked(DropFlag(std::rc::Rc::new(Cell::new(false)))));
+        assert!(!detached.is_heap_owned());
+        assert!(!detached.is_heap_tracked());
     }
 
     #[test]

@@ -72,10 +72,24 @@ const ITERS: usize = 64;
 /// genuine per-iteration leak of even one box would exceed this by ~10x.
 const TOLERANCE: isize = 4096;
 
+/// True under `LUA_RS_GC_QUARANTINE=1`, where sweep parks swept boxes
+/// (poisoned, freed only at heap teardown) instead of releasing them —
+/// live bytes then grow per iteration by design for scenarios that keep
+/// one VM alive. Only the live-byte assertions are relaxed for it; the
+/// detached-allocation tripwire is unaffected by quarantine and always
+/// runs.
+fn quarantine_mode() -> bool {
+    std::env::var_os("LUA_RS_GC_QUARANTINE").is_some_and(|v| v == "1")
+}
+
 /// Runs `scenario` twice to warm caches (string interner, lazy statics,
 /// thread-locals), snapshots live bytes, runs it `ITERS` more times, and
 /// asserts the counter came back to the snapshot within `TOLERANCE`.
-fn assert_steady_state(name: &str, mut scenario: impl FnMut()) {
+/// `persistent_heap` marks scenarios that reuse one VM across iterations —
+/// the only ones whose live-byte check must be skipped under quarantine
+/// (create/drop scenarios still settle, since heap teardown frees
+/// quarantined boxes).
+fn assert_steady_state_inner(name: &str, persistent_heap: bool, mut scenario: impl FnMut()) {
     scenario();
     scenario();
     let detached_before = lua_gc::detached_allocations();
@@ -92,6 +106,9 @@ fn assert_steady_state(name: &str, mut scenario: impl FnMut()) {
          active HeapGuard (issue #249 class); run the scenario under \
          OMNILUA_GC_STRICT_GUARD=1 for a panic backtrace at the exact site"
     );
+    if persistent_heap && quarantine_mode() {
+        return;
+    }
     assert!(
         growth <= TOLERANCE,
         "{name}: live bytes grew by {growth} over {ITERS} iterations \
@@ -101,16 +118,16 @@ fn assert_steady_state(name: &str, mut scenario: impl FnMut()) {
     );
 }
 
-/// Skipped under `LUA_RS_GC_QUARANTINE=1`: quarantine parks swept boxes
-/// (poisoned, freed only at heap teardown) instead of releasing them, so
-/// live bytes grow per iteration by design and steady-state cannot hold.
-/// The canary's job — catching detached and never-swept leaks — is done by
-/// the normal-mode run.
+fn assert_steady_state(name: &str, scenario: impl FnMut()) {
+    assert_steady_state_inner(name, false, scenario)
+}
+
+fn assert_steady_state_shared_vm(name: &str, scenario: impl FnMut()) {
+    assert_steady_state_inner(name, true, scenario)
+}
+
 #[test]
 fn embedding_lifecycle_is_steady_state() {
-    if std::env::var_os("LUA_RS_GC_QUARANTINE").is_some_and(|v| v == "1") {
-        return;
-    }
     assert_steady_state("vm_churn: create, exec, drop", || {
         let lua = Lua::new();
         lua.load("local t = {1, 2, 3} return #t").exec().unwrap();
@@ -126,7 +143,7 @@ fn embedding_lifecycle_is_steady_state() {
     let lua = Lua::new();
     lua.load("collectgarbage('collect')").exec().unwrap();
 
-    assert_steady_state("chunk_churn: load + into_function + drop", || {
+    assert_steady_state_shared_vm("chunk_churn: load + into_function + drop", || {
         let f = lua
             .load("local x = 42 return x")
             .into_function()
@@ -135,12 +152,12 @@ fn embedding_lifecycle_is_steady_state() {
         lua.load("collectgarbage('collect')").exec().unwrap();
     });
 
-    assert_steady_state("exec_churn: load + exec", || {
+    assert_steady_state_shared_vm("exec_churn: load + exec", || {
         lua.load("local s = 'a' .. 'b' return s").exec().unwrap();
         lua.load("collectgarbage('collect')").exec().unwrap();
     });
 
-    assert_steady_state("coroutine_churn: create + resume + discard", || {
+    assert_steady_state_shared_vm("coroutine_churn: create + resume + discard", || {
         lua.load(
             "for _ = 1, 8 do \
                  local co = coroutine.create(function() coroutine.yield(1) end) \
@@ -152,7 +169,7 @@ fn embedding_lifecycle_is_steady_state() {
         .unwrap();
     });
 
-    assert_steady_state("callback_churn: create_function + drop", || {
+    assert_steady_state_shared_vm("callback_churn: create_function + drop", || {
         let f = lua.create_function(|_, n: i64| Ok(n + 1)).unwrap();
         drop(f);
         lua.load("collectgarbage('collect')").exec().unwrap();

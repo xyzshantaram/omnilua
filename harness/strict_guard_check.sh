@@ -20,4 +20,5 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 export OMNILUA_GC_STRICT_GUARD=1
+unset LUA_RS_GC_QUARANTINE LUA_RS_GC_STRESS
 cargo test --workspace --no-fail-fast "$@"

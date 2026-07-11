@@ -110,7 +110,7 @@ impl<T: Trace + 'static> GcRef<T> {
     /// heap, the weak handle will stop upgrading once sweep removes that exact
     /// heap allocation.
     ///
-    /// Downgrading a *heap-tracked* box with no active `HeapGuard` is a
+    /// Downgrading a *heap-owned* box with no active `HeapGuard` is a
     /// latent use-after-free: the resulting handle has no heap identity to
     /// check, so it keeps upgrading after sweep frees the target.
     /// `OMNILUA_GC_STRICT_GUARD=1` turns that case into a panic; detached
@@ -123,9 +123,9 @@ impl<T: Trace + 'static> GcRef<T> {
                 (HeapRef::from_heap(heap), token)
             })
         });
-        if tracked.is_none() && lua_gc::strict_guard_mode() && self.0.is_heap_tracked() {
+        if tracked.is_none() && lua_gc::strict_guard_mode() && self.0.is_heap_owned() {
             panic!(
-                "OMNILUA_GC_STRICT_GUARD: GcRef::downgrade::<{}> on a heap-tracked box with no \
+                "OMNILUA_GC_STRICT_GUARD: GcRef::downgrade::<{}> on a heap-owned box with no \
                  active HeapGuard — the weak handle would upgrade forever, including after \
                  sweep frees the target (use-after-free); push a HeapGuard on the entry path",
                 std::any::type_name::<T>()
@@ -155,9 +155,9 @@ impl<T: Trace + 'static> GcRef<T> {
         lua_gc::with_current_heap(|h| match h {
             Some(h) => self.0.account_buffer(h, delta),
             None => {
-                if lua_gc::strict_guard_mode() && self.0.is_heap_tracked() {
+                if lua_gc::strict_guard_mode() && self.0.is_heap_owned() {
                     panic!(
-                        "OMNILUA_GC_STRICT_GUARD: account_buffer({delta}) on a heap-tracked \
+                        "OMNILUA_GC_STRICT_GUARD: account_buffer({delta}) on a heap-owned \
                          {} with no active HeapGuard — the charge would be silently dropped \
                          and the pacer would drift from real memory; push a HeapGuard on \
                          the entry path",
