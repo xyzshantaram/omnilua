@@ -12,18 +12,24 @@ measurement plan.
 
 | # | Finding (one line) | Disposition |
 |---|---|---|
-| 1 | W2 relocates the fat pointer (owner-vector slot), does not eliminate it | TODO |
-| 2 | W3 saves zero bytes and repeats a measured +4% Ir packing regression | TODO |
-| 3 | "Only sweep removes during sweep" is false; `unlink_from_list` rewrites the live cursor | TODO |
-| 4 | `retain` + incremental cursor is not a complete algorithm | TODO |
-| 5 | Wrong mid-minor hazard named; young sweep is STW, real hazards are full-sweep pauses + `release_box` reentrancy under RefCell | TODO |
-| 6 | Three segments do not replace seven `GcAge` states | TODO |
-| 7 | Order is load-bearing (newest-first sweep, tobefnz FIFO, head-vs-tail inserts); `swap_remove` unsuitable | TODO |
-| 8 | W1 is bigger than "4 functions"; grayagain persists across minors and has deletion paths | TODO |
-| 9 | Pacer accounting must address owner-vector capacity | TODO |
-| 10 | Quarantine/uncollected need explicit unique-ownership invariants; flags can't identify a vector | TODO |
-| 11 | 64-bit layout claims do not generalize to wasm32 | TODO |
-| R | RSS projection (2.96→2.2 etc.) unsupported by the stated arithmetic | TODO |
+| 1 | W2 relocates the fat pointer (owner-vector slot), does not eliminate it | INCORPORATED — "Where the bytes go today": relocation arithmetic stated (≥ 24 B / ≥ 16 B total ownership metadata per object), direct W2 saving called ≈ 0 ± slack, W2's case re-founded on size-class crossings + sweep locality + cursor-machinery deletion, all measurement-gated |
+| 2 | W3 saves zero bytes and repeats a measured +4% Ir packing regression | INCORPORATED — "Wave 3 — deleted": deleted outright (not deferred); replaced by `#[repr(u8)]` on `Color`/`GcAge` + an 8-byte `GcHeader` size assert |
+| 3 | "Only sweep removes during sweep" is false; `unlink_from_list` rewrites the live cursor | INCORPORATED — W2 "Design decision" pt 3 + "The one mutation rule": tombstones make indices stable so the cursor-rewrite apparatus is deleted rather than translated; the sweep-phase `current_white()` recolor in `move_allgc_to_finobj`/`move_tobefnz_to_allgc` is carried over verbatim; full before/at/ahead/beyond-watermark case table given |
+| 4 | `retain` + incremental cursor is not a complete algorithm | INCORPORATED — "Full incremental sweep": one explicit strategy chosen from R1's menu (stable slots + tombstones + fixed watermark, compaction only at named sweep-complete points); `Vec::retain` confined to compaction points; mid-sweep-allocation survival rule preserved by watermark + white color |
+| 5 | Wrong mid-minor hazard named; young sweep is STW, real hazards are full-sweep pauses + `release_box` reentrancy under RefCell | INCORPORATED — W2 "Minor collection" confirms `sweep_young` stays STW single-call; hazards restated as budgeted-sweep interleavings; two-phase scan/release rule with the stated invariant that no owner-vec borrow is ever held across `release_box` |
+| 6 | Three segments do not replace seven `GcAge` states | INCORPORATED — W2 "Design decision" pt 2: header age stays authoritative, vectors are coarse position cohorts bounding the young-sweep scan; cohort counters follow the in-tree `FinalizerRegistry` prefix-counter precedent (`finish_minor_collection` rotation); `Marker::should_trace_age`'s exact-`Old` skip untouched |
+| 7 | Order is load-bearing (newest-first sweep, tobefnz FIFO, head-vs-tail inserts); `swap_remove` unsuitable | INCORPORATED — "tobefnz FIFO": `FinalizerRegistry` named as the semantic FIFO authority with the entry/exit synchronization argument; head-prepend maps to tail-append = nursery cohort; `swap_remove` absent from the design; intra-cycle free order documented as non-contractual with the battery as falsifier (test row O1) |
+| 8 | W1 is bigger than "4 functions"; grayagain persists across minors and has deletion paths | INCORPORATED — W1 "What exists today": both rev-1 claims corrected against code ("cleared each cycle" is false — `replace_grayagain` persists `Old1`/`Touched2` until `Old`; full touchpoint list given), risk re-rated MEDIUM-LOW, all deletion cases enumerated incl. the `correct_generation_pointers` → `unlink_grayagain` hook and cross-list moves (new test G3) |
+| 9 | Pacer accounting must address owner-vector capacity | INCORPORATED — W2 "Pacer accounting": R1's option (b) chosen — pacer bytes explicitly redefined to exclude ownership storage, with rationale; cadence deltas measured (`collections()`/`minor_collections()`), `owner_capacity_bytes()` diagnostic feeds heap-diff, slack-charge fallback pre-declared |
+| 10 | Quarantine/uncollected need explicit unique-ownership invariants; flags can't identify a vector | INCORPORATED — W2 "Unique-ownership invariant": exactly-one-slot invariant across the five structures, membership never inferred from flags, `HDR_COLLECTED`-not-cleared-when-quarantined documented, grayagain declared non-owning ⊆ live sweepable set, `drop_all` ordering (grayagain cleared first, `mem::take` before frees) |
+| 11 | 64-bit layout claims do not generalize to wasm32 | INCORPORATED — "Where the bytes go today" dual-width table (40/24 B header, 16/8 B links); measurement plan item 6 adds a wasm linear-memory high-water measurement beyond `cargo check`; post-diet 8-B assert valid ungated on both widths |
+| R | RSS projection (2.96→2.2 etc.) unsupported by the stated arithmetic | INCORPORATED — projections withdrawn; "Measurement plan" states done-conditions as measurements to take (Ir arbiter, heap-diff incl. ownership storage, absolute peak-RSS triples, cadence, wasm high-water) with the drop-if-neutral decision rule, no target numbers |
+
+No finding is rebutted. Finding 1 carries one nuance rather than a
+disagreement: "direct saving ≈ 0" is accepted as stated, and the spec adds
+that allocator size-class effects can still make the relocation a real RSS
+win — which is R1's own closing recommendation ("require allocator-bucket
+or locality evidence"), here promoted to the W2 keep/revert criterion.
 
 ## Where the bytes go today (pointer-width qualified)
 
