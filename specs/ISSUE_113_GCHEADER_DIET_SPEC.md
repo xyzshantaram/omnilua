@@ -1,12 +1,24 @@
-# Issue #113 — GcHeader diet without unsafe: kill both intrusive fat links (rev 2)
+# Issue #113 — GcHeader diet without unsafe: kill both intrusive fat links (rev 3)
 
-Status: SPEC rev 2 (not started). Answers every finding of the round-1
-adversarial review (`ISSUE_113_GCHEADER_DIET_SPEC_REVIEW_R1.md`, VERDICT:
-REVISE). Rev-1 claimed both fat links can be removed in safe Rust; that
-claim survives review, but rev-1's W2 design (per-age segment vectors) did
-not — this revision replaces it with owner-class vectors plus deferred
-cohort maintenance, drops Wave 3, and replaces the RSS projections with a
-measurement plan.
+Status: SPEC rev 3 (not started). Rev-2 answered the round-1 adversarial
+review (`ISSUE_113_GCHEADER_DIET_SPEC_REVIEW_R1.md`); the round-2 review
+(`ISSUE_113_GCHEADER_DIET_SPEC_REVIEW_R2.md`, VERDICT: REVISE) judged W1,
+the W3 deletion, the pointer-width accounting, and the measurement plan
+materially improved and confined its findings to W2. Rev-3 is that W2 pass:
+(1) destruction ownership — dead boxes are owned by a heap-side
+`pending_release` structure with per-object accounting at release, a
+`releasing` window that makes collection entry points inert, and a
+drain-until-stable `drop_all`; (2) a bounded tombstone policy (25% density,
+move-time trigger outside sweep, one compaction algorithm, physical
+boundary indices, capacity shrink); (3) the `FinalizerRegistry` precedent
+claim withdrawn; (4) the `firstold1` deletion restated on
+unread-by-decisions grounds with a graph-shaped G3 test; (5) per-transition
+move/recolor semantics (`move_finobj_to_tobefnz` does not recolor).
+
+Rev-1's core claim stands: both fat links can be removed in safe Rust.
+Rev-1's W2 design (per-age segment vectors) did not survive R1 and was
+replaced in rev-2 by owner-class vectors plus deferred cohort maintenance;
+Wave 3 is dropped; RSS projections are replaced by a measurement plan.
 
 ## Review R1 disposition table
 
