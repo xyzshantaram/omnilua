@@ -540,18 +540,118 @@ on `GcHeader` — valid ungated on both widths since the post-diet header
 contains no pointers (`const _: () = assert!(size_of::<GcHeader>() == 8)`),
 plus updated `value_layout` example output.
 
-## Measurement plan (replaces rev-1 RSS projections)
+## Measurement plan (replaces rev-1's RSS projections)
 
-TODO
+Rev-1's projected ratios (closure_ops 2.96× → ~2.2×, binarytrees 2.22× →
+~1.9×) are withdrawn — R1's arithmetic critique is accepted in full: the W2
+pointer is relocated not removed, vector capacity was omitted, allocator
+buckets are unknown, no absolute C/Rust peak-RSS pairs were shown, and prior
+evidence (the R2-diet packet) showed payload-byte savings translating
+roughly 1:1 into process RSS, not into outsized ratio movement. No number
+appears below as a target; the done-condition is that the following
+measurements exist and the drop-if-neutral rule is applied to them.
+
+All measurements follow `docs/MEASUREMENT_PROTOCOL.md`: frozen baseline
+binary built from origin/main before edits, interleaved A/B within rounds,
+≥4 rounds judged on min-ratio, quiet machine for any number that enters the
+PR body, revert-validation for any surprise, and the bench host used
+exclusively (coordination board).
+
+Per wave (W1 first, W2 separately):
+
+1. **Compute-neutrality (Ir arbiter)** — `harness/bench/instr-count.sh` on
+   fibonacci and mandelbrot. These rows allocate little and must be flat;
+   the abort criterion is Ir regression > 2% on either. This is the
+   instruction-removal class check: the diet must be free for non-GC paths.
+2. **GC-path Ir** — instr-count on binarytrees, table_ops, closure_ops.
+   W1 expectation: flat to slightly down (barrier fast path loses a Cell
+   write). W2 expectation: sweep-loop instruction mix changes shape
+   (pointer-chase → linear scan + tombstone skips); an Ir increase here with
+   a wall/Bcm improvement is a legitimate CPI-class outcome — classify
+   before judging, per the protocol's win-class table. Any change touching
+   slot layout is codegen-layout-adjacent: pair Ir with a cold-machine wall
+   A/B (the T5a lesson).
+3. **Heap-diff including ownership storage** — `harness/bench/heap-diff.sh`
+   on closure_ops and binarytrees for alloc-count / bytes-per-block deltas,
+   which surfaces both the shrunken `GcBox` allocations and the owner-vector
+   backing blocks (few, large). Supplement with the new
+   `Heap::owner_capacity_bytes()` diagnostic sampled at workload peak so
+   excess capacity and tombstone slack are numbers, not assumptions.
+4. **Peak RSS with absolutes** — `harness/bench/compare.sh` on the `_long`
+   GC-heavy rows, reporting C peak, Rust-before peak, Rust-after peak in
+   bytes, and only then the ratios. Sub-100ms rows are excluded
+   (startup-dominated, per the protocol).
+5. **Cadence** — `collections()` / `minor_collections()` totals per workload
+   before/after. A shift is *expected* (header bytes shrink, so
+   pacer-derived thresholds shift; `GC_MIN_THRESHOLD` floors small heaps).
+   Record it; if a GC-heavy row's wall regression tracks the cadence change,
+   test the fallback (slack charge at compaction) before concluding.
+6. **wasm32** — `cargo check -p lua-vm --target wasm32-unknown-unknown` is
+   the compile gate (layout asserts must not be 64-bit-only), but per R1
+   finding 11 that is not a memory measurement: additionally run a fixed
+   GC-heavy workload under a wasm runtime and record linear-memory
+   high-water (`memory.size` after run, before/after the change — the
+   playground harness or wasmtime both expose it). Wasm linear memory
+   retains grown pages, so owner-vector growth spikes cost real,
+   unreturnable pages there; this is the environment where capacity slack
+   matters most.
+
+Decision rule: W1 keeps if Ir is flat on compute rows and heap-diff/RSS do
+not regress. W2 keeps only if the measurements show a net win at peak
+(heap-diff + owner_capacity_bytes accounting) or a wall/Ir win from sweep
+locality — otherwise it is reverted and the honest negative recorded, per
+the drop-if-neutral rule. "The 8-byte header is aesthetically right" is not
+a keep reason.
 
 ## Test matrix
 
-TODO
+R1's enumerated list, mapped to existing gates or new kit tests. "Kit"
+means deterministic in-memory tests in `heap.rs`'s test module — the
+fast-inner-loop tier, milliseconds per run.
+
+| # | Scenario | Existing coverage | New work |
+|---|---|---|---|
+| M1 | Each of the 3 owner moves with target **before** the active sweep cursor | none mid-sweep (`finalizer_intrusive_lists_sweep_and_drop` is at-Pause only) | NEW kit: drive `incremental_run_until_state_with_post_mark` to `SweepAllGc`, advance partially with `StepBudget::from_work(n)`, move an already-visited object, finish, assert membership/liveness/`allgc_count` |
+| M2 | Moves with target **at** the cursor slot | none | NEW kit (same harness, position at `sweep_index`) |
+| M3 | Moves with target **ahead of** the cursor (and beyond watermark) | none | NEW kit; assert the recolor rule preserved the object through both lists' sweeps |
+| A1 | Allocation during `SweepAllGc` | `allocation_during_incremental_sweep_survives_current_cycle` | extend to `SweepFinObj`, `SweepToBeFnz`, and the `EnterAtomic`→`Atomic` gap |
+| B1 | `StepBudget::from_work(1)` resumption to completion | `full_collect_equivalent_to_incremental_to_pause`, `budget_zero_does_some_work`, `sweep_can_pause_and_resume` | NEW kit variant: interleave a move + an allocation at every `InProgress` step under budget 1 (churn test; also proves tombstone-skip termination) |
+| F1 | FIFO finalization order | `finalizer_registry_minor_snapshot_uses_cohort_boundaries`, `finalizer_registry_marks_and_clears_finalized_bit`; gc.lua/gengc.lua `__gc`-order asserts | NEW kit: registry↔heap sync — register N finalizable, kill all, pop FIFO, assert each `move_tobefnz_to_allgc` succeeds and set-equality holds throughout |
+| G1 | grayagain deletion via full-sweep free | `full_sweep_unlinks_freed_grayagain_entries` | ports as-is |
+| G2 | grayagain dedup + persistence | `grayagain_links_object_once`, `grayagain_list_carries_old1_until_old`, `grayagain_list_carries_touched2_until_old` | port as-is (these pin the persistence facts rev-1 got wrong) |
+| G3 | Cross-list move of a gray-listed object deletes its entry | none (behavior exists via `unlink_from_list` → `correct_generation_pointers` but untested) | NEW kit: `Touched1` object → `move_allgc_to_finobj`, assert `grayagain_count` drops and next minor is sane |
+| Q1 | Quarantine parking + single free at teardown | canary battery under `LUA_RS_GC_QUARANTINE=1`, `harness/asan-stress.sh` | NEW kit: quarantined box's slot is tombstoned, box appears once in `quarantined`, `drop_all` frees exactly once |
+| U1 | Uncollected teardown | `allocate_uncollected_survives_collection_but_is_freed_on_heap_drop`, `bootstrapping_routes_allocate_to_the_uncollected_list`, #249 leak canaries (with the git-stash-revert verification caveat) | port as-is |
+| O1 | Newest-first order dependence (absence thereof) | not directly unit-testable — it is a claim of *no* dependence | falsifiers: 36 GC canaries × incremental+generational (`harness/canaries/gc/run_canaries.sh`), gc.lua + gengc.lua officials ×5 versions, the quarantine canary run |
+| C1 | Cohort rotation / scan bounding | `minor_collect_frees_young_and_keeps_old`, `minor_sweep_uses_generation_cursors_to_skip_old_tail` (sweep-visited counts pin the scan range), `minor_collect_skips_untouched_old_root_scan_work`, `promote_and_reset_all_ages`, `full_sweep_corrects_generation_cursors_when_cursor_object_is_freed` (assertion rewrites to counter state) | port with cursor asserts translated to counter/index asserts |
+
+PR gate on top of the kit tier: full battery — canaries ×2 modes,
+quarantine run, strict-guard run, `harness/run_official_all.sh`,
+`specs/oracle/check.sh` ×5, workspace tests, wasm check — per the repo's
+rung-6 definition.
 
 ## Sequencing & gates
 
-TODO
+1. **W1 lands alone**: own PR, kit rows G1–G3 + A1 + battery + measurement
+   plan items 1/3/5. Small, reversible, and it produces the first real
+   number for "what does removing one link actually buy" — which is the
+   evidence W2's approval depends on.
+2. **W2 only after** W1's measured result and this spec's round-2 review
+   verdict. Supervised branch (per the deep-spec → codex-review → execute
+   workflow), full battery per commit, no mixing with other GC work. The
+   `repr(u8)`/size-assert cleanup (ex-W3) rides with W2.
+3. Abort criteria (unchanged from rev-1, plus one): any canary/quarantine
+   flip that needs more than a localized fix; Ir regression > 2% on
+   fibonacci/mandelbrot; new: a GC-heavy-row regression attributable to
+   cadence or tombstone-scan overhead that survives the slack-charge
+   fallback test — then W2 reverts and the negative is recorded.
 
 ## Relation to other open work
 
-TODO
+Independent at the code level of #252 (Rc<Heap> ownership — already landed;
+`Heap::new` returns `Rc<Self>` in current main, so rev-1's "sequence after"
+note is satisfied) and #253 (LuaError bytes). If #253 is still open when W2
+starts, land it first for the same diff-purity reason as before. The
+`grayagain`/owner-vector work overlaps textually with any generational-GC
+follow-up in `specs/followup/issue-93-generational-gc-plan.md`; coordinate
+on the board before parallel GC branches exist.
