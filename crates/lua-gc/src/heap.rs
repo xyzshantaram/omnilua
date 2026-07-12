@@ -97,30 +97,26 @@ type IdentityHashMap<V> = HashMap<usize, V, IdentityBuildHasher>;
 // ──────────────────────────────────────────────────────────────────────────
 
 thread_local! {
-    static CURRENT_HEAP_STACK: RefCell<Vec<NonNull<Heap>>> = const { RefCell::new(Vec::new()) };
+    static CURRENT_HEAP_STACK: RefCell<Vec<std::rc::Rc<Heap>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A scoped guard for the currently-active heap. Pushed at entry to
 /// `state.run()` / `state.protected_call()` / `state.load()`; popped on
 /// drop. Supports nesting (multiple LuaStates on one thread).
+///
+/// Holds a strong `Rc<Heap>` on the TLS stack (issue #252): the guard is
+/// sound with no outlives contract — a guard that outlives its `Lua` keeps
+/// the heap alive until the guard pops, rather than dangling. Guards are
+/// function-scoped everywhere in-tree, so the lifetime extension is
+/// transient by construction.
 pub struct HeapGuard {
-    // Anchor a NonNull so the user can't accidentally drop the guard while
-    // an inner Lua state is still active. We rely on RAII.
     _private: (),
 }
 
 impl HeapGuard {
     /// Push `heap` onto the active stack. Returns a guard; dropping it pops.
-    ///
-    /// # Safety
-    ///
-    /// The pointer must remain valid for the lifetime of the guard. Callers
-    /// typically pass `&state.global.heap`, which lives as long as the
-    /// `GlobalState` (an `Rc<RefCell<_>>`); the guard must drop before the
-    /// state is dropped.
-    pub fn push(heap: &Heap) -> Self {
-        let ptr = NonNull::from(heap);
-        CURRENT_HEAP_STACK.with(|stack| stack.borrow_mut().push(ptr));
+    pub fn push(heap: &std::rc::Rc<Heap>) -> Self {
+        CURRENT_HEAP_STACK.with(|stack| stack.borrow_mut().push(std::rc::Rc::clone(heap)));
         HeapGuard { _private: () }
     }
 }
@@ -189,35 +185,32 @@ pub fn detached_allocations() -> usize {
 /// The heap reference is deliberately scoped to the closure. This avoids the
 /// previous `current_heap() -> Option<&'static Heap>` lifetime lie while still
 /// supporting legacy `GcRef::new` call sites that do not receive `&mut LuaState`.
-pub fn with_current_heap<R>(f: impl for<'a> FnOnce(Option<&'a Heap>) -> R) -> R {
-    CURRENT_HEAP_STACK.with(|stack| {
-        let ptr = stack.borrow().last().copied();
-        // SAFETY: the top NonNull was produced from a live `&Heap` whose
-        // lifetime is bounded by the corresponding `HeapGuard`. The reference
-        // is only handed to `f`, and cannot escape through the return type.
-        let heap = ptr.map(|ptr| unsafe { &*ptr.as_ptr() });
-        f(heap)
-    })
+pub fn with_current_heap<R>(f: impl for<'a> FnOnce(Option<&'a std::rc::Rc<Heap>>) -> R) -> R {
+    let top = CURRENT_HEAP_STACK.with(|stack| stack.borrow().last().cloned());
+    f(top.as_ref())
 }
 
-#[derive(Copy, Clone, Debug)]
+/// A non-owning heap identity handle for weak references (issue #252):
+/// holds a `Weak<Heap>`, so a `GcWeak` that outlives its heap answers
+/// "does the heap still contain my target" with a plain `false` instead of
+/// dereferencing freed memory. No unsafe, no outlives contract.
+#[derive(Clone, Debug)]
 pub struct HeapRef {
-    ptr: NonNull<Heap>,
+    weak: std::rc::Weak<Heap>,
 }
 
 impl HeapRef {
-    pub fn from_heap(heap: &Heap) -> Self {
+    pub fn from_heap(heap: &std::rc::Rc<Heap>) -> Self {
         HeapRef {
-            ptr: NonNull::from(heap),
+            weak: std::rc::Rc::downgrade(heap),
         }
     }
 
-    pub fn contains_allocation(self, identity: usize, token: usize) -> bool {
-        // SAFETY: `HeapRef` is created only from a live `&Heap`. Runtime-owned
-        // weak handles store it inside `GlobalState`, whose heap field outlives
-        // those handles. The method only traverses heap metadata and never
-        // dereferences the weak target pointer.
-        unsafe { self.ptr.as_ref() }.contains_allocation(identity, token)
+    pub fn contains_allocation(&self, identity: usize, token: usize) -> bool {
+        match self.weak.upgrade() {
+            Some(heap) => heap.contains_allocation(identity, token),
+            None => false,
+        }
     }
 }
 
@@ -1568,15 +1561,12 @@ pub struct Heap {
     v51_udata_roster: RefCell<Vec<std::rc::Rc<dyn Udata51Probe>>>,
 }
 
-impl Default for Heap {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Heap {
-    pub fn new() -> Self {
-        Self {
+    /// Construct a heap behind `Rc` — the only ownership shape the guard
+    /// and weak-handle machinery accept since issue #252. Everything that
+    /// needs `&Heap` gets it by deref.
+    pub fn new() -> std::rc::Rc<Self> {
+        std::rc::Rc::new(Self {
             head: Cell::new(None),
             finobj: Cell::new(None),
             tobefnz: Cell::new(None),
@@ -1611,7 +1601,7 @@ impl Heap {
             marker_pool: RefCell::new(None),
             sweep_prev_next: Cell::new(None),
             v51_udata_roster: RefCell::new(Vec::new()),
-        }
+        })
     }
 
     /// Enable collection. Until this is called, `step` is a no-op (so the
@@ -3867,18 +3857,12 @@ mod tests {
                 let _g2 = HeapGuard::push(&h2);
                 // top of stack is h2
                 with_current_heap(|heap| {
-                    assert!(std::ptr::addr_eq(
-                        heap.unwrap() as *const _,
-                        &h2 as *const _,
-                    ));
+                    assert!(std::rc::Rc::ptr_eq(heap.unwrap(), &h2));
                 });
             }
             // _g2 dropped — top is back to h1
             with_current_heap(|heap| {
-                assert!(std::ptr::addr_eq(
-                    heap.unwrap() as *const _,
-                    &h1 as *const _,
-                ));
+                assert!(std::rc::Rc::ptr_eq(heap.unwrap(), &h1));
             });
         }
         assert!(

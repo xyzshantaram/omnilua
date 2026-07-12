@@ -1923,7 +1923,7 @@ pub struct GlobalState {
     /// During Phase A-C this is `paused=true`, so allocations don't auto-
     /// register and `step` is a no-op. Phase D-1d wires `unpause()` after
     /// state initialization, at which point `step` runs during VM dispatch.
-    pub heap: lua_gc::Heap,
+    pub heap: std::rc::Rc<lua_gc::Heap>,
 
     /// Phase E-3 cross-thread open-upvalue mirror. Maps `(thread_id, stack_idx)`
     /// to the live value of an open upvalue whose home thread is currently

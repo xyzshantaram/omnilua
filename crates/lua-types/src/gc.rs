@@ -158,7 +158,7 @@ pub struct GcWeak<T: Trace + 'static> {
 impl<T: Trace + 'static> GcWeak<T> {
     /// Try to promote to a strong reference.
     pub fn upgrade(&self) -> Option<GcRef<T>> {
-        if let Some(heap) = self.heap {
+        if let Some(heap) = &self.heap {
             if !heap.contains_allocation(self.identity, self.allocation_token) {
                 return None;
             }
@@ -183,7 +183,7 @@ impl<T: Trace + 'static> Clone for GcWeak<T> {
             target: self.target,
             identity: self.identity,
             allocation_token: self.allocation_token,
-            heap: self.heap,
+            heap: self.heap.clone(),
         }
     }
 }
