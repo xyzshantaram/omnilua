@@ -17,7 +17,7 @@ measurement plan.
 | 3 | "Only sweep removes during sweep" is false; `unlink_from_list` rewrites the live cursor | INCORPORATED — W2 "Design decision" pt 3 + "The one mutation rule": tombstones make indices stable so the cursor-rewrite apparatus is deleted rather than translated; the sweep-phase `current_white()` recolor in `move_allgc_to_finobj`/`move_tobefnz_to_allgc` is carried over verbatim; full before/at/ahead/beyond-watermark case table given |
 | 4 | `retain` + incremental cursor is not a complete algorithm | INCORPORATED — "Full incremental sweep": one explicit strategy chosen from R1's menu (stable slots + tombstones + fixed watermark, compaction only at named sweep-complete points); `Vec::retain` confined to compaction points; mid-sweep-allocation survival rule preserved by watermark + white color |
 | 5 | Wrong mid-minor hazard named; young sweep is STW, real hazards are full-sweep pauses + `release_box` reentrancy under RefCell | INCORPORATED — W2 "Minor collection" confirms `sweep_young` stays STW single-call; hazards restated as budgeted-sweep interleavings; two-phase scan/release rule with the stated invariant that no owner-vec borrow is ever held across `release_box` |
-| 6 | Three segments do not replace seven `GcAge` states | INCORPORATED — W2 "Design decision" pt 2: header age stays authoritative, vectors are coarse position cohorts bounding the young-sweep scan; cohort counters follow the in-tree `FinalizerRegistry` prefix-counter precedent (`finish_minor_collection` rotation); `Marker::should_trace_age`'s exact-`Old` skip untouched |
+| 6 | Three segments do not replace seven `GcAge` states | INCORPORATED — W2 "Design decision" pt 2: header age stays authoritative, vectors are coarse position cohorts bounding the young-sweep scan; counter updates at compaction points model `finish_minor_collection`'s arithmetic (the broader registry-precedent claim is withdrawn per R2 finding 3); `Marker::should_trace_age`'s exact-`Old` skip untouched |
 | 7 | Order is load-bearing (newest-first sweep, tobefnz FIFO, head-vs-tail inserts); `swap_remove` unsuitable | INCORPORATED — "tobefnz FIFO": `FinalizerRegistry` named as the semantic FIFO authority with the entry/exit synchronization argument; head-prepend maps to tail-append = nursery cohort; `swap_remove` absent from the design; intra-cycle free order documented as non-contractual with the battery as falsifier (test row O1) |
 | 8 | W1 is bigger than "4 functions"; grayagain persists across minors and has deletion paths | INCORPORATED — W1 "What exists today": both rev-1 claims corrected against code ("cleared each cycle" is false — `replace_grayagain` persists `Old1`/`Touched2` until `Old`; full touchpoint list given), risk re-rated MEDIUM-LOW, all deletion cases enumerated incl. the `correct_generation_pointers` → `unlink_grayagain` hook and cross-list moves (new test G3) |
 | 9 | Pacer accounting must address owner-vector capacity | INCORPORATED — W2 "Pacer accounting": R1's option (b) chosen — pacer bytes explicitly redefined to exclude ownership storage, with rationale; cadence deltas measured (`collections()`/`minor_collections()`), `owner_capacity_bytes()` diagnostic feeds heap-diff, slack-charge fallback pre-declared |
@@ -242,15 +242,19 @@ correctly identified:
    `current_white()` when `GcState::is_sweep()` — cross-list moves during a
    paused incremental sweep are supported, load-bearing behavior.
 
-The precedent that makes this design low-novelty: **`FinalizerRegistry`
-already implements the exact cohort-prefix-counter scheme over a plain
-`Vec`** — `pending_reallyold`/`pending_old1`/`pending_survival` prefix
-counts with new entries appended at the tail, rotation in
-`finish_minor_collection` (`reallyold += old1; old1 = survival; survival =
-new`), stable order-preserving removal that decrements the right counter
-(`retain_pending_not_in`), and whole-list promotion
-(`promote_all_pending_to_old` sets `reallyold = len`). W2 applies the same
-shape to the heap's owner lists.
+Rev-2 claimed `FinalizerRegistry` as a precedent making this design
+"low-novelty." **That claim is withdrawn** (R2 finding 3): the registry has
+a dense `Vec` it rebuilds immediately on removal
+(`retain_pending_not_in`), no tombstones, no incremental cursor, no
+watermark, no scratch dead ownership, no destructor reentrancy, and it
+cohort-tracks only `pending`, not `to_be_finalized`. None of the hard parts
+of `OwnerVec` have an in-tree precedent; they are new machinery and carry
+their risk undiscounted. What the registry honestly supplies is the
+*post-compaction cohort arithmetic*: `finish_minor_collection`'s rotation
+(`reallyold += old1; old1 = survival; survival = new`) and
+`promote_all_pending_to_old`'s whole-list promotion are the model for how
+W2 updates its counters at compaction points — where the vector is dense,
+which is the only regime the registry ever operates in.
 
 ### Data structures
 
@@ -295,9 +299,10 @@ tail-append; cohort prefix ranges from index 0 are
 `Some(ptr)` onto `allgc` — one amortized push replacing two `Cell` writes.
 `quarantined` and `uncollected` need no tombstones or cohorts: they are
 append-only during life (`release_box` under quarantine;
-`allocate_uncollected`) and drained only in `drop_all`. `tobefnz` needs
-tombstone slots but no cohorts (its cohort mirrors live in
-`FinalizerRegistry` already).
+`allocate_uncollected`) and drained only in `drop_all`. (Rev-2 justified
+`tobefnz`'s missing cohorts by a registry mirror; the correct reason —
+above — is that the young sweep scans all of `tobefnz`, and
+`FinalizerRegistry` cohort-tracks only `pending`, not `to_be_finalized`.)
 
 ### The one mutation rule: tombstones, never shifts — with a bound
 
@@ -665,12 +670,13 @@ preserves front-to-back FIFO order in the heap vector anyway, but
 correctness does not lean on it. `swap_remove` appears nowhere in this
 design.
 
-Risk: MEDIUM-HIGH stands — this rewires the collector's spine even though
-each piece now has a named precedent. Mitigations: the tombstone rule is a
-single mechanism replacing seven cursor patches; the FinalizerRegistry
-pattern is already battle-tested in-tree; W2 starts only after W1's measured
-landing; supervised branch, full battery per commit, no mixing with other GC
-work.
+Risk: MEDIUM-HIGH stands — this rewires the collector's spine, and the
+tombstone/watermark/`pending_release` machinery is new, with no in-tree
+precedent for its hard parts (the withdrawn registry claim). Mitigations:
+the tombstone rule is a single mechanism replacing seven cursor patches;
+the destruction window is one flag with the same shape as `paused`; W2
+starts only after W1's measured landing; supervised branch, full battery
+per commit, no mixing with other GC work.
 
 ## Wave 3 — deleted (R1 finding 2 accepted)
 
