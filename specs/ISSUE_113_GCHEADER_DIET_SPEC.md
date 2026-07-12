@@ -204,11 +204,341 @@ W1 ships as its own PR and its measured result gates W2.
 
 ## Wave 2 — owner-class vectors with deferred cohort maintenance
 
-TODO — chosen design, data structures, phase-order table, move-vs-cursor cases.
+### Design decision
 
-## Wave 3 — deleted
+Rev-2 **adopts the R1 alternative** (owner-class vectors retaining header
+age, deferred cohort maintenance) and **abandons rev-1's per-age segment
+vectors**. Rev-1's design was wrong against the code in three ways R1
+correctly identified:
 
-TODO — rationale.
+1. Barriers never physically move objects today.
+   `generational_forward_barrier` sets `age = Old0` and
+   `generational_backward_barrier` sets `age = Touched1` *in place*, plus a
+   `remember_minor_revisit` — the allgc chain order is pure allocation
+   order. A design that moves objects between age vectors at barrier time
+   invents a mutation the collector has never had, precisely in the
+   hazard-heavy window (mid-sweep). Deferred cohort maintenance means: no
+   physical move ever happens at barrier time; position changes only at
+   sweep-completion points where the cursor state is known.
+2. Three segments cannot represent seven `GcAge` states (`New`, `Survival`,
+   `Old0`, `Old1`, `Old`, `Touched1`, `Touched2`). The minor marker's skip
+   test is exact-`Old` (`Marker::should_trace_age`), barriers create `Old0`
+   and `Touched1` at arbitrary positions, and `GcAge::next_after_minor`
+   advances each state differently. **Header age stays authoritative.**
+   Vectors are coarse *position cohorts* that bound which slice the young
+   sweep scans — which is already how the cursor scheme behaves today
+   (an `Old0`-aged object sits in the nursery region; `sweep_young_range`
+   frees only `is_white() && !age.is_old()`, so age, not position, decides
+   life or death).
+3. "Only sweep removes during sweep" is false. `unlink_from_list` explicitly
+   rewrites `sweep_prev_next` when the removed cell is the live cursor, and
+   `move_allgc_to_finobj` / `move_tobefnz_to_allgc` recolor to
+   `current_white()` when `GcState::is_sweep()` — cross-list moves during a
+   paused incremental sweep are supported, load-bearing behavior.
+
+The precedent that makes this design low-novelty: **`FinalizerRegistry`
+already implements the exact cohort-prefix-counter scheme over a plain
+`Vec`** — `pending_reallyold`/`pending_old1`/`pending_survival` prefix
+counts with new entries appended at the tail, rotation in
+`finish_minor_collection` (`reallyold += old1; old1 = survival; survival =
+new`), stable order-preserving removal that decrements the right counter
+(`retain_pending_not_in`), and whole-list promotion
+(`promote_all_pending_to_old` sets `reallyold = len`). W2 applies the same
+shape to the heap's owner lists.
+
+### Data structures
+
+```rust
+struct OwnerVec {
+    slots: Vec<Option<NonNull<GcBox<dyn Trace>>>>,
+    tombstones: usize,
+    reallyold: usize,
+    old1: usize,
+    survival: usize,
+}
+
+allgc:       RefCell<OwnerVec>,
+finobj:      RefCell<OwnerVec>,
+tobefnz:     RefCell<Vec<Option<NonNull<GcBox<dyn Trace>>>>>,
+quarantined: RefCell<Vec<NonNull<GcBox<dyn Trace>>>>,
+uncollected: RefCell<Vec<NonNull<GcBox<dyn Trace>>>>,
+sweep_index:     Cell<usize>,
+sweep_watermark: Cell<usize>,
+```
+
+Replaced outright: `head`, `finobj`, `tobefnz`, `quarantined`, `uncollected`
+head cells; the seven cursor cells (`survival`, `old1`, `reallyold`,
+`firstold1`, `finobjsur`, `finobjold1`, `finobjrold`); `sweep_prev_next`;
+`GcHeader::next`. (`firstold1` is written and cursor-corrected today but
+never read by any sweep decision — it exists for upstream parity and one
+test assert. The cohort counters make it unnecessary; its deletion is part
+of this wave and gets a changelog note.)
+
+Slot orientation: **oldest at index 0, `push` appends newest at the tail.**
+This maps today's prepend-at-`head` (newest first in traversal order) to
+tail-append; cohort prefix ranges from index 0 are
+`[0, reallyold)` = old/reallyold, `[reallyold, reallyold+old1)` = old1,
+`[.., ..+survival)` = survival, remainder = nursery. `allocate` pushes
+`Some(ptr)` onto `allgc` — one amortized push replacing two `Cell` writes.
+`quarantined` and `uncollected` need no tombstones or cohorts: they are
+append-only during life (`release_box` under quarantine;
+`allocate_uncollected`) and drained only in `drop_all`. `tobefnz` needs
+tombstone slots but no cohorts (its cohort mirrors live in
+`FinalizerRegistry` already).
+
+### The one mutation rule: tombstones, never shifts
+
+Any removal from `allgc`/`finobj`/`tobefnz` outside a compaction point
+writes `None` into the slot (a tombstone) and increments `tombstones`. No
+slot index ever changes except at **compaction points**, which run only when
+no sweep cursor is live: `finish_cycle`, the end of `sweep_young`,
+`abort_cycle`, and `drop_all`. Compaction is an order-preserving
+`retain`-style pass that drops `None` slots and recounts the cohort
+boundaries by counting surviving slots below each old boundary index (the
+same bookkeeping as `FinalizerRegistry::retain_pending_not_in`).
+`start_cycle` may also compact opportunistically (no cursor exists at
+`Pause → Propagate`) if `tombstones` exceeds a threshold.
+
+Because indices are stable between compactions, the entire cursor-patch
+apparatus — `unlink_from_list`'s `sweep_prev_next` rewrite and
+`correct_generation_pointers`' seven cursor fixups — is deleted rather than
+translated. The grayagain deletion hook (W1) survives as the only
+`correct_generation_pointers` duty and is called directly by the sweep and
+move paths.
+
+This answers R1 finding 4 by choosing one explicit strategy from its menu:
+stable slots + tombstones + fixed watermark + compaction only at
+sweep-complete points. `Vec::retain` is used *only* at compaction points
+where it is a complete (non-incremental) operation; the incremental sweep
+never compacts.
+
+### Full incremental sweep
+
+At the `Atomic → SweepAllGc` transition (`run_atomic`), set
+`sweep_index = 0` and `sweep_watermark = allgc.slots.len()`. Entering
+`SweepFinObj` / `SweepToBeFnz` re-arms both for that vector. A budgeted
+sweep step (`sweep_budgeted`'s replacement) is two-phase:
+
+1. **Scan phase** (short `RefCell` borrow): examine up to `budget` slots in
+   `slots[sweep_index .. sweep_watermark]`. Tombstone → skip (counts as one
+   work unit, so `StepBudget::from_work(1)` still advances and terminates).
+   Dead white (`color == other_white()`) → tombstone the slot, push the ptr
+   onto a scratch dead-list, settle accounting (byte refund via
+   `header.size()`, `allocation_tokens` removal, `objects` decrement),
+   run the grayagain deletion hook if `gray_listed()`. Live → recolor
+   Black/Gray to `current_white()`, exactly today's `sweep_budgeted` logic.
+2. **Release phase** (borrow released): `release_box` each dead ptr.
+
+The two-phase split answers R1 finding 5's reentrancy hazard: a payload
+`Drop` running inside `release_box` can re-enter the heap (allocate, touch
+registries) without hitting a live `RefCell` borrow. Invariant, stated once
+and enforced everywhere: **`release_box` is never called while any owner-vec
+borrow is held, and only after all bookkeeping for that step is complete.**
+A `Drop`-triggered allocation during the release phase appends beyond the
+watermark and survives the cycle (below).
+
+Slots appended at or beyond `sweep_watermark` are never visited by the
+in-progress sweep. This is the structural twin of today's behavior —
+`allocate` prepends at `head`, behind a cursor that only moves away from
+`head`, so mid-sweep allocations are never visited today either — and the
+color rule (`allocate` paints `current_white()`, sweep frees only
+`other_white()`) independently protects them, pinned by
+`allocation_during_incremental_sweep_survives_current_cycle`. Both guards
+stay.
+
+### Every owner-list move vs. an in-progress sweep cursor
+
+The three transitions keep their exact current semantics, including the
+sweep-phase recolor that R1 finding 3/7 called load-bearing:
+
+- `move_allgc_to_finobj` (from `luaC_checkfinalizer` path): requires
+  `HDR_COLLECTED`; tombstone its `allgc` slot (linear scan, same O(n) as
+  today's chain walk — cold path); **if `GcState::is_sweep()`, recolor to
+  `current_white()`** (unchanged); push onto `finobj` tail. Tail = nursery
+  cohort region, matching today's `link_to_head(finobj)` which also lands in
+  the newest region; header age is untouched either way.
+- `move_finobj_to_tobefnz`: tombstone in `finobj`, push onto `tobefnz` tail
+  (today: `link_to_tail` — order-preserving append, identical). No recolor,
+  matching today.
+- `move_tobefnz_to_allgc`: tombstone in `tobefnz`; **if sweeping, recolor
+  `current_white()`** (unchanged); push onto `allgc` tail. Today's
+  `firstold1` special-case for `Old1`-aged objects is dropped with
+  `firstold1` itself; the object's `Old1` header age keeps it out of the
+  young sweep's free test regardless of its nursery position, and its
+  grayagain entry (it holds one whenever `Old0/Old1/Touched1/Touched2`, via
+  `push_next_revisit`) keeps it marked in minors.
+
+Cursor interaction table, for a move that tombstones slot `j` in the vector
+the sweep is currently walking (`i = sweep_index`, `w = sweep_watermark`):
+
+| case | what the sweep sees | outcome |
+|---|---|---|
+| `j < i` (before cursor) | nothing — slot already visited | already recolored live by the scan; now leaves the list; no double visit |
+| `j == i` (at cursor) | next scan reads `None`, skips | one wasted work unit; no cursor rewrite needed |
+| `i < j < w` (ahead of cursor) | scan reads `None` when it arrives, skips | object is not swept from the source list; the `is_sweep()` recolor makes it `current_white()`, so whichever list it lands in treats it as this-cycle-live — same as today |
+| `j >= w` (beyond watermark) | never visited | object was appended mid-sweep and moved again; both slots beyond watermark or tombstoned |
+
+The destination push always lands at the tail. If the destination vector's
+sweep phase has already completed (e.g. `allgc → finobj` while in
+`SweepToBeFnz`), the object simply isn't visited there this cycle — the
+recolor already made it live-white. If the destination phase hasn't started,
+its watermark (taken at phase entry) includes the new slot; the recolor
+means the scan sees a live object and skips it. Both cases reduce to "the
+recolor rule does the semantic work; position does none," which is exactly
+the C design's reasoning (`lgc.c` makes moved objects white during sweep so
+they cannot be freed by a sweep that already passed them).
+
+`barrier` / `barrier_back` / the generational barriers touch only colors,
+ages, the marker's gray queue, and grayagain — no owner-vec access at all.
+Barrier-during-sweep therefore cannot invalidate anything (R1 finding 5's
+reframing of rev-1's wrongly-named hazard).
+
+### Minor collection (`sweep_young`) in vector terms
+
+`minor_collect_with_post_mark` remains stop-the-world, single-call (R1
+finding 5: there is no mutator resumption inside `sweep_young` today, and
+this design does not introduce one). Mapping:
+
+- Scan range: today's `sweep_young_range(head → survival)` +
+  `(survival → old1)` walks nursery + survival cohorts. Vector version scans
+  `allgc.slots[reallyold + old1 ..]` — the same two cohorts. Traversal order
+  flips from newest-first to oldest-first within the slice; per-element
+  handling (free white non-old, `next_after_minor` aging, recolor `New` →
+  `current_white` / `Touched*` → Black, `push_next_revisit`) reads no other
+  element, so no order dependence exists in the logic. The battery is the
+  falsifier (test matrix).
+- `finobj` mirror: scan `finobj.slots[reallyold + old1 ..]`; `tobefnz`: scan
+  all slots (today `sweep_young_range(tobefnz, None)`).
+- Grayagain revisit pass: unchanged from today (`take_grayagain`,
+  `OldRevisitTracker` positional filtering, age advance for unprocessed
+  entries, `replace_grayagain(next_revisit)`) — W1 already converted the
+  container.
+- Frees are two-phase exactly like the incremental sweep: scan+tombstone
+  under the borrow, compact + rotate, release after.
+- Cohort rotation at the end (replacing today's cursor rotation in
+  `sweep_young`): compact the scanned slice in place, then
+  `reallyold += old1; old1 = survivors_of_survival_cohort;
+  survival = survivors_of_nursery_cohort` — the `FinalizerRegistry::
+  finish_minor_collection` rotation with death-adjusted counts. Today's
+  `new_old1` boundary object and `survival = head.get()` cursor writes fall
+  out as index arithmetic.
+- `promote_all_to_old` → `reallyold = live_len, old1 = survival = 0` (the
+  registry's `promote_all_pending_to_old`); `reset_all_ages` /
+  `clear_generation_cursors` → all three counters to 0 + clear grayagain.
+
+### Unique-ownership invariant (R1 finding 10)
+
+Every heap-owned box is referenced by **exactly one** `Some` slot across:
+`allgc.slots ∪ finobj.slots ∪ tobefnz ∪ quarantined ∪ uncollected`.
+Structure membership is explicit — never inferred from flags. Flag semantics
+are untouched and remain coarse invariant guards, not membership metadata:
+`HDR_COLLECTED` = "in one of the three sweepable vectors" (checked by
+`move_allgc_to_finobj`, `Gc::account_buffer`), `HDR_HEAP_OWNED` = "in any of
+the five" (strict-guard checks), `HDR_FREED` = "parked in quarantined".
+As today, `HDR_COLLECTED` is not cleared when a box moves to quarantined;
+the invariant text for the sweepable set is therefore "`HDR_COLLECTED` set
+and `HDR_FREED` clear." `grayagain` is **non-owning** and must be a subset
+of the live sweepable set (W1 deletion cases keep it so). Accounting
+asymmetries carry over verbatim: `allocate_uncollected` charges neither
+`bytes` nor `objects`; quarantined boxes had bytes/token/object accounting
+settled before `release_box` parked them.
+
+Teardown (`drop_all`): clear grayagain (flags then entries) first, then for
+each owner structure `std::mem::take` the vector *out* of its `RefCell` and
+free the boxes from the local — no borrow is live while payload `Drop` runs,
+and no box can be reached twice because each was in exactly one structure.
+Replaces `drop_list`'s chain walk; same order (sweepable lists, then
+quarantined, then uncollected).
+
+### Phase-order table
+
+| Phase (`GcState`) | Collector work | Mutator windows between steps | Owner-vec mutations permitted | Cursor validity |
+|---|---|---|---|---|
+| `Pause` | none | yes | append (`allocate`), tombstone+append (moves) | no cursor; compaction allowed |
+| `Propagate` | `drain_gray_budgeted` | yes | append, moves (no recolor — not sweep) | no cursor |
+| `EnterAtomic` | state hop | yes (budget can end here) | append, moves | no cursor |
+| `Atomic` | `run_atomic`: final drain, post-mark hook, arm `sweep_index`/`sweep_watermark` | no (single step) | none (STW step) | cursor armed at end |
+| `SweepAllGc` | budgeted two-phase scan of `allgc` | yes | append ≥ watermark; moves tombstone per the case table; sweep-phase recolor applies | `sweep_index` valid — tombstones never shift indices |
+| `SweepFinObj` | same for `finobj` | yes | same | re-armed at phase entry |
+| `SweepToBeFnz` | same for `tobefnz` | yes | same (incl. `move_tobefnz_to_allgc` from finalizer dispatch) | re-armed at phase entry |
+| `SweepEnd` | state hop | yes | append, moves | cursor dead |
+| `CallFin` | `finish_cycle`: **compaction of all three + boundary recount**, threshold calc | — | — | no cursor; compaction point |
+| minor (STW inside `minor_collect_with_post_mark`) | mark revisits + roots → atomic hook → `sweep_young` scan/compact/rotate → release | none | payload-`Drop` allocations during release append at tail | no persistent cursor; compaction inside |
+| `abort_cycle` | repaint colors, reset state | — | — | compaction point |
+
+### Pacer accounting (R1 finding 9)
+
+Definition change, stated explicitly: **pacer `bytes` counts box + charged
+buffer bytes only, excluding ownership-metadata storage** (owner-vector
+backing). Rationale: owner-slot bytes are proportional to *live* objects and
+are reclaimed only at compaction, so charging them would feed capacity —
+which does not shrink when objects die — into a threshold formula
+(`finish_cycle`: `bytes * pause_multiplier / 100`) that exists to measure
+collectable pressure. The mechanism is untouched: `allocate` charges
+`size_of::<GcBox<T>>()`, `Gc::account_buffer` adjusts, sweep refunds
+`header.size()`.
+
+Consequences to measure, not hand-wave: after the diet every header charge
+shrinks (−32 B/object 64-bit, −16 B wasm32), so thresholds derived from
+`bytes` drop and collection cadence shifts even with zero behavior change —
+R1's point that the representation change alters collection thresholds is
+correct and applies to W1 too (−16/−8 B per object). The measurement plan
+therefore records `collections()` / `minor_collections()` per workload
+before/after, and a new diagnostic `Heap::owner_capacity_bytes()` (sum of
+`capacity × slot size` across owner vectors) feeds heap-diff so total memory
+claims include the relocated pointer and its slack. If cadence shift alone
+regresses a GC-heavy row, the fallback is an explicit slack charge into
+`bytes` at compaction points — a measured decision, not a default.
+
+### Diagnostics and remaining surfaces
+
+`for_each_header` / `start_cycle`'s repaint / `promote_all_to_old` /
+`reset_all_ages` / `abort_cycle`: iterate vectors, skip `None`.
+`type_name_count` and `allgc_cohort_stats` (lua-cli telemetry): trivial slot
+walks; cohort stats become index arithmetic instead of a cursor-compare
+walk. `Marker` internals: untouched (its `gray_queue` is already a
+`Vec<NonNull<GcBox<dyn Trace>>>`). No code outside `heap.rs` touches
+`header.next`/`gray_next` (verified by grep across `lua-gc`, `lua-types`,
+`lua-vm`); `lua-vm` consumes only the three `move_*` functions, whose
+signatures are unchanged.
+
+### tobefnz FIFO (R1 finding 7)
+
+Stated explicitly: **`FinalizerRegistry` is the semantic FIFO authority**
+for `__gc` order — `push_to_be_finalized` appends, `pop_to_be_finalized`
+consumes via `remove(0)`. The heap-side `tobefnz` vector is a *membership*
+structure only: entries enter both structures in the same act (the runtime
+registers the entry and calls `move_finobj_to_tobefnz`) and leave in the
+same act (`pop_to_be_finalized` then `move_tobefnz_to_allgc`), so the sets
+stay equal; the heap-side *order* is read by nothing except sweep visitation
+(order-insensitive) and `drop_all`. Tail-append (today's `link_to_tail`)
+preserves front-to-back FIFO order in the heap vector anyway, but
+correctness does not lean on it. `swap_remove` appears nowhere in this
+design.
+
+Risk: MEDIUM-HIGH stands — this rewires the collector's spine even though
+each piece now has a named precedent. Mitigations: the tombstone rule is a
+single mechanism replacing seven cursor patches; the FinalizerRegistry
+pattern is already battle-tested in-tree; W2 starts only after W1's measured
+landing; supervised branch, full battery per commit, no mixing with other GC
+work.
+
+## Wave 3 — deleted (R1 finding 2 accepted)
+
+After both links are removed the header is already 8 B on both widths —
+`color(1) + age(1) + flags(1) + pad(1) + size(4)` — so `Cell<u16>` packing
+saves nothing. Worse, it is a measured anti-pattern in this exact spot: the
+`GcHeader` doc-comment records that packing the hot fields cost ~+4% Ir on
+gc_pressure (recount 2026-06-10), which is why color/age/flags each own a
+byte today. `Cell`-based bit-packing turns every hot color/age read-write in
+`mark_box`, `drain_gray_queue`, and the sweep loops into read-modify-write.
+Wave 3 is deleted, not deferred.
+
+What replaces it (mechanical, rides with W2's PR): `#[repr(u8)]` on `Color`
+and `GcAge` to lock the one-byte layout, and a compile-time size assertion
+on `GcHeader` — valid ungated on both widths since the post-diet header
+contains no pointers (`const _: () = assert!(size_of::<GcHeader>() == 8)`),
+plus updated `value_layout` example output.
 
 ## Measurement plan (replaces rev-1 RSS projections)
 
