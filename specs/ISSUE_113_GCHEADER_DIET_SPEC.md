@@ -328,20 +328,100 @@ sweep step (`sweep_budgeted`'s replacement) is two-phase:
 1. **Scan phase** (short `RefCell` borrow): examine up to `budget` slots in
    `slots[sweep_index .. sweep_watermark]`. Tombstone → skip (counts as one
    work unit, so `StepBudget::from_work(1)` still advances and terminates).
-   Dead white (`color == other_white()`) → tombstone the slot, push the ptr
-   onto a scratch dead-list, settle accounting (byte refund via
-   `header.size()`, `allocation_tokens` removal, `objects` decrement),
-   run the grayagain deletion hook if `gray_listed()`. Live → recolor
-   Black/Gray to `current_white()`, exactly today's `sweep_budgeted` logic.
-2. **Release phase** (borrow released): `release_box` each dead ptr.
+   Dead white (`color == other_white()`) → tombstone the slot, run the
+   grayagain deletion hook if `gray_listed()`, and transfer the ptr into
+   `pending_release` (below). **No accounting happens in the scan.** Live →
+   recolor Black/Gray to `current_white()`, exactly today's
+   `sweep_budgeted` logic.
+2. **Release phase** (all owner-structure borrows released): drain
+   `pending_release` one object at a time — pop, settle *that object's*
+   accounting (byte refund via `header.size()`, `allocation_tokens`
+   removal, `objects` decrement), `release_box` it, then move to the next.
 
-The two-phase split answers R1 finding 5's reentrancy hazard: a payload
-`Drop` running inside `release_box` can re-enter the heap (allocate, touch
-registries) without hitting a live `RefCell` borrow. Invariant, stated once
-and enforced everywhere: **`release_box` is never called while any owner-vec
-borrow is held, and only after all bookkeeping for that step is complete.**
-A `Drop`-triggered allocation during the release phase appends beyond the
-watermark and survives the cycle (below).
+### Destruction ownership and reentrancy (R2 findings 1 and 6)
+
+Dead-in-transit boxes are owned by a sixth heap structure, not a stack
+scratch list:
+
+```rust
+pending_release: RefCell<Vec<NonNull<GcBox<dyn Trace>>>>,
+releasing:       Cell<bool>,
+```
+
+The exactly-one-owner invariant now holds at every instant: the scan moves
+a dead box's single owning reference from its owner slot into
+`pending_release` (a different `RefCell`; both borrows are transient), and
+the drain moves it from `pending_release` into the local frame that
+immediately frees it. Rev-2's dead pointers "in none of the five
+structures" no longer exist.
+
+**Accounting travels with release, per object, in pop order.** This is
+today's ordering guarantee restated: current `sweep_budgeted` unlinks,
+accounts, and calls `release_box` for each object before inspecting the
+next. Rev-2's batch accounting broke it — R2's counterexample: dead peers A
+and B both refunded up front, then A's `Drop` calls
+`B.account_buffer(heap, n)` (legal: B's `HDR_COLLECTED` is still set, per
+`Gc::account_buffer`), inflating `bytes` with no later refund — the pacer
+drifts permanently. Under the per-object rule a peer still in
+`pending_release` has *not* been refunded yet, so a reentrant charge lands
+in `B.header.size` and heap `bytes` together and is refunded in full when B
+is popped. The pacer cannot drift.
+
+**Collector reentrancy is prohibited during the drain.** `releasing` is set
+for the duration of every release drain (incremental step, minor sweep,
+full collect) and cleared by a drop guard so a caught panic cannot wedge
+the collector shut. While set, every collection entry point — `step`,
+`step_with_post_mark`, `full_collect_with_post_mark`,
+`minor_collect_with_post_mark`, `incremental_step_with_post_mark`,
+`mark_only_with_post_mark` — returns immediately, the same early-return
+shape `paused` already has. This closes R2's nested-collection variant: a
+destructor cannot start a collection that traces a `pending_release` box as
+a root and then have the outer drain free it.
+
+**Allocation during release is permitted** under one precise rule: it takes
+the normal `allocate` path (or `allocate_uncollected` under bootstrap),
+appends at the `allgc` tail beyond any live watermark, is charged to
+`bytes` normally, and survives the current cycle. Moves are also legal
+inside a destructor (they touch owner structures only through their own
+transient borrows). Collections are inert per the flag; nothing else needs
+a rule.
+
+**Panic safety** falls out of heap ownership: a payload `Drop` that panics
+mid-drain leaves the not-yet-released pointers owned by `pending_release` —
+nothing leaks with the unwinding stack frame (R2's leak variant). The box
+in flight is freed by the unwinding `Box::from_raw` drop; the remainder is
+freed by the next drain or by `Heap::drop` → `drop_all`, which drains
+`pending_release` first.
+
+**Teardown drains until stable** (R2 finding 6 — `drop_all` is public, so
+"weak upgrade fails during `Heap::drop`" is not a sufficient guard).
+`drop_all` becomes:
+
+1. Drain `pending_release` (per-object accounting, then free).
+2. Clear grayagain (flags, then entries — existing order).
+3. Loop until every owner structure is empty: `std::mem::take` each vector
+   out of its `RefCell` in today's `drop_list` order (allgc, finobj,
+   tobefnz, quarantined, uncollected) and free the boxes from the local. A
+   destructor that allocates mid-teardown lands in a fresh (empty-again)
+   vector and is collected by the next pass of the loop; a `debug_assert`
+   bounds the pass count against a degenerate allocate-in-`Drop` ping-pong.
+4. Zero `bytes`/`objects` only after a full pass finds every structure
+   empty.
+
+A reentrant `drop_all` from inside a payload `Drop` is safe by the same
+ownership argument: the box currently being freed is owned by the outer
+frame (in no structure), so the inner call cannot double-free it, and the
+outer loops find their queues empty afterwards and terminate. Step 3 also
+fixes a latent hole in *today's* `drop_all`: the current single-pass
+`drop_list` walk empties each head cell once and then zeroes accounting, so
+a destructor allocating during teardown strands its box on the just-emptied
+`head` cell — leaked outright if the walk was `Heap::drop`'s own.
+
+Invariant, stated once and enforced everywhere: **`release_box` is never
+called while any owner-structure borrow is held, and only after that
+object's own bookkeeping is complete.** A `Drop`-triggered allocation
+during the release phase appends beyond the watermark and survives the
+cycle (below).
 
 Slots appended at or beyond `sweep_watermark` are never visited by the
 in-progress sweep. This is the structural twin of today's behavior —
@@ -419,8 +499,11 @@ this design does not introduce one). Mapping:
   `OldRevisitTracker` positional filtering, age advance for unprocessed
   entries, `replace_grayagain(next_revisit)`) — W1 already converted the
   container.
-- Frees are two-phase exactly like the incremental sweep: scan+tombstone
-  under the borrow, compact + rotate, release after.
+- Frees are two-phase exactly like the incremental sweep: the scan
+  tombstones and transfers dead boxes into `pending_release` under the
+  borrow, compaction and cohort rotation complete all bookkeeping, and the
+  `pending_release` drain (per-object accounting + `release_box`, with
+  `releasing` set) runs last, after every borrow is released.
 - Cohort rotation at the end (replacing today's cursor rotation in
   `sweep_young`): compact the scanned slice in place, then
   `reallyold += old1; old1 = survivors_of_survival_cohort;
@@ -434,9 +517,14 @@ this design does not introduce one). Mapping:
 
 ### Unique-ownership invariant (R1 finding 10)
 
-Every heap-owned box is referenced by **exactly one** `Some` slot across:
-`allgc.slots ∪ finobj.slots ∪ tobefnz ∪ quarantined ∪ uncollected`.
-Structure membership is explicit — never inferred from flags. Flag semantics
+Every heap-owned box is referenced by **exactly one** owning entry across
+the six structures:
+`allgc.slots ∪ finobj.slots ∪ tobefnz.slots ∪ quarantined ∪ uncollected ∪
+pending_release`. `pending_release` is the transitional owner between "slot
+tombstoned by a sweep scan" and "freed by the release drain" — it is what
+makes the invariant hold *during* destruction, which rev-2's stack scratch
+list did not (R2 finding 1). Structure membership is explicit — never
+inferred from flags. Flag semantics
 are untouched and remain coarse invariant guards, not membership metadata:
 `HDR_COLLECTED` = "in one of the three sweepable vectors" (checked by
 `move_allgc_to_finobj`, `Gc::account_buffer`), `HDR_HEAP_OWNED` = "in any of
@@ -449,12 +537,12 @@ asymmetries carry over verbatim: `allocate_uncollected` charges neither
 `bytes` nor `objects`; quarantined boxes had bytes/token/object accounting
 settled before `release_box` parked them.
 
-Teardown (`drop_all`): clear grayagain (flags then entries) first, then for
-each owner structure `std::mem::take` the vector *out* of its `RefCell` and
-free the boxes from the local — no borrow is live while payload `Drop` runs,
-and no box can be reached twice because each was in exactly one structure.
-Replaces `drop_list`'s chain walk; same order (sweepable lists, then
-quarantined, then uncollected).
+Teardown: the drain-until-stable `drop_all` specified under "Destruction
+ownership and reentrancy" — `pending_release` first, grayagain second,
+then repeated `std::mem::take`-and-free passes over the owner structures
+until a full pass finds them all empty, and only then the accounting zero.
+No borrow is live while payload `Drop` runs, and no box can be reached
+twice because each is in exactly one structure at every instant.
 
 ### Phase-order table
 
