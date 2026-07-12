@@ -170,18 +170,6 @@ thread_local! {
     static DETACHED_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
-/// True when `OMNILUA_GC_STRICT_GUARD=1`: the silent no-active-heap fallback
-/// arms (`GcRef::new` → detached allocation, `GcRef::downgrade` →
-/// forever-upgrading weak handle, `GcRef::account_buffer` → dropped charge)
-/// panic with a backtrace instead of degrading, so every guard-coverage gap
-/// self-reports under the existing test suites. The dual of
-/// `LUA_RS_GC_QUARANTINE`: quarantine turns freed-too-early into a loud
-/// failure, strict-guard turns never-freed into one (issue #249's class).
-pub fn strict_guard_mode() -> bool {
-    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *STRICT.get_or_init(|| std::env::var_os("OMNILUA_GC_STRICT_GUARD").is_some_and(|v| v == "1"))
-}
-
 /// Total detached ([`Gc::new_uncollected`]) allocations made on this thread
 /// since it started. Leak canaries assert a zero delta across embedding
 /// scenarios. This counter deliberately lives outside the heap's own

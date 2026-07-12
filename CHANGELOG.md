@@ -4,6 +4,22 @@ All notable changes to `omniLua` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed — GC guard-coverage panics are unconditional
+
+The last two env-gated GC guard checks are now always-on, completing the
+issue #249 → #251 → #253 arc. A guard-less `GcRef::downgrade` of a
+heap-owned box (which would mint a `GcWeak` that upgrades forever, including
+after sweep frees the target) and a guard-less `GcRef::account_buffer` on a
+heap-owned box (whose pacer charge would be silently dropped) now **panic
+unconditionally in every build** — previously they degraded silently unless
+`OMNILUA_GC_STRICT_GUARD=1` was set. With all three guard checks (allocation
+since #253, plus these two) always-on, the `OMNILUA_GC_STRICT_GUARD` env var
+is retired; `harness/strict_guard_check.sh` remains the convenience runner
+for the workspace GC gate. Detached (`Gc::new_uncollected`, process-lifetime)
+boxes keep their legacy behavior.
+
 ## [0.5.0] - 2026-07-12
 
 ### Breaking — `LuaError` representation (#253)
