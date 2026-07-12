@@ -66,6 +66,7 @@ pub(crate) fn error_bytes(e: &LuaError) -> Vec<u8> {
             LuaValue::Str(s) => s.as_bytes().to_vec(),
             _ => b"(error object is not a string)".to_vec(),
         },
+        LuaError::RuntimeMsg(b) | LuaError::SyntaxMsg(b) => b.to_vec(),
         _ => b"(error message not a string)".to_vec(),
     }
 }

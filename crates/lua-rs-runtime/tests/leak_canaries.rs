@@ -169,6 +169,14 @@ fn embedding_lifecycle_is_steady_state() {
         .unwrap();
     });
 
+    assert_steady_state("error_churn: host-side LuaError construction (no VM)", || {
+        for i in 0..32 {
+            let e = lua_types::LuaError::runtime(format_args!("host-side error {i}"));
+            let _ = e.message_lossy();
+            drop(e);
+        }
+    });
+
     assert_steady_state_shared_vm("callback_churn: create_function + drop", || {
         let f = lua.create_function(|_, n: i64| Ok(n + 1)).unwrap();
         drop(f);

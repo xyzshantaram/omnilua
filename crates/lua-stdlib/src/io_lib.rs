@@ -553,11 +553,9 @@ fn opencheck(state: &mut LuaState, fname: &[u8], mode: &[u8]) -> Result<(), LuaE
             LuaError::runtime(format_args!(
                 "cannot open file '{}' ({})",
                 fname.escape_ascii(),
-                match &e {
-                    LuaError::Runtime(LuaValue::Str(s)) => {
-                        String::from_utf8_lossy(s.as_bytes()).into_owned()
-                    }
-                    other => format!("{:?}", other),
+                match e.message_bytes() {
+                    Some(b) => String::from_utf8_lossy(b).into_owned(),
+                    None => format!("{:?}", &e),
                 }
             ))
         })?,
@@ -725,11 +723,9 @@ pub fn io_open(state: &mut LuaState) -> Result<usize, LuaError> {
             Err(e) => {
                 let os_err = io::Error::new(
                     io::ErrorKind::Other,
-                    match &e {
-                        LuaError::Runtime(LuaValue::Str(s)) => {
-                            String::from_utf8_lossy(s.as_bytes()).into_owned()
-                        }
-                        other => format!("{:?}", other),
+                    match e.message_bytes() {
+                        Some(b) => String::from_utf8_lossy(b).into_owned(),
+                        None => format!("{:?}", &e),
                     },
                 );
                 file_result(state, false, Some(&filename), os_err)
@@ -771,11 +767,9 @@ pub fn io_popen(state: &mut LuaState) -> Result<usize, LuaError> {
             Err(e) => {
                 let os_err = io::Error::new(
                     io::ErrorKind::Other,
-                    match &e {
-                        LuaError::Runtime(LuaValue::Str(s)) => {
-                            String::from_utf8_lossy(s.as_bytes()).into_owned()
-                        }
-                        other => format!("{:?}", other),
+                    match e.message_bytes() {
+                        Some(b) => String::from_utf8_lossy(b).into_owned(),
+                        None => format!("{:?}", &e),
                     },
                 );
                 file_result(state, false, Some(&filename), os_err)
@@ -832,11 +826,9 @@ pub fn io_tmpfile(state: &mut LuaState) -> Result<usize, LuaError> {
         Some(temp_fn) => match temp_fn() {
             Ok(path) => path,
             Err(e) => {
-                let msg = match &e {
-                    LuaError::Runtime(LuaValue::Str(s)) => {
-                        String::from_utf8_lossy(s.as_bytes()).into_owned()
-                    }
-                    other => format!("{:?}", other),
+                let msg = match e.message_bytes() {
+                    Some(b) => String::from_utf8_lossy(b).into_owned(),
+                    None => format!("{:?}", &e),
                 };
                 return file_result(
                     state,
@@ -861,11 +853,9 @@ pub fn io_tmpfile(state: &mut LuaState) -> Result<usize, LuaError> {
         Err(e) => {
             let os_err = io::Error::new(
                 io::ErrorKind::Other,
-                match &e {
-                    LuaError::Runtime(LuaValue::Str(s)) => {
-                        String::from_utf8_lossy(s.as_bytes()).into_owned()
-                    }
-                    other => format!("{:?}", other),
+                match e.message_bytes() {
+                    Some(b) => String::from_utf8_lossy(b).into_owned(),
+                    None => format!("{:?}", &e),
                 },
             );
             file_result(state, false, None, os_err)

@@ -328,11 +328,9 @@ enum SymOutcome {
 /// Extract a byte-string error message from a `LuaError`, falling back to a
 /// debug rendering for non-string variants.
 fn error_to_bytes(e: &LuaError) -> Vec<u8> {
-    match e {
-        LuaError::Runtime(LuaValue::Str(s)) | LuaError::Syntax(LuaValue::Str(s)) => {
-            s.as_bytes().to_vec()
-        }
-        other => format!("{:?}", other).into_bytes(),
+    match e.message_bytes() {
+        Some(b) => b.to_vec(),
+        None => format!("{:?}", e).into_bytes(),
     }
 }
 
@@ -783,10 +781,9 @@ fn searcher_lua(state: &mut LuaState) -> Result<usize, LuaError> {
                 Ok(true) => true,
                 Ok(false) => false,
                 Err(e) => {
-                    let msg = match e {
-                        LuaError::Syntax(LuaValue::Str(ref s))
-                        | LuaError::Runtime(LuaValue::Str(ref s)) => s.as_bytes().to_vec(),
-                        other => format!("{:?}", other).into_bytes(),
+                    let msg = match e.message_bytes() {
+                        Some(b) => b.to_vec(),
+                        None => format!("{:?}", &e).into_bytes(),
                     };
                     let s = state.intern_str(&msg)?;
                     state.push(LuaValue::Str(s));
@@ -795,9 +792,9 @@ fn searcher_lua(state: &mut LuaState) -> Result<usize, LuaError> {
             }
         }
         Err(e) => {
-            let msg = match e {
-                LuaError::Runtime(LuaValue::Str(ref s)) => s.as_bytes().to_vec(),
-                other => format!("{:?}", other).into_bytes(),
+            let msg = match e.message_bytes() {
+                Some(b) => b.to_vec(),
+                None => format!("{:?}", &e).into_bytes(),
             };
             let s = state.intern_str(&msg)?;
             state.push(LuaValue::Str(s));

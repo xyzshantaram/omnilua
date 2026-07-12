@@ -1100,11 +1100,9 @@ pub fn load_filex(
     let raw = match raw {
         Ok(bytes) => bytes,
         Err(e) => {
-            let detail = match &e {
-                LuaError::Runtime(LuaValue::Str(s)) => {
-                    String::from_utf8_lossy(s.as_bytes()).into_owned()
-                }
-                other => format!("{:?}", other),
+            let detail = match e.message_bytes() {
+                Some(b) => String::from_utf8_lossy(b).into_owned(),
+                None => format!("{:?}", &e),
             };
             state.push_fstring(format_args!("cannot open {}: {}", BStr(fname), detail))?;
             return Ok(LUA_ERRFILE);

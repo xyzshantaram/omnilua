@@ -1325,6 +1325,14 @@ pub fn lua_resume(
     nargs: i32,
     nresults: &mut i32,
 ) -> LuaStatus {
+    // Public low-level entry point: errors propagated out of the resumed
+    // body materialize their message via into_value(), which requires an
+    // active heap. In-tree callers arrive under pcall_k's guard, but a
+    // direct host call must be self-sufficient (issue #253 review).
+    let _heap_guard = {
+        let g = state.global.borrow();
+        lua_gc::HeapGuard::push(&g.heap)
+    };
     // TODO(port): coroutine support (Phase E). The implementation below is a
     // faithful translation of the C logic but will not work correctly until
     // coroutine stack switching is available. Phase A: translate the logic;

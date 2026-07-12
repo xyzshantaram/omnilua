@@ -123,6 +123,7 @@ fn set_lua_error(error: LuaError) {
 fn lua_error_bytes(error: LuaError) -> Vec<u8> {
     match error {
         LuaError::Runtime(value) | LuaError::Syntax(value) => lua_value_bytes(value),
+        LuaError::RuntimeMsg(b) | LuaError::SyntaxMsg(b) => b.into_vec(),
         other => other.to_string().into_bytes(),
     }
 }

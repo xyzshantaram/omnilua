@@ -6124,6 +6124,9 @@ mod tests {
                 RawLuaValue::Str(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
                 other => format!("{other:?}"),
             },
+            LuaError::RuntimeMsg(b) | LuaError::SyntaxMsg(b) => {
+                String::from_utf8_lossy(b).into_owned()
+            }
             other => format!("{other:?}"),
         }
     }
