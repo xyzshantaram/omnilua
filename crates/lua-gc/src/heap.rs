@@ -109,15 +109,22 @@ thread_local! {
 /// the heap alive until the guard pops, rather than dangling. Guards are
 /// function-scoped everywhere in-tree, so the lifetime extension is
 /// transient by construction.
+///
+/// `!Send`/`!Sync` (via the `Rc` it carries): the stack it pops lives in
+/// this thread's TLS, so moving a guard to another thread would pop the
+/// wrong stack. The guard keeps its own copy of the heap handle so `Drop`
+/// can assert it pops the frame it pushed.
 pub struct HeapGuard {
-    _private: (),
+    heap: std::rc::Rc<Heap>,
 }
 
 impl HeapGuard {
     /// Push `heap` onto the active stack. Returns a guard; dropping it pops.
     pub fn push(heap: &std::rc::Rc<Heap>) -> Self {
         CURRENT_HEAP_STACK.with(|stack| stack.borrow_mut().push(std::rc::Rc::clone(heap)));
-        HeapGuard { _private: () }
+        HeapGuard {
+            heap: std::rc::Rc::clone(heap),
+        }
     }
 }
 
@@ -125,7 +132,13 @@ impl Drop for HeapGuard {
     fn drop(&mut self) {
         CURRENT_HEAP_STACK.with(|stack| {
             let popped = stack.borrow_mut().pop();
-            debug_assert!(popped.is_some(), "HeapGuard::drop with empty stack");
+            debug_assert!(
+                popped
+                    .as_ref()
+                    .is_some_and(|top| std::rc::Rc::ptr_eq(top, &self.heap)),
+                "HeapGuard::drop popped a frame it did not push — guards must \
+                 drop in reverse push order on the thread that created them"
+            );
         });
     }
 }
@@ -192,7 +205,8 @@ pub fn with_current_heap<R>(f: impl for<'a> FnOnce(Option<&'a std::rc::Rc<Heap>>
 
 /// A non-owning heap identity handle for weak references (issue #252):
 /// holds a `Weak<Heap>`, so a `GcWeak` that outlives its heap answers
-/// "does the heap still contain my target" with a plain `false` instead of
+/// "does the heap still contain my target" with a plain `false` — after
+/// sweep *or* after heap teardown, indistinguishably — instead of
 /// dereferencing freed memory. No unsafe, no outlives contract.
 #[derive(Clone, Debug)]
 pub struct HeapRef {
@@ -1565,6 +1579,11 @@ impl Heap {
     /// Construct a heap behind `Rc` — the only ownership shape the guard
     /// and weak-handle machinery accept since issue #252. Everything that
     /// needs `&Heap` gets it by deref.
+    ///
+    /// Do not store a clone of this `Rc` inside anything the heap itself
+    /// owns (a traced value, a userdata payload): that is a reference cycle
+    /// and the heap will never drop. Collector-internal bookkeeping only
+    /// ever holds `Weak<Heap>` (`HeapRef`) for this reason.
     pub fn new() -> std::rc::Rc<Self> {
         std::rc::Rc::new(Self {
             head: Cell::new(None),
