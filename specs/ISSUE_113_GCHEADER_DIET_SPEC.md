@@ -506,10 +506,24 @@ sweep-phase recolor that R1 finding 3/7 called load-bearing:
 - `move_tobefnz_to_allgc`: tombstone in `tobefnz`; **if sweeping, recolor
   `current_white()`** (unchanged); push onto `allgc` tail. Today's
   `firstold1` special-case for `Old1`-aged objects is dropped with
-  `firstold1` itself; the object's `Old1` header age keeps it out of the
-  young sweep's free test regardless of its nursery position, and its
-  grayagain entry (it holds one whenever `Old0/Old1/Touched1/Touched2`, via
-  `push_next_revisit`) keeps it marked in minors.
+  `firstold1` itself. Rev-2 defended this by claiming the moved object
+  retains a grayagain entry; **that claim was false and is withdrawn** (R2
+  finding 4): `unlink_from_list` always runs
+  `correct_generation_pointers`, whose final duty is `unlink_grayagain`, so
+  today every cross-list move *deletes* the object's grayagain entry — the
+  behavior W1's deletion case 3 specifies and preserves. The deletion of
+  `firstold1` therefore rests on one ground only: **it is written and
+  cursor-corrected but read by no collector decision** (its only reader is
+  a test assert), so removing it cannot change behavior. The moved object's
+  *own* survival in minors needs no entry — the young sweep frees only
+  `is_white() && !age.is_old()`, and `Old1` is old. Whether its *young
+  descendants* can be missed after the entry deletion when the only path to
+  them runs through an exact-`Old` parent (which `Marker::should_trace_age`
+  skips) is a property of *today's* code that W2 inherits unchanged; test
+  G3 pins it against current behavior as the oracle baseline, and if that
+  baseline itself shows a reachable young child dying, that is a
+  pre-existing bug to file separately — not a W2 regression and not
+  something W2 silently fixes.
 
 Cursor interaction table, for a move that tombstones slot `j` in the vector
 the sweep is currently walking (`i = sweep_index`, `w = sweep_watermark`):
@@ -775,7 +789,7 @@ fast-inner-loop tier, milliseconds per run.
 | F1 | FIFO finalization order | `finalizer_registry_minor_snapshot_uses_cohort_boundaries`, `finalizer_registry_marks_and_clears_finalized_bit`; gc.lua/gengc.lua `__gc`-order asserts | NEW kit: registry↔heap sync — register N finalizable, kill all, pop FIFO, assert each `move_tobefnz_to_allgc` succeeds and set-equality holds throughout |
 | G1 | grayagain deletion via full-sweep free | `full_sweep_unlinks_freed_grayagain_entries` | ports as-is |
 | G2 | grayagain dedup + persistence | `grayagain_links_object_once`, `grayagain_list_carries_old1_until_old`, `grayagain_list_carries_touched2_until_old` | port as-is (these pin the persistence facts rev-1 got wrong) |
-| G3 | Cross-list move of a gray-listed object deletes its entry | none (behavior exists via `unlink_from_list` → `correct_generation_pointers` but untested) | NEW kit: `Touched1` object → `move_allgc_to_finobj`, assert `grayagain_count` drops and next minor is sane |
+| G3 | Cross-list move of a gray-listed transitional object, graph-shaped (R2 finding 4) | none (the deletion happens today via `unlink_from_list` → `correct_generation_pointers` → `unlink_grayagain`, untested) | NEW kit, run against **current** code first to fix the oracle baseline: root → exact-`Old` parent (skipped by `Marker::should_trace_age`) → `Old1`/`Touched2` object → young child; move the transitional object (`move_allgc_to_finobj`, and the `move_tobefnz_to_allgc` variant), assert the move returned `true` and `grayagain_count` dropped, then run a minor and assert the young child's fate matches the pre-W2 baseline; a baseline-level child loss is filed as a separate pre-existing issue |
 | Q1 | Quarantine parking + single free at teardown | canary battery under `LUA_RS_GC_QUARANTINE=1`, `harness/asan-stress.sh` | NEW kit: quarantined box's slot is tombstoned, box appears once in `quarantined`, `drop_all` frees exactly once |
 | U1 | Uncollected teardown | `allocate_uncollected_survives_collection_but_is_freed_on_heap_drop`, `bootstrapping_routes_allocate_to_the_uncollected_list`, #249 leak canaries (with the git-stash-revert verification caveat) | port as-is |
 | O1 | Newest-first order dependence (absence thereof) | not directly unit-testable — it is a claim of *no* dependence | falsifiers: 36 GC canaries × incremental+generational (`harness/canaries/gc/run_canaries.sh`), gc.lua + gengc.lua officials ×5 versions, the quarantine canary run |
