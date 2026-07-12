@@ -528,22 +528,32 @@ sweep-phase recolor that R1 finding 3/7 called load-bearing:
 Cursor interaction table, for a move that tombstones slot `j` in the vector
 the sweep is currently walking (`i = sweep_index`, `w = sweep_watermark`):
 
+Positionally, the source-slot cases are transition-independent:
+
 | case | what the sweep sees | outcome |
 |---|---|---|
 | `j < i` (before cursor) | nothing — slot already visited | already recolored live by the scan; now leaves the list; no double visit |
 | `j == i` (at cursor) | next scan reads `None`, skips | one wasted work unit; no cursor rewrite needed |
-| `i < j < w` (ahead of cursor) | scan reads `None` when it arrives, skips | object is not swept from the source list; the `is_sweep()` recolor makes it `current_white()`, so whichever list it lands in treats it as this-cycle-live — same as today |
+| `i < j < w` (ahead of cursor) | scan reads `None` when it arrives, skips | object is not swept from the *source* list; its fate is transition-specific — table below |
 | `j >= w` (beyond watermark) | never visited | object was appended mid-sweep and moved again; both slots beyond watermark or tombstoned |
 
-The destination push always lands at the tail. If the destination vector's
-sweep phase has already completed (e.g. `allgc → finobj` while in
-`SweepToBeFnz`), the object simply isn't visited there this cycle — the
-recolor already made it live-white. If the destination phase hasn't started,
-its watermark (taken at phase entry) includes the new slot; the recolor
-means the scan sees a live object and skips it. Both cases reduce to "the
-recolor rule does the semantic work; position does none," which is exactly
-the C design's reasoning (`lgc.c` makes moved objects white during sweep so
-they cannot be freed by a sweep that already passed them).
+What protects the moved object afterwards differs per transition — rev-2's
+table wrongly generalized "the `is_sweep()` recolor" to all three (R2
+finding 5: `move_finobj_to_tobefnz` deliberately does not recolor, today or
+here):
+
+| transition | recolor? | what keeps the object correct through the rest of the cycle |
+|---|---|---|
+| `allgc → finobj` | yes, `current_white()` when `is_sweep()` | the recolor: `SweepFinObj` runs after `SweepAllGc`, its phase-entry watermark includes the new tail slot, and the scan sees a this-cycle-live white and skips it; if the finobj phase is somehow already past, not being visited is equally safe — the recolor already made it live-white |
+| `finobj → tobefnz` | **no** (deliberate, matching today's `move_finobj_to_tobefnz`) | being **marked before promotion**: the runtime resurrects dead finalizable objects in the atomic post-mark hook before promoting them, so the object is not `other_white()` when a later sweep reaches it — and when promotion happens with `SweepToBeFnz` not yet started, the phase-entry watermark includes the tail slot and the object *is* swept there, exactly as today's `link_to_tail` chain walk reaches it. One documented divergence: a still-dead-white object promoted *during* `SweepToBeFnz` lands beyond the watermark and is not visited this cycle (today's chain walk does reach a growing tail), so its box free defers one cycle — the next `start_cycle` repaint + sweep collects it; a liveness-timing difference, not a safety one, and `__gc` order is unaffected (registry-owned) |
+| `tobefnz → allgc` | yes, `current_white()` when `is_sweep()` | the recolor: the usual call window is finalizer dispatch (`CallFin` or between cycles, no cursor live); if invoked mid-sweep, `SweepAllGc` has already passed, the object is not visited in `allgc` this cycle, and the recolor makes that safe |
+
+The destination push always lands at the tail; position never does the
+semantic work. For the two recoloring transitions the recolor rule is the C
+design's reasoning (`lgc.c` makes moved objects white during sweep so a
+sweep that already passed them cannot free them); for `finobj → tobefnz`
+the invariant is mark-before-promote plus later tobefnz sweep, and the spec
+depends on the runtime maintaining it — test F1/M3 assert it.
 
 `barrier` / `barrier_back` / the generational barriers touch only colors,
 ages, the marker's gray queue, and grayagain — no owner-vec access at all.
@@ -780,9 +790,9 @@ fast-inner-loop tier, milliseconds per run.
 
 | # | Scenario | Existing coverage | New work |
 |---|---|---|---|
-| M1 | Each of the 3 owner moves with target **before** the active sweep cursor | none mid-sweep (`finalizer_intrusive_lists_sweep_and_drop` is at-Pause only) | NEW kit: drive `incremental_run_until_state_with_post_mark` to `SweepAllGc`, advance partially with `StepBudget::from_work(n)`, move an already-visited object, finish, assert membership/liveness/`allgc_count` |
-| M2 | Moves with target **at** the cursor slot | none | NEW kit (same harness, position at `sweep_index`) |
-| M3 | Moves with target **ahead of** the cursor (and beyond watermark) | none | NEW kit; assert the recolor rule preserved the object through both lists' sweeps |
+| M1 | Each of the 3 owner moves with target **before** the active sweep cursor | none mid-sweep (`finalizer_intrusive_lists_sweep_and_drop` is at-Pause only) | NEW kit ×3 transitions: drive `incremental_run_until_state_with_post_mark` to `SweepAllGc`, advance partially with `StepBudget::from_work(n)`, move an already-visited object, finish; **assert the move returned `true`** (R1 item 7 sync note), then membership/liveness/`allgc_count` |
+| M2 | Moves with target **at** the cursor slot | none | NEW kit ×3 transitions (same harness, position at `sweep_index`); assert move returned `true` |
+| M3 | Moves with target **ahead of** the cursor (and beyond watermark) — per-transition expectations | none | NEW kit ×3: `allgc→finobj` and `tobefnz→allgc` assert the `current_white()` recolor carried the object through both lists' sweeps; `finobj→tobefnz` (no recolor) asserts the marked-before-promotion invariant instead, plus the documented one-cycle free deferral for a dead-white promotion during `SweepToBeFnz`; every case asserts the move returned `true` |
 | A1 | Allocation during `SweepAllGc` | `allocation_during_incremental_sweep_survives_current_cycle` | extend to `SweepFinObj`, `SweepToBeFnz`, and the `EnterAtomic`→`Atomic` gap |
 | B1 | `StepBudget::from_work(1)` resumption to completion | `full_collect_equivalent_to_incremental_to_pause`, `budget_zero_does_some_work`, `sweep_can_pause_and_resume` | NEW kit variant: interleave a move + an allocation at every `InProgress` step under budget 1 (churn test; also proves tombstone-skip termination) |
 | B2 | Adversarial repeated-move churn (R2 finding 2) | none | NEW kit: cycle one object `allgc → finobj → tobefnz → allgc` for N ≫ threshold rounds, at `Pause` and again with an incremental sweep paused mid-`allgc`; assert every move returns `true`, slot counts stay within the `(4/3)·live + cycle-churn` bound, boundaries stay physical-index-consistent, and post-compaction order/cohorts are intact |
