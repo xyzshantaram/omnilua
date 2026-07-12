@@ -265,12 +265,19 @@ struct OwnerVec {
 
 allgc:       RefCell<OwnerVec>,
 finobj:      RefCell<OwnerVec>,
-tobefnz:     RefCell<Vec<Option<NonNull<GcBox<dyn Trace>>>>>,
+tobefnz:     RefCell<OwnerVec>,
 quarantined: RefCell<Vec<NonNull<GcBox<dyn Trace>>>>,
 uncollected: RefCell<Vec<NonNull<GcBox<dyn Trace>>>>,
 sweep_index:     Cell<usize>,
 sweep_watermark: Cell<usize>,
 ```
+
+All three sweepable lists are the same `OwnerVec` type so the tombstone
+counter and density policy apply uniformly (R2 flagged rev-2's `tobefnz` as
+a plain `Vec<Option<_>>` with no counter — an inconsistency with the
+mutation rule). `tobefnz`'s cohort counters are permanently zero: the young
+sweep scans all of it (today's `sweep_young_range(tobefnz, None)`), so it
+needs membership and tombstones, never cohorts.
 
 Replaced outright: `head`, `finobj`, `tobefnz`, `quarantined`, `uncollected`
 head cells; the seven cursor cells (`survival`, `old1`, `reallyold`,
@@ -292,18 +299,62 @@ append-only during life (`release_box` under quarantine;
 tombstone slots but no cohorts (its cohort mirrors live in
 `FinalizerRegistry` already).
 
-### The one mutation rule: tombstones, never shifts
+### The one mutation rule: tombstones, never shifts — with a bound
 
 Any removal from `allgc`/`finobj`/`tobefnz` outside a compaction point
-writes `None` into the slot (a tombstone) and increments `tombstones`. No
-slot index ever changes except at **compaction points**, which run only when
-no sweep cursor is live: `finish_cycle`, the end of `sweep_young`,
-`abort_cycle`, and `drop_all`. Compaction is an order-preserving
-`retain`-style pass that drops `None` slots and recounts the cohort
-boundaries by counting surviving slots below each old boundary index (the
-same bookkeeping as `FinalizerRegistry::retain_pending_not_in`).
-`start_cycle` may also compact opportunistically (no cursor exists at
-`Pause → Propagate`) if `tombstones` exceeds a threshold.
+writes `None` into the slot (a tombstone) and increments that vector's
+`tombstones`. **While tombstones exist, `reallyold`/`old1`/`survival` are
+physical slot-index boundaries — they count slots, tombstoned or not.** A
+tombstone under a boundary does not move it; only compaction recounts
+boundaries to dense indices. No slot index ever changes except at a
+**compaction point**, defined as any moment with no live sweep cursor for
+that vector.
+
+There is exactly one compaction algorithm: a whole-vector, order-preserving
+pass that drops `None` slots, sets `tombstones = 0`, and recounts each
+cohort boundary as the number of surviving slots below its old physical
+index. (Rev-2 described a second, slice-only variant for the minor sweep;
+that is withdrawn — moves can tombstone old-prefix slots too, so slice-only
+compaction leaves the prefix dirty and the two algorithms diverge. R2
+finding 2.)
+
+**Density policy — the bound R2 finding 2 demanded.** Per vector, the
+threshold is `tombstones * 4 > slots.len()` (25% density; a named constant,
+initial value tunable only by measurement). Compaction runs:
+
+- *mandatorily* at `finish_cycle`, the end of `sweep_young`, `abort_cycle`,
+  and `drop_all`, whatever the density;
+- *by threshold* at `start_cycle` (no cursor exists at `Pause →
+  Propagate`), and — this is the piece rev-2 lacked — **immediately after
+  any tombstoning move, if the source vector crosses the threshold and
+  `GcState` is not a sweep phase**. Moves are the only tombstone source
+  outside a sweep, so checking there closes the churn hole.
+
+R2's pathological case — cycling one object `allgc → finobj → tobefnz →
+allgc` during `Pause`, three tombstones and three appends per round,
+forever, with owner capacity invisible to the pacer — is bounded by the
+move-time trigger: each vector compacts every ≥ `len/4` tombstoning ops at
+a cost of O(len), i.e. amortized O(1) slots and O(4) work per move. During
+a sweep phase compaction is prohibited (cursor live), so density can exceed
+25% transiently; a cycle completes in bounded steps and `finish_cycle`
+compacts unconditionally. Worst-case slot count is therefore
+`(4/3) × live-at-cycle-start + appends-during-that-cycle`, and at every
+no-cursor moment slot count ≤ `(4/3) × live`.
+
+The rev-2 claim that a move's membership scan is "the same O(n) as today"
+is corrected (R2 called it misleading): today's `n` is live chain length;
+W2's `n` is slot count including tombstones — bounded to `4/3 ×` live at
+no-cursor times plus intra-cycle churn by the policy above, which is the
+honest statement.
+
+**Capacity high-water**: `Vec::retain` never shrinks capacity, so
+compaction alone does not reduce retained memory. Policy: at the mandatory
+compaction points, if `capacity > 2 × len` after compacting, `shrink_to(len
+* 3 / 2)` — bounding the retained high-water near 2× live while leaving
+headroom against shrink-grow thrash. `owner_capacity_bytes()` and the wasm
+linear-memory high-water measurement (plan item 6) judge whether this needs
+tightening; on wasm the pages are unreturnable, so the shrink only caps
+future growth there — the measured number is what matters.
 
 Because indices are stable between compactions, the entire cursor-patch
 apparatus — `unlink_from_list`'s `sweep_prev_next` rewrite and
@@ -438,8 +489,9 @@ The three transitions keep their exact current semantics, including the
 sweep-phase recolor that R1 finding 3/7 called load-bearing:
 
 - `move_allgc_to_finobj` (from `luaC_checkfinalizer` path): requires
-  `HDR_COLLECTED`; tombstone its `allgc` slot (linear scan, same O(n) as
-  today's chain walk — cold path); **if `GcState::is_sweep()`, recolor to
+  `HDR_COLLECTED`; tombstone its `allgc` slot (linear membership scan over
+  slots — cold path; the cost is bounded by the density policy, see "The
+  one mutation rule"); **if `GcState::is_sweep()`, recolor to
   `current_white()`** (unchanged); push onto `finobj` tail. Tail = nursery
   cohort region, matching today's `link_to_head(finobj)` which also lands in
   the newest region; header age is untouched either way.
@@ -505,14 +557,17 @@ this design does not introduce one). Mapping:
   `pending_release` drain (per-object accounting + `release_box`, with
   `releasing` set) runs last, after every borrow is released.
 - Cohort rotation at the end (replacing today's cursor rotation in
-  `sweep_young`): compact the scanned slice in place, then
+  `sweep_young`): run the single whole-vector compaction (the slice-only
+  variant is withdrawn — see "The one mutation rule"), then
   `reallyold += old1; old1 = survivors_of_survival_cohort;
-  survival = survivors_of_nursery_cohort` — the `FinalizerRegistry::
-  finish_minor_collection` rotation with death-adjusted counts. Today's
-  `new_old1` boundary object and `survival = head.get()` cursor writes fall
-  out as index arithmetic.
-- `promote_all_to_old` → `reallyold = live_len, old1 = survival = 0` (the
-  registry's `promote_all_pending_to_old`); `reset_all_ages` /
+  survival = survivors_of_nursery_cohort`, with survivor counts taken from
+  the compaction's boundary recount. Today's `new_old1` boundary object and
+  `survival = head.get()` cursor writes fall out as index arithmetic.
+- `promote_all_to_old` → **compact first** (its call sites are VM mode
+  transitions at `Pause`; no cursor is live), then
+  `reallyold = slots.len(), old1 = survival = 0`. Rev-2's
+  `reallyold = live_len` without compaction was wrong whenever holes
+  preceded a live tail (R2 finding 2). `reset_all_ages` /
   `clear_generation_cursors` → all three counters to 0 + clear grayagain.
 
 ### Unique-ownership invariant (R1 finding 10)
@@ -710,6 +765,7 @@ fast-inner-loop tier, milliseconds per run.
 | M3 | Moves with target **ahead of** the cursor (and beyond watermark) | none | NEW kit; assert the recolor rule preserved the object through both lists' sweeps |
 | A1 | Allocation during `SweepAllGc` | `allocation_during_incremental_sweep_survives_current_cycle` | extend to `SweepFinObj`, `SweepToBeFnz`, and the `EnterAtomic`→`Atomic` gap |
 | B1 | `StepBudget::from_work(1)` resumption to completion | `full_collect_equivalent_to_incremental_to_pause`, `budget_zero_does_some_work`, `sweep_can_pause_and_resume` | NEW kit variant: interleave a move + an allocation at every `InProgress` step under budget 1 (churn test; also proves tombstone-skip termination) |
+| B2 | Adversarial repeated-move churn (R2 finding 2) | none | NEW kit: cycle one object `allgc → finobj → tobefnz → allgc` for N ≫ threshold rounds, at `Pause` and again with an incremental sweep paused mid-`allgc`; assert every move returns `true`, slot counts stay within the `(4/3)·live + cycle-churn` bound, boundaries stay physical-index-consistent, and post-compaction order/cohorts are intact |
 | F1 | FIFO finalization order | `finalizer_registry_minor_snapshot_uses_cohort_boundaries`, `finalizer_registry_marks_and_clears_finalized_bit`; gc.lua/gengc.lua `__gc`-order asserts | NEW kit: registry↔heap sync — register N finalizable, kill all, pop FIFO, assert each `move_tobefnz_to_allgc` succeeds and set-equality holds throughout |
 | G1 | grayagain deletion via full-sweep free | `full_sweep_unlinks_freed_grayagain_entries` | ports as-is |
 | G2 | grayagain dedup + persistence | `grayagain_links_object_once`, `grayagain_list_carries_old1_until_old`, `grayagain_list_carries_touched2_until_old` | port as-is (these pin the persistence facts rev-1 got wrong) |
