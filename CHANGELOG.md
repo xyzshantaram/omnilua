@@ -4,6 +4,53 @@ All notable changes to `omniLua` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-07-12
+
+### Breaking — `LuaError` representation (#253)
+
+`LuaError` gained two variants, `RuntimeMsg(Box<[u8]>)` and
+`SyntaxMsg(Box<[u8]>)`: host-side error construction
+(`LuaError::runtime(...)` and friends) now carries the message as owned
+bytes instead of allocating a GC string, and the string is materialized
+only when the error enters a VM. Two consequences for embedders:
+
+- **Exhaustive matches on `LuaError` stop compiling** — add arms for the
+  new variants, or better, switch to the stable accessors:
+  `message_bytes()` / `message_lossy()` (never allocate, never panic) and
+  `to_status()` for classification.
+- **Wildcard matches like `Runtime(LuaValue::Str(s)) => ..., _ => ...`
+  keep compiling but now take the `_` arm for host-constructed errors** —
+  audit these; `message_bytes()` covers both representations.
+- `into_value()` now documents (and enforces) that it requires an active
+  heap for `*Msg` payloads; hosts that only need the text should use the
+  accessors above.
+
+Why: constructing an error with no VM in scope previously either required
+an active `HeapGuard` or silently allocated a detached, never-freed box —
+the last remnant of the issue #249 leak class. With the message carried as
+bytes, **the guard-less allocation fallback is deleted entirely**: a
+`GcRef::new` with no active heap now panics with an entry-path diagnostic
+in every build, making that leak class unrepresentable. `lua_resume` and
+`reset_thread` are now guard-self-sufficient as part of the same sweep.
+
+### Fixed — weak-handle and guard soundness (#252)
+
+`Heap` now lives behind `Rc` end to end: `HeapGuard` holds a strong
+reference on the TLS stack (a guard can no longer dangle, with no
+documented-contract caveats), and weak-reference heap identity
+(`HeapRef`) holds a `Weak<Heap>` — a `GcWeak` that outlives its VM now
+answers upgrade checks with `false` instead of touching freed memory.
+One `unsafe` block removed from `lua-gc`. `Heap::new()` returns
+`Rc<Heap>` (breaking only for direct `lua-gc` consumers; the embedding
+API is unaffected).
+
+### Docs
+
+README and CLI crate README now describe omniLua accurately as an
+AI-assisted C-to-Rust port of PUC-Rio Lua 5.4.7 extended to 5.1–5.5
+(#248, wording per the reporter), and `specs/` gains the reviewed design
+spec for the safe GcHeader diet (#113).
+
 ## [0.4.4] - 2026-07-12
 
 ### Fixed — GC ownership of bootstrap allocations (#249, #250)
