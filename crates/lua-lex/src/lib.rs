@@ -1561,10 +1561,10 @@ mod tests {
     /// Activates the state's own heap for the test body and stops the
     /// collector, mirroring production lexing: `protected_parser` pushes a
     /// heap context and stops the GC for the whole parse. Both halves
-    /// matter — without the guard the lexer's interned strings fall through
-    /// `GcRef::new`'s detached arm (a panic under `OMNILUA_GC_STRICT_GUARD=1`),
-    /// and without the GC stop a mid-lex step sweeps strings these tests
-    /// hold outside any traced root.
+    /// matter — without the guard the lexer's interned strings hit
+    /// `GcRef::new` with no active heap and panic (issue #249's guard-coverage
+    /// class), and without the GC stop a mid-lex step sweeps strings these
+    /// tests hold outside any traced root.
     fn state_heap_guard(state: &mut lua_vm::state::LuaState) -> lua_gc::HeapGuard {
         let _ = state.global_mut().stop_gc_internal();
         let g = state.global();

@@ -56,10 +56,12 @@ OMNILUA_VERSION=5.1 target/debug/omnilua script.lua  # pick a version (5.1–5.5
 | 6 | `harness/run_official_all.sh` + `cargo test --workspace` + `specs/oracle/check.sh` ×5 | the PR gate |
 
 A GC-lifecycle, heap-guard, VM-construction, or embedding-entry-point change
-also runs **`harness/strict_guard_check.sh`** (the workspace under
-`OMNILUA_GC_STRICT_GUARD=1`, where the GC's silent no-active-heap fallback
-arms panic with a backtrace — the never-freed dual of
-`LUA_RS_GC_QUARANTINE`'s freed-too-early). The embedding leak canaries
+also runs **`harness/strict_guard_check.sh`**. The GC's three no-active-heap
+guard checks (detached allocation, sweep-blind weak handle, dropped pacer
+charge) now panic **unconditionally in every build** — the never-freed dual of
+`LUA_RS_GC_QUARANTINE`'s freed-too-early — so any guard-coverage violation
+self-reports with a backtrace under the normal test suites; the script is just
+the convenience runner for the whole workspace. The embedding leak canaries
 (`crates/lua-rs-runtime/tests/leak_canaries.rs`, a counting global allocator
 asserting net-zero live bytes across VM/chunk/coroutine/callback churn) run
 with the normal workspace tests.

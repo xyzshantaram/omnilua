@@ -103,8 +103,8 @@ fn assert_steady_state_inner(name: &str, persistent_heap: bool, mut scenario: im
         detached_growth, 0,
         "{name}: {detached_growth} detached (never-freed) GC allocations \
          escaped during {ITERS} iterations — some path allocated with no \
-         active HeapGuard (issue #249 class); run the scenario under \
-         OMNILUA_GC_STRICT_GUARD=1 for a panic backtrace at the exact site"
+         active HeapGuard (issue #249 class); the guard-less allocation site \
+         now panics directly, so a panic backtrace pinpoints the offending path"
     );
     if persistent_heap && quarantine_mode() {
         return;

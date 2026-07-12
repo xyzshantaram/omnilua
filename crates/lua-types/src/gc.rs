@@ -89,9 +89,9 @@ impl<T: Trace + 'static> GcRef<T> {
     ///
     /// Downgrading a *heap-owned* box with no active `HeapGuard` is a
     /// latent use-after-free: the resulting handle has no heap identity to
-    /// check, so it keeps upgrading after sweep frees the target.
-    /// `OMNILUA_GC_STRICT_GUARD=1` turns that case into a panic; detached
-    /// (process-lifetime) targets keep the legacy always-upgrades behavior.
+    /// check, so it keeps upgrading after sweep frees the target. That case
+    /// panics unconditionally in every build; detached (process-lifetime)
+    /// targets keep the legacy always-upgrades behavior.
     pub fn downgrade(&self) -> GcWeak<T> {
         let identity = self.identity();
         let tracked = lua_gc::with_current_heap(|heap| {
@@ -100,9 +100,9 @@ impl<T: Trace + 'static> GcRef<T> {
                 (HeapRef::from_heap(heap), token)
             })
         });
-        if tracked.is_none() && lua_gc::strict_guard_mode() && self.0.is_heap_owned() {
+        if tracked.is_none() && self.0.is_heap_owned() {
             panic!(
-                "OMNILUA_GC_STRICT_GUARD: GcRef::downgrade::<{}> on a heap-owned box with no \
+                "GcRef::downgrade::<{}> on a heap-owned box with no \
                  active HeapGuard — the weak handle would upgrade forever, including after \
                  sweep frees the target (use-after-free); push a HeapGuard on the entry path",
                 std::any::type_name::<T>()
@@ -122,9 +122,13 @@ impl<T: Trace + 'static> GcRef<T> {
 
     /// Charge (`delta > 0`) or refund (`delta < 0`) bytes of this object's
     /// owned heap buffers against the active heap's pacer, so collections
-    /// fire at honest memory pressure. No-op on `delta == 0`, when no heap is
-    /// active, or when the underlying box is uncollected (see
-    /// [`lua_gc::Gc::account_buffer`]).
+    /// fire at honest memory pressure. No-op on `delta == 0` or when the
+    /// underlying box is uncollected (see [`lua_gc::Gc::account_buffer`]).
+    ///
+    /// A guard-less charge on a *heap-owned* box panics unconditionally in
+    /// every build: the charge would be silently dropped and the pacer would
+    /// drift from real memory. Detached (uncollected, process-lifetime) boxes
+    /// keep the legacy no-op behavior.
     pub fn account_buffer(&self, delta: isize) {
         if delta == 0 {
             return;
@@ -132,9 +136,9 @@ impl<T: Trace + 'static> GcRef<T> {
         lua_gc::with_current_heap(|h| match h {
             Some(h) => self.0.account_buffer(h, delta),
             None => {
-                if lua_gc::strict_guard_mode() && self.0.is_heap_owned() {
+                if self.0.is_heap_owned() {
                     panic!(
-                        "OMNILUA_GC_STRICT_GUARD: account_buffer({delta}) on a heap-owned \
+                        "account_buffer({delta}) on a heap-owned \
                          {} with no active HeapGuard — the charge would be silently dropped \
                          and the pacer would drift from real memory; push a HeapGuard on \
                          the entry path",
@@ -249,6 +253,35 @@ mod tests {
     #[should_panic(expected = "no active HeapGuard")]
     fn guardless_allocation_panics() {
         let _ = GcRef::new(Cell0);
+    }
+
+    /// A guard-less `downgrade` of a heap-owned box mints a `GcWeak` with no
+    /// heap identity, so it upgrades forever — including after sweep frees the
+    /// target (use-after-free). That now panics unconditionally, not just
+    /// under a retired env flag.
+    #[test]
+    #[should_panic(expected = "no active HeapGuard")]
+    fn guardless_downgrade_of_heap_owned_box_panics() {
+        let heap = lua_gc::Heap::new();
+        let strong = {
+            let _guard = lua_gc::HeapGuard::push(&heap);
+            GcRef::new(Cell0)
+        };
+        let _ = strong.downgrade();
+    }
+
+    /// A guard-less `account_buffer` on a heap-owned box would silently drop
+    /// the pacer charge, drifting the collector from real memory. That now
+    /// panics unconditionally, not just under a retired env flag.
+    #[test]
+    #[should_panic(expected = "no active HeapGuard")]
+    fn guardless_account_buffer_on_heap_owned_box_panics() {
+        let heap = lua_gc::Heap::new();
+        let strong = {
+            let _guard = lua_gc::HeapGuard::push(&heap);
+            GcRef::new(Cell0)
+        };
+        strong.account_buffer(64);
     }
 }
 
