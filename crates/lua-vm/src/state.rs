@@ -6856,6 +6856,161 @@ mod tests {
         drop(state);
     }
 
+    thread_local! {
+        static CLOSE_GC_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn close_gc_probe(_state: &mut LuaState) -> Result<usize, LuaError> {
+        CLOSE_GC_RUNS.with(|c| c.set(c.get() + 1));
+        Ok(0)
+    }
+
+    /// Build a table carrying a `__gc = close_gc_probe` metatable on `state`,
+    /// registering it in the pending-finalizers list via the canonical
+    /// `api::set_metatable` path, and leave the object table on the stack so
+    /// it stays live to close.
+    fn install_finalizable_table(state: &mut LuaState) {
+        let heap = state.global().heap.clone();
+        let _guard = lua_gc::HeapGuard::push(&heap);
+        crate::api::create_table(state, 0, 0).expect("object table");
+        crate::api::create_table(state, 0, 1).expect("metatable");
+        crate::api::push_cclosure(state, close_gc_probe, 0).expect("push __gc");
+        crate::api::set_field(state, -2, b"__gc").expect("mt.__gc");
+        crate::api::set_metatable(state, -2).expect("setmetatable");
+    }
+
+    /// Codex finding 3 on issue #260: `state::close` must run close-time
+    /// `__gc` finalizers (C `lua_close` → `luaC_freeallobjects` order) now
+    /// that `free_all_objects` really frees — an object alive at close must
+    /// observe its finalizer exactly once, before its box is torn down.
+    #[test]
+    fn state_close_runs_gc_finalizer_exactly_once() {
+        CLOSE_GC_RUNS.with(|c| c.set(0));
+        let mut state = new_state().expect("state should initialize");
+        install_finalizable_table(&mut state);
+        assert_eq!(
+            CLOSE_GC_RUNS.with(|c| c.get()),
+            0,
+            "finalizer must not fire while the object is live"
+        );
+
+        close(state);
+        assert_eq!(
+            CLOSE_GC_RUNS.with(|c| c.get()),
+            1,
+            "close must run the pending __gc exactly once before freeing"
+        );
+    }
+
+    /// The CLI composition half of finding 3: lua-cli's `pmain` calls
+    /// `api::run_close_finalizers` itself before the state winds down. A
+    /// subsequent `close_state` invocation must see the drained pending
+    /// registry and not double-run the finalizer.
+    #[test]
+    fn manual_close_finalizer_pass_then_close_runs_gc_exactly_once() {
+        CLOSE_GC_RUNS.with(|c| c.set(0));
+        let mut state = new_state().expect("state should initialize");
+        install_finalizable_table(&mut state);
+
+        crate::api::run_close_finalizers(&mut state);
+        assert_eq!(CLOSE_GC_RUNS.with(|c| c.get()), 1);
+
+        close(state);
+        assert_eq!(
+            CLOSE_GC_RUNS.with(|c| c.get()),
+            1,
+            "close after a manual run_close_finalizers pass must not double-run __gc"
+        );
+    }
+
+    /// Flips its flag when dropped; the inner payload for
+    /// [`VmAllocOnDrop`]'s teardown-time allocation.
+    struct VmDropFlag(std::rc::Rc<std::cell::Cell<bool>>);
+    impl lua_gc::Trace for VmDropFlag {
+        fn trace(&self, _m: &mut lua_gc::Marker) {}
+    }
+    impl Drop for VmDropFlag {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    /// A payload whose `Drop` allocates through `GcRef::new` — the path every
+    /// real VM destructor uses — so it resolves the top of the TLS guard
+    /// stack. Pins codex finding 4 on issue #260: `free_all_objects` must
+    /// push a guard for the state's own heap or this lands in the wrong heap
+    /// (or panics with no ambient guard at all).
+    struct VmAllocOnDrop {
+        flag: std::rc::Rc<std::cell::Cell<bool>>,
+        inner: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+    impl lua_gc::Trace for VmAllocOnDrop {
+        fn trace(&self, _m: &mut lua_gc::Marker) {}
+    }
+    impl Drop for VmAllocOnDrop {
+        fn drop(&mut self) {
+            self.flag.set(true);
+            let _ = GcRef::new(VmDropFlag(self.inner.clone()));
+        }
+    }
+
+    #[test]
+    fn free_all_objects_provides_own_heap_guard_with_no_ambient_guard() {
+        let mut state = new_state().expect("state should initialize");
+        let heap = state.global().heap.clone();
+        let outer = std::rc::Rc::new(std::cell::Cell::new(false));
+        let inner = std::rc::Rc::new(std::cell::Cell::new(false));
+        let _gc = heap.allocate(VmAllocOnDrop {
+            flag: outer.clone(),
+            inner: inner.clone(),
+        });
+
+        state.gc().free_all_objects();
+
+        assert!(outer.get(), "the destructor itself must have run");
+        assert!(
+            inner.get(),
+            "GcRef::new inside a teardown destructor must land in the closing \
+             heap (via free_all_objects's own guard) and be drained, even with \
+             no ambient HeapGuard"
+        );
+        assert!(heap.is_closed());
+    }
+
+    #[test]
+    fn free_all_objects_targets_own_heap_under_foreign_guard() {
+        let mut state1 = new_state().expect("state 1 should initialize");
+        let state2 = new_state().expect("state 2 should initialize");
+        let heap1 = state1.global().heap.clone();
+        let heap2 = state2.global().heap.clone();
+        let _foreign = lua_gc::HeapGuard::push(&heap2);
+
+        let outer = std::rc::Rc::new(std::cell::Cell::new(false));
+        let inner = std::rc::Rc::new(std::cell::Cell::new(false));
+        let _gc = heap1.allocate(VmAllocOnDrop {
+            flag: outer.clone(),
+            inner: inner.clone(),
+        });
+        let heap2_baseline = heap2.allgc_count();
+
+        state1.gc().free_all_objects();
+
+        assert!(outer.get());
+        assert!(
+            inner.get(),
+            "the teardown allocation must land in (and be drained from) the \
+             heap being closed, not the foreign heap on the TLS guard stack"
+        );
+        assert_eq!(
+            heap2.allgc_count(),
+            heap2_baseline,
+            "the foreign heap must be untouched by another state's close"
+        );
+        assert!(heap1.is_closed());
+        assert!(!heap2.is_closed());
+        drop(state2);
+    }
+
     #[test]
     fn interned_string_table_grows_then_shrinks_on_collection() {
         let mut state = new_state().expect("state should initialize");

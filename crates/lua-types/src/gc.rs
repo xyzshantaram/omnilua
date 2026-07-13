@@ -283,6 +283,28 @@ mod tests {
         };
         strong.account_buffer(64);
     }
+
+    /// Codex finding 2 on issue #260: downgrading a stale `GcRef` AFTER the
+    /// heap closed (its box already freed by `drop_all`) must yield a weak
+    /// handle that never upgrades. Before the closed-heap token refusal,
+    /// `downgrade` re-registered the freed box's address in the token map and
+    /// the weak handle upgraded into freed memory.
+    #[test]
+    fn downgrade_after_close_cannot_resurrect_freed_box() {
+        let heap = lua_gc::Heap::new();
+        heap.unpause();
+        let _guard = lua_gc::HeapGuard::push(&heap);
+
+        let stale = GcRef::new(Cell0);
+        heap.drop_all();
+
+        let weak = stale.downgrade();
+        assert!(
+            weak.upgrade().is_none(),
+            "a weak handle minted after close must never upgrade — the box \
+             is freed and the heap is closed"
+        );
+    }
 }
 
 impl<T: PartialEq + Trace + 'static> PartialEq for GcRef<T> {

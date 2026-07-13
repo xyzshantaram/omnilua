@@ -4783,6 +4783,89 @@ mod tests {
              allocation tokens, while the heap Rc is still alive"
         );
     }
+
+    /// A `Trace` payload whose `Drop` allocates a fresh box and fires the
+    /// generational-barrier path (`remember_minor_revisit`) on it, mid-drain.
+    /// Codex finding 1 on #260: before the closed-heap gate, that pushed a
+    /// pointer into grayagain which a later drain pass freed — a second
+    /// `drop_all` (or `Heap::drop` after an explicit close) then dereferenced
+    /// the freed header in `clear_grayagain`.
+    struct BarrierOnDrop {
+        flag: std::rc::Rc<Cell<bool>>,
+        inner: std::rc::Rc<Cell<bool>>,
+    }
+    impl Trace for BarrierOnDrop {
+        fn trace(&self, _m: &mut Marker) {}
+    }
+    impl Drop for BarrierOnDrop {
+        fn drop(&mut self) {
+            self.flag.set(true);
+            with_current_heap(|heap| {
+                if let Some(heap) = heap {
+                    let fresh = heap.allocate(Tracked(DropFlag(self.inner.clone())));
+                    heap.remember_minor_revisit(fresh.as_trace_ptr());
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn teardown_barrier_cannot_repopulate_grayagain() {
+        let heap = Heap::new();
+        heap.unpause();
+        let _guard = HeapGuard::push(&heap);
+
+        let outer = std::rc::Rc::new(Cell::new(false));
+        let inner = std::rc::Rc::new(Cell::new(false));
+        let _gc = heap.allocate(BarrierOnDrop {
+            flag: outer.clone(),
+            inner: inner.clone(),
+        });
+
+        heap.drop_all();
+        assert!(outer.get(), "the destructor itself must have run");
+        assert!(
+            inner.get(),
+            "the box the destructor allocated must still be drained"
+        );
+        assert_eq!(
+            heap.grayagain_count(),
+            0,
+            "a barrier fired during teardown must not park a soon-freed \
+             pointer in grayagain"
+        );
+
+        heap.drop_all();
+        assert_eq!(heap.grayagain_count(), 0);
+        assert_eq!(heap.bytes_used(), 0);
+    }
+
+    /// Codex finding 2 on #260, heap-level half: after close, the token
+    /// machinery must refuse to mint (0 is never a valid token) and
+    /// `contains_allocation` must be unconditionally false, so a post-close
+    /// downgrade cannot resurrect a freed box as an upgradable weak target.
+    #[test]
+    fn post_close_token_minting_is_refused() {
+        let heap = Heap::new();
+        heap.unpause();
+        let _guard = HeapGuard::push(&heap);
+
+        let gc = heap.allocate(Tracked(DropFlag(std::rc::Rc::new(Cell::new(false)))));
+        let identity = gc.identity();
+
+        heap.drop_all();
+
+        let token = heap.register_allocation_token(identity);
+        assert_eq!(token, 0, "a closed heap must refuse to mint a token");
+        assert!(
+            !heap.contains_allocation(identity, token),
+            "the refused token must never validate"
+        );
+        assert!(
+            heap.allocation_token(identity).is_none(),
+            "the refusal must not have touched the token map"
+        );
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
