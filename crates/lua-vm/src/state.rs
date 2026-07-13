@@ -5546,16 +5546,12 @@ impl<'a> GcHandle<'a> {
     }
 
     /// GC write barrier for a TValue.
-    ///
-    /// macros.tsv: `luaC_barrier → state.gc().barrier(p, v)`
     pub fn barrier(&self, p: &dyn std::any::Any, v: &LuaValue) {
         let g = self._state.global();
         barrier_any(&g.heap, p, v, g.is_gen_mode(), BarrierKind::Forward);
     }
 
     /// Backward write barrier.
-    ///
-    /// macros.tsv: `luaC_barrierback → state.gc().barrier_back(p, v)`
     pub fn barrier_back(&self, p: &dyn std::any::Any, v: &LuaValue) {
         let g = self._state.global();
         barrier_any(&g.heap, p, v, g.is_gen_mode(), BarrierKind::Backward);
@@ -5568,8 +5564,6 @@ impl<'a> GcHandle<'a> {
     }
 
     /// Object write barrier.
-    ///
-    /// macros.tsv: `luaC_objbarrier → state.gc().obj_barrier(p, o)`
     pub fn obj_barrier(&self, p: &dyn std::any::Any, o: &dyn std::any::Any) {
         let g = self._state.global();
         barrier_any(&g.heap, p, o, g.is_gen_mode(), BarrierKind::Forward);
@@ -5585,12 +5579,13 @@ impl<'a> GcHandle<'a> {
 
 // ─── Functions from lstate.c ──────────────────────────────────────────────────
 
-//
-// PORT NOTE: `luai_makeseed` in C mixed ASLR entropy (pointer addresses of a
-// heap var, stack var, and code symbol) with the current time via `luaS_hash`.
-// In Rust, raw pointer addresses require `unsafe` which is forbidden outside
-// lua-gc/lua-coro. Native builds use time-only entropy for now; bare WASM uses
-// a fixed seed so state creation never touches a stubbed host clock.
+/// C's `luai_makeseed` mixes ASLR entropy (pointer addresses of a heap var,
+/// stack var, and code symbol) with the current time via `luaS_hash`. Raw
+/// pointer addresses require `unsafe`, which is forbidden outside
+/// lua-gc/lua-coro, so native builds use time-only entropy for now — a
+/// pointer- or `getrandom`-based source would meaningfully improve
+/// hash-DoS resistance and remains unaddressed. Bare WASM uses a fixed
+/// seed so state creation never touches a stubbed host clock.
 fn make_seed() -> u32 {
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     {
@@ -5605,34 +5600,16 @@ fn make_seed() -> u32 {
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0);
 
-        // TODO(port): mix in ASLR entropy (pointer to heap / stack / code).
-        // Requires a short `unsafe` block to cast references to usize.
-        // The entropy improvement is important for hash DoS resistance (CVE-class).
-        // Phase B should add this via a platform-specific helper in lua-gc or via
-        // the `getrandom` crate if it is added as a dependency.
-
-        // For Phase A, just hash the time bytes against itself.
         crate::string::hash_bytes(&t.to_le_bytes(), t)
     }
 }
 
 /// Adjust the compatibility `GCdebt` value against the collector-owned live
 /// byte count.
-///
-///
-/// ```c
-///
-/// //   l_mem tb = gettotalbytes(g);
-/// //   lua_assert(tb > 0);
-/// //   if (debt < tb - MAX_LMEM)
-/// //     debt = tb - MAX_LMEM;
-/// //   g->GCdebt = debt;
-/// // }
-/// ```
 pub(crate) fn set_debt(g: &mut GlobalState, mut debt: isize) {
     let tb = g.total_bytes() as isize;
     debug_assert!(tb > 0);
-    // macros.tsv: MAX_LMEM → isize::MAX
+    // isize::MAX stands in for C's MAX_LMEM ceiling.
     if debt < tb.saturating_sub(isize::MAX) {
         debt = tb - isize::MAX;
     }
@@ -5654,21 +5631,6 @@ pub fn set_c_stack_limit(_state: &mut LuaState, _limit: u32) -> i32 {
 }
 
 /// Allocate a fresh `CallInfo` beyond the current frame and return its index.
-///
-///
-/// ```c
-///
-/// //   CallInfo *ci;
-/// //   lua_assert(L->ci->next == NULL);
-/// //   ci = luaM_new(L, CallInfo);
-/// //   L->ci->next = ci;
-/// //   ci->previous = L->ci;
-/// //   ci->next = NULL;
-/// //   ci->u.l.trap = 0;
-/// //   L->nci++;
-/// //   return ci;
-/// // }
-/// ```
 pub(crate) fn extend_ci(state: &mut LuaState) -> CallInfoIdx {
     debug_assert!(
         state.call_info[state.ci.0 as usize].next.is_none(),
@@ -5676,7 +5638,7 @@ pub(crate) fn extend_ci(state: &mut LuaState) -> CallInfoIdx {
     );
 
     let current_idx = state.ci;
-    // macros.tsv: luaM_new → Box::new(T::default()) — here we push onto the Vec
+    // Pushes onto the Vec rather than a separate heap allocation (`luaM_new`).
     let new_idx = CallInfoIdx(state.call_info.len() as u32);
 
     state.call_info.push(CallInfo {
@@ -5695,24 +5657,11 @@ pub(crate) fn extend_ci(state: &mut LuaState) -> CallInfoIdx {
 
 /// Free all cached (unused) `CallInfo` frames beyond the current frame.
 ///
-///
-/// ```c
-///
-/// //   CallInfo *ci = L->ci;
-/// //   CallInfo *next = ci->next;
-/// //   ci->next = NULL;
-/// //   while ((ci = next) != NULL) {
-/// //     next = ci->next;
-/// //     luaM_free(L, ci);
-/// //     L->nci--;
-/// //   }
-/// // }
-/// ```
-///
-/// PORT NOTE: In C, each `CallInfo` is an independent heap allocation freed by
-/// `luaM_free`.  In Rust, all `CallInfo` entries live in `state.call_info: Vec<CallInfo>`.
-/// We walk the link chain to count removals (updating `nci`), then truncate the Vec.
-/// This is safe as long as all free entries have indices greater than `state.ci`.
+/// In C, each `CallInfo` is an independent heap allocation freed by
+/// `luaM_free`. Here, all `CallInfo` entries live in
+/// `state.call_info: Vec<CallInfo>`: this walks the link chain to count
+/// removals (updating `nci`), then truncates the Vec — safe as long as all
+/// free entries have indices greater than `state.ci`.
 fn free_ci(state: &mut LuaState) {
     let ci_idx = state.ci.0 as usize;
 
@@ -5723,37 +5672,19 @@ fn free_ci(state: &mut LuaState) {
         state.nci = state.nci.saturating_sub(1);
     }
 
-    // Truncate: drop all entries beyond the current ci.
-    // TODO(port): verify invariant that all cached frames have contiguous indices > state.ci
+    // Truncate: drop all entries beyond the current ci. Assumes all cached
+    // frames have contiguous indices greater than state.ci; not verified.
     state.call_info.truncate(ci_idx + 1);
 }
 
 /// Free approximately half of the cached `CallInfo` frames beyond the current frame.
 ///
-///
-/// ```c
-///
-/// //   CallInfo *ci = L->ci->next;
-/// //   CallInfo *next;
-/// //   if (ci == NULL) return;
-/// //   while ((next = ci->next) != NULL) {
-/// //     CallInfo *next2 = next->next;
-/// //     ci->next = next2;
-/// //     L->nci--;
-/// //     luaM_free(L, next);
-/// //     if (next2 == NULL) break;
-/// //     else { next2->previous = ci; ci = next2; }
-/// //   }
-/// // }
-/// ```
-///
-/// PORT NOTE: The C code removes every other node from the free-list chain by
-/// pointer manipulation.  In Rust, removing elements from the middle of a `Vec`
-/// shifts subsequent elements and invalidates `CallInfoIdx` values that point
-/// past the removal site.  For Phase A, we approximate by halving the free count
-/// via truncation.  TODO(port): Phase B should implement a proper free-list
-/// pool (e.g., a slab) that allows O(1) element removal without index
-/// invalidation.
+/// The C code removes every other node from the free-list chain by pointer
+/// manipulation. Removing elements from the middle of a `Vec` here would
+/// shift subsequent elements and invalidate `CallInfoIdx` values that point
+/// past the removal site, so this instead approximates by halving the free
+/// count via truncation — an O(n) copy for the drop where a slab allocator
+/// supporting O(1) removal without index invalidation would do better.
 pub(crate) fn shrink_ci(state: &mut LuaState) {
     let ci_idx = state.ci.0 as usize;
 
@@ -5767,8 +5698,6 @@ pub(crate) fn shrink_ci(state: &mut LuaState) {
     }
 
     // Remove every other cached frame (halve the free list).
-    // PERF(port): truncation is O(n) copy for the drop; a slab allocator
-    // would be O(1) — profile in Phase B.
     let keep = free_count / 2;
     let removed = free_count - keep;
     let new_len = ci_idx + 1 + keep;
@@ -5782,23 +5711,12 @@ pub(crate) fn shrink_ci(state: &mut LuaState) {
 }
 
 /// Check whether the C-call depth has reached its limit and raise an error if so.
-///
-///
-/// ```c
-///
-/// //   if (getCcalls(L) == LUAI_MAXCCALLS)
-/// //     luaG_runerror(L, "C stack overflow");
-/// //   else if (getCcalls(L) >= (LUAI_MAXCCALLS / 10 * 11))
-/// //     luaD_throw(L, LUA_ERRERR);
-/// // }
-/// ```
 pub(crate) fn check_c_stack(state: &mut LuaState) -> Result<(), LuaError> {
-    // macros.tsv: getCcalls → state.c_calls()
-    // error_sites.tsv: luaG_runerror → return Err(LuaError::runtime(format_args!(...)))
+    // Mirrors luaG_runerror.
     if state.c_calls() == LUAI_MAXCCALLS {
         return Err(LuaError::runtime(format_args!("C stack overflow")));
     }
-    // error_sites.tsv: luaD_throw(L, LUA_ERRERR) → return Err(LuaError::with_status(LuaStatus::ErrErr))
+    // Mirrors luaD_throw(L, LUA_ERRERR).
     if state.c_calls() >= (LUAI_MAXCCALLS / 10 * 11) {
         return Err(LuaError::with_status(LuaStatus::ErrErr));
     }
@@ -5806,31 +5724,19 @@ pub(crate) fn check_c_stack(state: &mut LuaState) -> Result<(), LuaError> {
 }
 
 /// Increment the C-call depth counter, checking for overflow.
-///
-///
-/// ```c
-///
-/// //   L->n_ccalls++;
-/// //   if (l_unlikely(getCcalls(L) >= LUAI_MAXCCALLS))
-/// //     luaE_checkcstack(L);
-/// // }
-/// ```
 pub fn inc_c_stack(state: &mut LuaState) -> Result<(), LuaError> {
     state.n_ccalls += 1;
-    // macros.tsv: l_unlikely → x (drop branch hint); getCcalls → state.c_calls()
     if state.c_calls() >= LUAI_MAXCCALLS {
         check_c_stack(state)?;
     }
     Ok(())
 }
 
-//
-// PORT NOTE: In C, `L` is a separate thread used only for memory allocation
-// (via `luaM_newvector`).  In Rust we don't have a custom allocator; all
-// allocation goes through the global Rust allocator.  The function takes only
-// the new thread (`thread`) and ignores the caller.
+/// In C, `L` is a separate thread used only for memory allocation (via
+/// `luaM_newvector`). There is no custom allocator here; all allocation
+/// goes through the global Rust allocator, so this takes only the new
+/// thread (`thread`) and ignores the caller.
 fn stack_init(thread: &mut LuaState) {
-    // macros.tsv: luaM_newvector → vec![T::default(); n]
     let total_slots = BASIC_STACK_SIZE + EXTRA_STACK;
     thread.stack = vec![StackValue::default(); total_slots];
 
