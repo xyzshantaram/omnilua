@@ -15,18 +15,3 @@ pub use heap::{
     Heap, HeapGuard, HeapRef, Marker, StepBudget, StepOutcome, Trace, Udata51Probe, WeakEntry,
     WeakListKind, WeakRegistry, WeakRegistrySnapshot, WeakRegistryStats,
 };
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        (module aggregator; per-file ports own their own trailers)
-//   target_crate:  lua-gc
-//   confidence:    high
-//   todos:         0
-//   port_notes:    0
-//   unsafe_blocks: 0
-//   notes:         Module aggregator: re-exports the public surface of heap.rs
-//                  (Gc, GcBox, GcHeader, Heap, HeapGuard, Marker, Trace, etc.).
-//                  No code of its own. The mark-and-sweep collector lives in
-//                  heap.rs. Reference-only Phase-A partial ports are not kept
-//                  in src/, so source scans track the active build.
-// ──────────────────────────────────────────────────────────────────────────

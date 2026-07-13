@@ -1874,26 +1874,3 @@ mod tests {
         assert_eq!(num.without_trailing_nul(), b"123");
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        originally ported from src/llex.c + src/llex.h; the C
-//                  correspondence has since been GRADUATED away (see GRADUATED.md
-//                  and the module-level doc). This file no longer tracks the C
-//                  line-by-line — it is idiomatic Rust guarded by the oracle.
-//   target_crate:  lua-lex
-//   confidence:    high
-//   todos:         1  (ZIO/LexBuffer move to lua_vm::zio — separate refactor)
-//   port_notes:    0  (C-correspondence crutches removed in idiomatization S1)
-//   unsafe_blocks: 0   (must be 0 outside explicit unsafe-budget crates)
-//   notes:         Idiomatized (Sprint 1, P1a): byte cursor is a single-cursor
-//                  chunk reader; numeral parsing returns Option not a C status +
-//                  out-param; token text uses named LexBuffer extraction methods;
-//                  the scan loop dispatches on an internal Peek enum while the
-//                  emitted token kind stays i32 (TK_*) as the lua-parse boundary.
-//                  The oracle that now guards behaviour: bytecode parity (token
-//                  stream → identical luac -l -l), the multiversion_oracle, and
-//                  the literals.lua / errors.lua line-and-message tests. Numeric
-//                  literal parsing delegates to lua_vm::object::str2num. Do NOT
-//                  reach for llex.c to debug this file — see GRADUATED.md.
-// ──────────────────────────────────────────────────────────────────────────────

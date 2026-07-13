@@ -577,17 +577,3 @@ mod tests {
         assert_eq!(s_c_to_int(int_to_s_c(-50)), -50);
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/lopcodes.c  (104 lines, 0 functions — data only)
-//                  src/lopcodes.h  (406 lines, merged per PORTING.md §1)
-//   target_crate:  lua-code
-//   confidence:    high
-//   todos:         1
-//   port_notes:    1
-//   unsafe_blocks: 0
-//   notes:         Pure data/encoding translation; OpCode::from_u32 needs
-//                  Phase B review for transmute vs. num_enum. Self_ rename
-//                  is permanent (Rust keyword conflict).
-// ──────────────────────────────────────────────────────────────────────────

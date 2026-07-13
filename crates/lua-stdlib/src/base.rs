@@ -1652,27 +1652,3 @@ pub fn open(state: &mut LuaState) -> Result<usize, LuaError> {
     }
     Ok(1)
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/lbaselib.c (5.1–5.5, version-gated from one source)
-//   target_crate:  lua-stdlib
-//   unsafe_blocks: 0
-//   net:           tests/base_strengthen.rs + multiversion_oracle +
-//                  official calls/errors/nextvar/constructs + check.sh ×5
-//   load-bearing:  pcall/xpcall/error unwinding, load/compile, next/pairs/ipairs
-//                  iteration, collectgarbage, type/tostring/raw* fast paths, and
-//                  every per-version roster/behavior gate — idiomatize AROUND.
-//   version-gated: error() prefixes luaL_where onto a NUMBER value on 5.1/5.2
-//                  (lua_isstring true for numbers) but only strict strings on
-//                  5.3+. collectgarbage "count" returns a 2nd byte-remainder
-//                  result on 5.2 only; "generational"/"incremental" are valid on
-//                  5.2 (return integer 0) / 5.4+ (return the string mode) but
-//                  invalid on 5.3 (per-version OPTS_5x sets). debug_getfenv_fn/
-//                  debug_setfenv_fn are the 5.1 object-form fenv accessors used
-//                  by debug_lib (distinct from the level-aware getfenv/setfenv).
-//   deferred:      __name pre-5.3 gating + 5.1/5.2 arg-error fn-name ('?'/'_G.')
-//                  live in lua-vm (obj_type_name_cow / arg_error_impl); see the
-//                  module header. Not base-fixable. 5.2 collectgarbage
-//                  "setmajorinc" (a generational-GC param) is also out of scope.
-// ──────────────────────────────────────────────────────────────────────────────

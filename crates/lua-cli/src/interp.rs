@@ -386,7 +386,7 @@ impl Cli {
     /// `lua.c`: `docall` — call the function on the stack under a freshly
     /// installed `msghandler`, so any error comes back as a traceback string.
     /// C-Lua's SIGINT-driven interrupt of a running chunk (`laction`/`lstop`)
-    /// is not yet ported; see the `repl.rs` PORT STATUS for why.
+    /// is not yet ported (readline/history integration is CLI-native work).
     pub(crate) fn docall(
         &self,
         state: &mut LuaState,
@@ -817,31 +817,3 @@ pub(crate) fn run(
         }
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        reference/lua-5.4.7/src/lua.c (option handling + pmain)
-//   target_crate:  lua-cli
-//   confidence:    medium
-//   todos:         1  (os.exit exit-code propagation is a pre-existing
-//                      lua-stdlib gap: os_lib.rs returns a placeholder
-//                      with_status error; a LuaError::Exit(i32) variant is
-//                      needed for faithful behaviour — out of scope here)
-//   port_notes:    3  (banner is omniLua's own, version-aware; shebang stripped in
-//                      buffer not reader; script-dir prepended to LUA_PATH —
-//                      a lua-rs extension preserved from the prior CLI)
-//   unsafe_blocks: 0
-//   notes:         docall installs msghandler as the pcall errfunc; the VM
-//                  invokes it during error synthesis (do_.rs pcall), so the
-//                  returned LuaError carries the traceback string. SIGINT
-//                  interruption of a running chunk is wired in repl.rs.
-//                  #79d: `run` now mirrors lua.c's `main` — it pushes `pmain`
-//                  as a C closure and `pcall_k`s it (errfunc=0, NO outer
-//                  message handler), so the whole interpreter body runs beneath
-//                  a base C CallInfo. Uncaught errors thus gain the trailing
-//                  `[C]: in ?` frame from the (unchanged) stack walker. argv/
-//                  preload are parked on GlobalState::cli_argv/cli_preload for
-//                  `pmain` to reclaim (a C closure cannot capture Rust values);
-//                  `pmain` leaves a boolean success flag on the stack that the
-//                  wrapper reads for the exit code (lua.c's lua_toboolean(-1)).
-// ──────────────────────────────────────────────────────────────────────────

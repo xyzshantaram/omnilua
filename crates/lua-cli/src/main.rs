@@ -1601,27 +1601,3 @@ fn main() -> ExitCode {
         }
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        (minimal entrypoint; not a port of lua.c — that's Phase F)
-//   target_crate:  lua-cli
-//   confidence:    high
-//   todos:         0
-//   port_notes:    0
-//   unsafe_blocks: 3  (libloading-backed dynlib backend, Phase D-3.5;
-//                      budget counts 4 due to one `unsafe extern "C" fn()`
-//                      type parameter on `Symbol<...>`).
-//   notes:         drives new_state → open_libs → load_string → pcall_k.
-//                  Designed to surface the first todo!() panic on a hello-
-//                  world program, not to be a complete interpreter. Hosts the
-//                  libloading-backed implementation of the three
-//                  dynlib_*_hook hooks on GlobalState (Phase D-3.5); ceiling
-//                  in harness/unsafe-budgets.toml = 3. Also installs
-//                  popen_hook (Phase F): spawns /bin/sh -c <cmd> via
-//                  std::process::Command, wraps the resulting pipe in
-//                  PopenFile (a LuaFileHandle) so io.popen and the LStream
-//                  read/write/close path Just Work for clients like
-//                  LuaRocks. No new unsafe — std::process is permitted in
-//                  lua-cli.
-// ──────────────────────────────────────────────────────────────────────────

@@ -263,22 +263,3 @@ where
         }
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        (no C analog — Rust-native async embedding)
-//   target_crate:  omnilua
-//   confidence:    high
-//   todos:         0
-//   port_notes:    0
-//   unsafe_blocks: 0
-//   notes:         create_async_function + call_async/eval_async/exec_async,
-//                  built on coroutine create_thread/resume/status + a yielded
-//                  per-function capability token (light-userdata = address of an
-//                  owned Box, unforgeable by Lua, version-invariant). Callbacks
-//                  are Rc so the registry borrow drops before user code runs
-//                  (re-entrant create_async_function safe). No VM/GC/unsafe;
-//                  rooting inherited from the coroutine path. Feature `async`
-//                  enables `coroutine`. Future errors propagate to the Rust
-//                  caller (coroutine left suspended; not injected into pcall).
-// ──────────────────────────────────────────────────────────────────────────

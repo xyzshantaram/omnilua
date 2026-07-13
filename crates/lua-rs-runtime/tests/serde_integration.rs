@@ -341,16 +341,3 @@ fn i128_in_range_roundtrips_out_of_range_errors() {
     let ub: u128 = lua.from_value(lua.to_value(&9u128).unwrap()).unwrap();
     assert_eq!(ub, 9u128);
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        (no C analog — serde integration tests)
-//   target_crate:  omnilua
-//   confidence:    high
-//   todos:         0
-//   port_notes:    0
-//   unsafe_blocks: 0
-//   notes:         Exercises LuaSerdeExt round-trips (structs, enums, maps,
-//                  tuples, bytes, serde_json interop), the None-field omission
-//                  rule, real-Lua-data check, and the number-model seam.
-// ──────────────────────────────────────────────────────────────────────────

@@ -297,17 +297,3 @@ fn prior_global_tampering_on_shared_instance_does_not_break_async() {
         "async uses coroutine primitives captured at construction, immune to prior tampering"
     );
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        (no C analog — async dogfood harness)
-//   target_crate:  omnilua
-//   confidence:    high
-//   todos:         0
-//   port_notes:    0
-//   unsafe_blocks: 0
-//   notes:         Deterministic in-memory executor (std::task::Wake, no unsafe)
-//                  + YieldOnce (pending-once) future. Exercises ready/suspend/
-//                  sequential/call_async/exec_async/error/sync-misuse/plain-yield
-//                  paths with no tokio or sockets.
-// ──────────────────────────────────────────────────────────────────────────

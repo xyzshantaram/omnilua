@@ -1128,21 +1128,3 @@ pub fn open_debug(state: &mut LuaState) -> Result<usize, LuaError> {
 
     Ok(1)
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   target_crate:  lua-stdlib
-//   unsafe_blocks: 0
-//   net:           db.lua (5.4) + multiversion_oracle + check.sh 5.1..5.5 +
-//                  tests/debug_strengthen.rs (this crate). See GRADUATED.md.
-//   version-gated: per-version roster (open_debug): setcstacklimit is 5.4-only;
-//                  5.1 drops upvalueid/upvaluejoin/get|setuservalue/
-//                  setcstacklimit and adds getfenv/setfenv. upvalueid raises on
-//                  an out-of-range index on 5.1/5.2/5.3, returns fail on 5.4/5.5.
-//   deferred:      6 TODO(port), all genuine deferred VM behavior — the
-//                  cross-thread `lua_xmove` cluster (getinfo/getlocal/setlocal/
-//                  sethook/gethook against another thread's stack needs
-//                  simultaneous `&mut LuaState` for both threads) and the
-//                  `UpvalId` raw-pointer identity for upvalueid/upvaluejoin.
-//                  These reach into lua-vm internals and are load-bearing.
-// ──────────────────────────────────────────────────────────────────────────

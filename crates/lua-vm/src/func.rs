@@ -558,25 +558,3 @@ impl LuaState {
         crate::debug::find_local(self, ci, n, None)
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/lfunc.c  (295 lines, 16 functions)
-//   target_crate:  lua-vm
-//   confidence:    medium
-//   todos:         36
-//   port_notes:    7
-//   unsafe_blocks: 0
-//   notes:         Logic is faithful. Two blockers for Phase B:
-//                  (1) GcRef<UpVal> needs interior mutability (Rc<RefCell<UpVal>>)
-//                      so close_upval and init_upvals can mutate in-place.
-//                  (2) LuaProto stub in state.rs must gain full field list from
-//                      object.rs before new_proto / get_local_name compile.
-//                  LuaClosureLua.proto needs Option<> wrapper for NULL init in
-//                  new_lua_closure. Stub methods on LuaState (get_tm_by_obj,
-//                  lua_call, set_error_obj, debug_find_local) must be removed
-//                  once their home modules are written (do_.rs, debug.rs,
-//                  tagmethods.rs). The 36 TODO(port) markers include both the
-//                  core design blockers and the stub-method placeholders; the
-//                  stub-method TODOs will auto-resolve as other modules land.
-// ──────────────────────────────────────────────────────────────────────────

@@ -459,26 +459,3 @@ fn highlight_lua(line: &str) -> String {
     }
     out
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        reference/lua-5.4.7/src/lua.c (doREPL and friends)
-//   target_crate:  lua-cli
-//   confidence:    medium
-//   todos:         2  (in-execution Ctrl-C interrupt of a running chunk is
-//                      deferred: the debug-hook closure returns () so a hook
-//                      cannot raise "interrupted!" the way lua.c's lstop does;
-//                      that needs a hook-ABI change in lua-vm. Ctrl-C at the
-//                      prompt works via rustyline. field completion is one
-//                      level of table fields deep)
-//   port_notes:    2  (continuation handled in our loop, not a rustyline
-//                      Validator, mirroring C readline's line-at-a-time model;
-//                      highlighting uses a self-contained scanner because
-//                      lua-lex requires &mut LuaState per token)
-//   unsafe_blocks: 0
-//   notes:         loadline/addreturn/multiline/incomplete reproduce the
-//                  upstream <eof> continuation contract against load_buffer.
-//                  rustyline supplies editing, history (~/.lua_history),
-//                  highlighting, and completion over a per-prompt snapshot of
-//                  _G plus one level of table fields.
-// ──────────────────────────────────────────────────────────────────────────

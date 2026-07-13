@@ -4,8 +4,7 @@
 //!
 //! The recursive pattern matcher (§2) is the hot, CPI-load-bearing core: its
 //! `goto`-derived `'outer: loop` and per-char dispatch are pinned by the
-//! behavioral net and must not be refactored (see the PORT STATUS trailer and
-//! `GRADUATED.md` "string"). Version seams live in two single-source helpers:
+//! behavioral net and must not be refactored (see `GRADUATED.md` "string"). Version seams live in two single-source helpers:
 //! [`matcher_bounds_depth`] (the 5.2+ "pattern too complex" guard, absent on
 //! 5.1) and [`matcher_dedups_empty_match`] (the 5.3.3 empty-match rule).
 //!
@@ -3350,36 +3349,3 @@ pub fn luaopen_string(state: &mut LuaState) -> Result<usize, LuaError> {
     createmetatable(state)?;
     Ok(1)
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   target_crate:  lua-stdlib
-//   unsafe_blocks: 0
-//   load-bearing:  the recursive pattern matcher (match_pat + its helpers
-//                  singlematch/match_class/matchbracketclass/classend/
-//                  max_expand/min_expand/start_capture/end_capture/
-//                  match_capture/matchbalance) is HOT and CPI-critical. The
-//                  goto->`'outer: loop` tail-call translation, the per-char
-//                  match dispatch, and the recursion structure are NOT to be
-//                  refactored — extract/rename and doc-comments only, proven
-//                  Ir/branch-sim neutral. See GRADUATED.md "string".
-//   net:           behavior is pinned by the behavioral suite — multiversion
-//                  oracle (incl. the P2c pattern-too-complex gate, the 5.3.3
-//                  empty-match advance rule, and the capture-overflow tripwire),
-//                  strings.lua + pm.lua, check.sh 5.1-5.5. Version seams are
-//                  single-sourced in matcher_bounds_depth (5.1 has no MAXCCALLS
-//                  recursion guard) and matcher_dedups_empty_match (the 5.3.3
-//                  `e != lastmatch` rule, absent on 5.1/5.2). Further per-version
-//                  seams: pack/packsize/unpack are registered only for 5.3+
-//                  (STRING_PACK_LIB in luaopen_string); string.rep ignores the
-//                  separator on 5.1; `%q` strict-string-coerces on 5.1/5.2
-//                  (addquoted_51 for 5.1's NUL/`\r`/literal-control rules) and
-//                  emits inf/nan literally on 5.3 (quotefloat); `%s` is strict on
-//                  5.1; `%u`/`%o`/`%x`/`%X` cast the float-only number per
-//                  version (format_uint_arg: 5.1 saturating fptoui, 5.2 range
-//                  check); `%g`/`%e` preserve negative-zero on every version.
-//   perf:          the cold API fns borrow source bytes through to_lua_string
-//                  (GcRef) rather than copying via check_arg_string; num_to_str
-//                  stringifies small integers into a stack buffer. string_ops
-//                  ~2.00x, string_ops_long ~1.48x vs reference (best-of-5).
-// ────────────────────────────────────────────────────────────────────────────

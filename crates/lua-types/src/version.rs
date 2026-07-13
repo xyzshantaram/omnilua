@@ -320,17 +320,3 @@ mod tests {
         assert_eq!(LuaVersion::V53.luac_version_byte(), 0x53);
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        (foundation — multi-version seam, not ported from .c)
-//   target_crate:  lua-types
-//   confidence:    high
-//   todos:         0
-//   port_notes:    0
-//   unsafe_blocks: 0
-//   notes:         LuaVersion + NumberModel. Default = V54 preserves the
-//                  existing single-version behavior. V51-V55 complete; V51
-//                  reuses the 5.2 float-only core plus the fenv-globals,
-//                  metamethod-diff, and roster/syntax axes (all V51-gated).
-// ──────────────────────────────────────────────────────────────────────────

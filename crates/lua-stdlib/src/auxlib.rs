@@ -1448,27 +1448,3 @@ impl<'a> std::fmt::Display for BStr<'a> {
 use std::fmt::Write as _;
 
 // ── LuaDebug Default ─────────────────────────────────────────────────────────
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/lauxlib.c  (1127 lines, ~50 functions)
-//   target_crate:  lua-stdlib
-//   confidence:    medium
-//   todos:         10
-//   port_notes:    8
-//   unsafe_blocks: 0
-//   notes:         Buffer simplified from stack-based C UBox/box-on-Lua-stack to
-//                  plain Vec<u8> (LuaBuffer); UBox/resizebox/boxgc/boxmt/newbox
-//                  machinery dropped entirely — Rust Drop handles deallocation.
-//                  load_filex reads via GlobalState::file_loader_hook and pushes
-//                  an error string on open failure so loadfile/dofile return
-//                  (nil, err) per C semantics (stdin loading still TODO).
-//                  Warning system uses fn-ptr callbacks matching lua_WarnFunction
-//                  type; warnfoff/warnfon/warnfcont translated faithfully.
-//                  LuaState / LuaDebug / GcRef are Phase-A stubs; Phase B replaces
-//                  with real imports from lua-vm / lua-types.
-//                  add_size() is a no-op in Phase A (Vec tracks length implicitly);
-//                  direct buffer writes via spare capacity need revisit in Phase B.
-//                  int_error() return type changed from `!` to `Result<usize,_>` as
-//                  the never type is nightly-only on stable Rust.
-// ──────────────────────────────────────────────────────────────────────────

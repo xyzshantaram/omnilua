@@ -261,18 +261,3 @@ pub fn open_bit32(state: &mut LuaState) -> Result<usize, LuaError> {
     state.new_lib(BIT32_FUNCS)?;
     Ok(1)
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/lbitlib.c (Lua 5.2/5.3)
-//   target_crate:  lua-stdlib
-//   confidence:    high
-//   todos:         0
-//   port_notes:    0
-//   unsafe_blocks: 0
-//   notes:         Full 5.2/5.3 bit32 surface (band/bor/bxor/bnot/btest/lshift/
-//                  rshift/arshift/lrotate/rrotate/extract/replace), registered
-//                  under the V52|V53 gate. mod-2^32 masking and the version-
-//                  specific float coercion (5.2 rounds, 5.3 rejects fractions)
-//                  are reference-pinned in tests/bit32_strengthen.rs.
-// ──────────────────────────────────────────────────────────────────────────

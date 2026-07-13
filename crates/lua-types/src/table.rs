@@ -2039,33 +2039,3 @@ fn extract_weak_mode(mt: &LuaTable) -> u8 {
     }
     0
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/ltable.c (~995 lines, 28 functions), src/ltable.h
-//   target_crate:  lua-types
-//   confidence:    high
-//   todos:         0
-//   port_notes:    0
-//   unsafe_blocks: 0
-//   notes:         Canonical LuaTable: hybrid array + hash. Mirrors C's Table
-//                  struct (flags, lsizenode, alimit, array, node, lastfree) with
-//                  Vec<LuaValue> + Vec<TableNode> in place of raw C pointers, and
-//                  Option<usize> indexing in place of Node*. The luaH_getn
-//                  boundary search + alimit-aware integer-key fast path are
-//                  ported faithfully (see getn() and get_int_slot()). The
-//                  integer-key read path also exposes get_int_value, which
-//                  mirrors C's luaH_getint by returning the array slot directly
-//                  in one bounds-checked load (no TableSlotRef indirection) and
-//                  splitting the rare alimit-aliased / hash-part path into a
-//                  cold helper. The short-string read path mirrors that shape
-//                  via get_str_value (single hash-chain walk, no TableSlotRef
-//                  round-trip); LuaTable::get dispatches on integer/short-string
-//                  keys inline and routes everything else through a #[cold]
-//                  get_generic_value, matching C's luaH_get fast-path structure.
-//                  LuaTable::get / get_int / get_short_str are #[inline(always)]
-//                  so the dispatch folds into the cross-crate VM hot frames
-//                  (state::fast_get / state::table_get_with_tm). Weak-table mode
-//                  flags + the prune_weak_dead / ephemeron_values_to_mark
-//                  helpers integrate with the lua-gc Trace impl.
-// ──────────────────────────────────────────────────────────────────────────────

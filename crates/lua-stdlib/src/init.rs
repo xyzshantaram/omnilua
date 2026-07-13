@@ -122,17 +122,3 @@ pub fn open_libs(state: &mut LuaState) -> Result<(), LuaError> {
     }
     Ok(())
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/linit.c  (66 lines, 1 function)
-//   target_crate:  lua-stdlib
-//   confidence:    high
-//   todos:         1
-//   port_notes:    3
-//   unsafe_blocks: 0
-//   notes:         Trivial file. Cross-crate refs (state.require_lib,
-//                  state.pop_n, crate::*::open) resolve in Phase B.
-//                  Phase B must also reconcile inconsistent open-function
-//                  names in the existing stdlib modules (see PORT NOTEs).
-// ──────────────────────────────────────────────────────────────────────────

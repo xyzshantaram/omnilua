@@ -1989,19 +1989,3 @@ impl<'a> std::fmt::Display for StubBStr<'a> {
         Ok(())
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        (Phase-B reconcile shim; no C source)
-//   target_crate:  lua-stdlib
-//   confidence:    high
-//   todos:         0
-//   port_notes:    3
-//   unsafe_blocks: 0
-//   notes:         Re-exports lua_vm::state::LuaState (canonical owner per
-//                  harness/type-vocabulary.tsv); the LuaStateStubExt trait
-//                  carries every Phase-A stub method as a
-//                  todo!("phase-b-reconcile: …") body so the rest of
-//                  lua-stdlib keeps compiling while the canonical API
-//                  catches up.
-// ──────────────────────────────────────────────────────────────────────────

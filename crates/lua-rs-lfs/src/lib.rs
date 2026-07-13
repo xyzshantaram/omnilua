@@ -717,20 +717,3 @@ pub fn luaopen_lfs(state: &mut LuaState) -> Result<usize, LuaError> {
     }
     Ok(1)
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        external — LuaFileSystem (lfs) by Roberto Ierusalimschy
-//                  et al., subset corresponding to LuaRocks' usage; not a
-//                  port of any file inside reference/lua-5.4.7/.
-//   target_crate:  lua-rs-lfs
-//   confidence:    high
-//   todos:         0
-//   port_notes:    0
-//   unsafe_blocks: 0
-//   notes:         Rust-native module exposed via package.preload.lfs by
-//                  lua-cli. Statically linked, no FFI, no unsafe. Implements
-//                  the lfs functions LuaRocks needs: attributes, dir, mkdir,
-//                  rmdir, chdir, currentdir, touch, link, lock_dir. Out of
-//                  scope: lock/unlock/symlinkattributes/setmode.
-// ──────────────────────────────────────────────────────────────────────────

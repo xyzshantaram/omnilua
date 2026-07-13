@@ -136,7 +136,6 @@ workload, then `git bisect run` a script that thresholds the best-of-N wall time
   (`&[u8]` / `Vec<u8>` / `LuaString`).
 - **`unsafe` is budgeted** (`harness/unsafe-budgets.toml`); every block needs a
   `// SAFETY:` comment and must stay under the per-crate ceiling.
-- **Every `crates/**/*.rs` carries a PORT STATUS trailer.**
 
 ## Worktrees & parallel agents
 

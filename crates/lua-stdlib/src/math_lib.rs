@@ -925,20 +925,3 @@ pub fn luaopen_math(state: &mut LuaState) -> Result<usize, LuaError> {
 
     Ok(1)
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   target_crate:  lua-stdlib
-//   unsafe_blocks: 0
-//   deferred:      one TODO — the PRNG state is a thread-local rather than
-//                  per-lua_State typed userdata in a closure upvalue; see
-//                  math_random. The PRNG/ldexp/frexp/version-gate behavior is
-//                  pinned by the behavioral net (multiversion_oracle PRNG
-//                  sequence + subnormal tests, the lua-stdlib FloatOnly test,
-//                  math.lua, and check.sh 5.1-5.5). See GRADUATED.md "math".
-//   version-gated: math.max/math.min use luaL_checknumber on 5.1/5.2 (reject
-//                  non-numbers, return a coerced number) vs lua_compare on 5.3+.
-//                  Known residual: the 5.1 arg-error function name is '?' in the
-//                  reference but qualified ('math.max') here — same lua-vm
-//                  arg_error_impl 5.1 name-resolution gap noted in base.rs.
-// ──────────────────────────────────────────────────────────────────────────

@@ -6528,31 +6528,3 @@ mod tests {
         assert_eq!(getunopr(b'+' as TokenKind), UnOpr::NoUnOpr);
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        originally ported from src/lparser.c + src/lparser.h with
-//                  src/lcode.c codegen folded in; the C correspondence has since
-//                  been GRADUATED away (see GRADUATED.md and the module-level
-//                  doc). This file no longer tracks the C line-by-line — it is
-//                  idiomatic Rust guarded by the oracle.
-//   target_crate:  lua-parse
-//   confidence:    high
-//   todos:         8  (genuine deferred-codegen markers, not crutch: integer
-//                  stack-check, debug-var startpc, local const-fold, explicit
-//                  fix_line, GC proto allocation, single-vs-multret arg, and the
-//                  unnamed-var defensive branch — each kept because the
-//                  bytecode-parity oracle proves they do not move output, and
-//                  removing them would hide a real divergence from full lcode.c)
-//   port_notes:    0  (C-correspondence crutches removed in idiomatization S1)
-//   unsafe_blocks: 0
-//   notes:         Idiomatized (Sprint 1, P1b — subsumes P1c, since lcode.c is
-//                  folded in here and the standalone lua-code crate is only the
-//                  opcode tables). The emit/register-alloc/jump-offset/line-info/
-//                  constant-fold CORE was deliberately left structurally faithful
-//                  (the hot-loop exception). The oracle that now guards behaviour:
-//                  bytecode parity (parser+codegen → identical luac -l -l), the
-//                  multiversion_oracle, the full official suite, and the
-//                  check.sh 5.1..5.5 version batteries. Do NOT reach for
-//                  lparser.c / lcode.c to debug this file — see GRADUATED.md.
-// ──────────────────────────────────────────────────────────────────────────

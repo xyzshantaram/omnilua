@@ -2145,24 +2145,3 @@ fn ci_lua_proto(ci: &CallInfo, state: &LuaState) -> GcRef<LuaProto> {
         _ => panic!("ci_lua_proto: call frame does not hold a Lua closure"),
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/ldebug.c  (962 lines, 30 functions)
-//   target_crate:  lua-vm
-//   confidence:    medium
-//   todos:         44
-//   port_notes:    15
-//   unsafe_blocks: 0
-//   notes:         Logic faithful to C; cross-crate imports (luaF_*, luaT_*,
-//                  luaD_*, luaO_chunkid, opcode accessors) are stubbed with
-//                  TODO(port) markers. LuaState accessor methods (call_stack_mut,
-//                  get_ci, set_trap, saved_pc, hook_mask, etc.) are called as if
-//                  defined in state.rs — Phase B must implement them. The
-//                  pointer-identity comparisons in instack/getupvalname are
-//                  translated to StackIdx comparisons (a structural change).
-//                  `lua_gethook` returns a bool instead of a fn pointer because
-//                  Box<dyn FnMut> cannot be returned by value without restructuring.
-//                  rustc check: zero real syntax errors; all 67 diagnostics are
-//                  expected name-resolution errors (E0432/E0433/E0425/E0282).
-// ──────────────────────────────────────────────────────────────────────────────

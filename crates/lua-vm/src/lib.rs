@@ -34,15 +34,3 @@ pub mod prelude {
     pub(crate) use crate::tagmethods::TagMethod;
     pub use crate::vm::{InstructionExt, OpCode};
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        (module aggregator; see individual files for C sources)
-//   target_crate:  lua-vm
-//   confidence:    high
-//   todos:         0
-//   port_notes:    0
-//   unsafe_blocks: 0
-//   notes:         Each pub mod corresponds to one C source under
-//                  `reference/lua-5.4.7/src/`. See `ANALYSES/file_deps.txt`.
-// ──────────────────────────────────────────────────────────────────────────

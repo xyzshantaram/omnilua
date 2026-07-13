@@ -991,22 +991,3 @@ pub fn chunk_id(out: &mut [u8], source: &[u8]) -> usize {
 
     written
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/lobject.c  (602 lines, ~20 functions)
-//   target_crate:  lua-vm
-//   confidence:    medium
-//   todos:         15
-//   port_notes:    12
-//   unsafe_blocks: 0
-//   notes:         All import paths are speculative (crate::state, lua_types::*);
-//                  Phase B must reconcile.  va_list replaced by FmtArg enum —
-//                  call sites of push_fstring/push_vfstring need updating.
-//                  Float formatting (%.14g) is approximated with {:.14e}; needs
-//                  proper %g in Phase B.  Locale decimal-point handling is
-//                  stubbed (always '.').  str2dloc uses from_utf8 for ASCII
-//                  number strings (flagged TODO).  int_floor_mod, int_floor_div,
-//                  shiftl, float_floor_mod, concat are assumed to exist in
-//                  crate::vm; Phase B must confirm or create them.
-// ──────────────────────────────────────────────────────────────────────────
