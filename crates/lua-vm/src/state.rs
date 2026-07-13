@@ -6879,18 +6879,22 @@ mod tests {
         Ok(0)
     }
 
-    /// Build a table carrying a `__gc = close_gc_probe` metatable on `state`,
+    /// Build a table carrying a `__gc = gc_fn` metatable on `state`,
     /// registering it in the pending-finalizers list via the canonical
     /// `api::set_metatable` path, and leave the object table on the stack so
     /// it stays live to close.
-    fn install_finalizable_table(state: &mut LuaState) {
+    fn install_finalizable_table_with(state: &mut LuaState, gc_fn: LuaCFunction) {
         let heap = state.global().heap.clone();
         let _guard = lua_gc::HeapGuard::push(&heap);
         crate::api::create_table(state, 0, 0).expect("object table");
         crate::api::create_table(state, 0, 1).expect("metatable");
-        crate::api::push_cclosure(state, close_gc_probe, 0).expect("push __gc");
+        crate::api::push_cclosure(state, gc_fn, 0).expect("push __gc");
         crate::api::set_field(state, -2, b"__gc").expect("mt.__gc");
         crate::api::set_metatable(state, -2).expect("setmetatable");
+    }
+
+    fn install_finalizable_table(state: &mut LuaState) {
+        install_finalizable_table_with(state, close_gc_probe);
     }
 
     /// Codex finding 3 on issue #260: `state::close` must run close-time
@@ -6934,6 +6938,94 @@ mod tests {
             CLOSE_GC_RUNS.with(|c| c.get()),
             1,
             "close after a manual run_close_finalizers pass must not double-run __gc"
+        );
+    }
+
+    /// Codex round 2 finding 3 on #260, queue-only half: leftovers parked in
+    /// `to_be_finalized` by a bounded incremental pass must still run at
+    /// close even when `pending` is empty — the old early-return on empty
+    /// `pending` silently dropped them.
+    #[test]
+    fn close_runs_queue_only_finalizer_leftovers() {
+        CLOSE_GC_RUNS.with(|c| c.set(0));
+        let mut state = new_state().expect("state should initialize");
+        install_finalizable_table(&mut state);
+
+        {
+            let mut g = state.global_mut();
+            let pending: Vec<FinalizerObject> = g.finalizers.take_pending();
+            assert!(!pending.is_empty());
+            for object in pending.into_iter().rev() {
+                let heap_ptr = object.heap_ptr();
+                g.finalizers.push_to_be_finalized(object);
+                if let Some(ptr) = heap_ptr {
+                    g.heap.move_finobj_to_tobefnz(ptr);
+                }
+            }
+            assert_eq!(g.finalizers.pending_len(), 0);
+            assert!(g.finalizers.has_to_be_finalized());
+        }
+
+        close(state);
+        assert_eq!(
+            CLOSE_GC_RUNS.with(|c| c.get()),
+            1,
+            "a finalizer parked in to_be_finalized with pending empty must \
+             still run at close"
+        );
+    }
+
+    fn regen_gc_probe(state: &mut LuaState) -> Result<usize, LuaError> {
+        CLOSE_GC_RUNS.with(|c| c.set(c.get() + 1));
+        crate::api::create_table(state, 0, 0)?;
+        crate::api::create_table(state, 0, 1)?;
+        crate::api::push_cclosure(state, close_gc_probe, 0)?;
+        crate::api::set_field(state, -2, b"__gc")?;
+        crate::api::set_metatable(state, -2)?;
+        state.pop();
+        Ok(0)
+    }
+
+    /// Codex round 2 finding 3 on #260, re-registration half: a `__gc` that
+    /// registers a fresh finalizable object during the close drain must have
+    /// that object's finalizer run by a later pass of the both-queue loop
+    /// (once each — the cross-pass seen-set prevents re-running).
+    #[test]
+    fn finalizer_registering_new_finalizable_during_close_runs_it() {
+        CLOSE_GC_RUNS.with(|c| c.set(0));
+        let mut state = new_state().expect("state should initialize");
+        install_finalizable_table_with(&mut state, regen_gc_probe);
+
+        close(state);
+        assert_eq!(
+            CLOSE_GC_RUNS.with(|c| c.get()),
+            2,
+            "regen_gc_probe runs once, and the fresh finalizable it registered \
+             during the drain runs exactly once on a later pass"
+        );
+    }
+
+    /// Codex round 2 finding 5 on #260: `GlobalState::threads` holds
+    /// `Rc<RefCell<LuaState>>` entries whose `.global` is a strong back-edge
+    /// to the `GlobalState` — a live suspended coroutine at close is a
+    /// reference cycle that would keep the heap alive forever after the
+    /// outer state drops. `free_all_objects` must break it.
+    #[test]
+    fn close_with_live_coroutine_lets_heap_drop() {
+        let mut state = new_state().expect("state should initialize");
+        let heap_weak = std::rc::Rc::downgrade(&state.global().heap);
+        {
+            let heap = state.global().heap.clone();
+            let _guard = lua_gc::HeapGuard::push(&heap);
+            new_thread(&mut state, None).expect("coroutine creation");
+        }
+        assert_eq!(state.global().threads.len(), 1);
+
+        close(state);
+        assert!(
+            heap_weak.upgrade().is_none(),
+            "the heap must actually drop once the outer state drops after \
+             close — a lingering threads-map cycle would keep it alive"
         );
     }
 

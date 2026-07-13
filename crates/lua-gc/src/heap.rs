@@ -4876,6 +4876,80 @@ mod tests {
         assert_eq!(heap.bytes_used(), 0);
     }
 
+    /// A `Trace` payload whose `Drop` allocates a fresh box, roots it, and
+    /// invokes minor + full collections mid-drain. Codex round 2 finding 1 on
+    /// #260: with only the barrier path gated, a destructor-run
+    /// `minor_collect` reaches `sweep_young` → `replace_grayagain` and
+    /// re-installs grayagain entries a later drain pass frees — recreating
+    /// the second-`drop_all` UAF. Every collection entry point must be inert
+    /// on a closed heap.
+    struct CollectOnDrop {
+        flag: std::rc::Rc<Cell<bool>>,
+        inner: std::rc::Rc<Cell<bool>>,
+    }
+    struct TrackedRoot(Option<Gc<Tracked>>);
+    impl Trace for TrackedRoot {
+        fn trace(&self, m: &mut Marker) {
+            if let Some(g) = self.0 {
+                m.mark(g);
+            }
+        }
+    }
+    impl Trace for CollectOnDrop {
+        fn trace(&self, _m: &mut Marker) {}
+    }
+    impl Drop for CollectOnDrop {
+        fn drop(&mut self) {
+            self.flag.set(true);
+            with_current_heap(|heap| {
+                if let Some(heap) = heap {
+                    let fresh = heap.allocate(Tracked(DropFlag(self.inner.clone())));
+                    let root = TrackedRoot(Some(fresh));
+                    heap.minor_collect_with_post_mark(&root, |_: &mut Marker| {});
+                    heap.full_collect(&root);
+                    heap.step(&root);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn collections_invoked_by_teardown_destructor_are_inert() {
+        let heap = Heap::new();
+        heap.unpause();
+        let _guard = HeapGuard::push(&heap);
+
+        let outer = std::rc::Rc::new(Cell::new(false));
+        let inner = std::rc::Rc::new(Cell::new(false));
+        let _gc = heap.allocate(CollectOnDrop {
+            flag: outer.clone(),
+            inner: inner.clone(),
+        });
+
+        heap.drop_all();
+        assert!(outer.get(), "the destructor itself must have run");
+        assert!(
+            inner.get(),
+            "the box the destructor allocated must still be drained"
+        );
+        assert_eq!(
+            heap.minor_collections(),
+            0,
+            "a minor collection invoked from a teardown destructor must be inert"
+        );
+        assert_eq!(
+            heap.full_collections(),
+            0,
+            "a full collection invoked from a teardown destructor must be inert"
+        );
+        assert_eq!(heap.grayagain_count(), 0);
+
+        heap.drop_all();
+        assert_eq!(heap.grayagain_count(), 0);
+        assert_eq!(heap.bytes_used(), 0);
+        assert!(!heap.would_collect());
+    }
+
     /// Codex finding 2 on #260, heap-level half: after close, the token
     /// machinery must refuse to mint (0 is never a valid token) and
     /// `contains_allocation` must be unconditionally false, so a post-close
