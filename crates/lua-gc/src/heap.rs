@@ -9,8 +9,9 @@
 //!
 //! - **Gc<T>**: a pointer-sized handle. `Copy + Clone`. Replaces `GcRef<T>`.
 //! - **GcBox<T>**: the heap allocation; contains a header and the value.
-//! - **GcHeader**: per-object metadata (color, age, finalized flag, intrusive
-//!   `next` pointer for exactly one heap owner list, and grayagain revisit link).
+//! - **GcHeader**: per-object metadata (color, age, finalized flag, and an
+//!   intrusive `next` pointer for exactly one heap owner list). The grayagain
+//!   revisit set is heap-owned (`Heap::grayagain`), not an intrusive link.
 //! - **Trace**: trait every GC-rooted type implements. The `trace` method
 //!   walks all `Gc<_>` fields and calls `Marker::mark` on each.
 //! - **Marker**: passed to `trace`; carries the gray queue.
@@ -725,9 +726,13 @@ pub struct GcHeader {
     /// Hot fields read/written by the mark/sweep/barrier loops keep their
     /// own bytes — packing them measurably taxed gc-heavy workloads
     /// (recount 2026-06-10: +4% Ir on gc_pressure). The 64 -> 40 byte diet
-    /// comes from the COLD side instead: the diagnostics-only `type_name`
+    /// came from the COLD side instead: the diagnostics-only `type_name`
     /// fat pointer became a `Trace` method, the three cold bool flags share
-    /// one byte, and the pacer size is u32.
+    /// one byte, and the pacer size is u32. The 40 -> 24 byte diet (#113
+    /// Wave 1) removed the `gray_next` grayagain link entirely — the revisit
+    /// set now lives heap-side as `Heap::grayagain` (a `Vec`), leaving the
+    /// header `color + age + flags + pad + size + next` (24 B on 64-bit,
+    /// 16 B on wasm32).
     color: Cell<Color>,
     age: Cell<GcAge>,
     /// Cold flags, one bit each: finalized (FINALIZEDBIT — set while the
@@ -735,8 +740,8 @@ pub struct GcHeader {
     /// popped for `__gc`), collected (true iff this box is linked into a
     /// heap owner list so it will be swept and its `size` refunded;
     /// `new_uncollected` boxes stay false and must never have buffer bytes
-    /// charged — [`Gc::account_buffer`] no-ops), gray_listed (true while
-    /// linked into the grayagain revisit list).
+    /// charged — [`Gc::account_buffer`] no-ops), gray_listed (true while the
+    /// object has an entry in the heap-side `Heap::grayagain` revisit vector).
     flags: Cell<u8>,
     /// Rough byte size charged to the pacer for this object. Starts at the
     /// `GcBox<T>` size and is adjusted in place by [`Gc::account_buffer`]
@@ -747,8 +752,6 @@ pub struct GcHeader {
     size: Cell<u32>,
     /// Intrusive link into exactly one heap owner list.
     next: Cell<Option<NonNull<GcBox<dyn Trace>>>>,
-    /// Intrusive link into the collector's grayagain-style revisit list.
-    gray_next: Cell<Option<NonNull<GcBox<dyn Trace>>>>,
 }
 
 const HDR_FINALIZED: u8 = 1;
@@ -775,7 +778,6 @@ impl GcHeader {
             flags: Cell::new(flags),
             size: Cell::new(size.min(u32::MAX as usize) as u32),
             next: Cell::new(None),
-            gray_next: Cell::new(None),
         }
     }
 
@@ -1536,10 +1538,22 @@ pub struct Heap {
     last_mark_stats: Cell<MarkerStats>,
     /// Diagnostic counters from the most recent sweep phase.
     last_sweep_stats: Cell<SweepStats>,
-    /// Intrusive grayagain-style list of objects that young collections must
-    /// revisit even if they are not reached through normal roots: OLD0/OLD1
-    /// and touched old objects.
-    grayagain: Cell<Option<NonNull<GcBox<dyn Trace>>>>,
+    /// Heap-owned grayagain revisit set: objects young collections must
+    /// revisit even if they are not reached through normal roots (OLD0/OLD1
+    /// and touched old objects). Non-owning — every entry is a live sweepable
+    /// box, membership is a subset of the live sweepable set, and
+    /// `HDR_GRAY_LISTED` is the O(1) membership/dedup bit. Replaced the
+    /// `GcHeader::gray_next` intrusive link in #113 Wave 1, shrinking every
+    /// object's header by one fat pointer; the `Vec` slot exists only while
+    /// an object is on the revisit list.
+    grayagain: RefCell<Vec<NonNull<GcBox<dyn Trace>>>>,
+    /// Capacity-recycling scratch for [`sweep_young`](Self::sweep_young)'s
+    /// next-revisit builder: the buffer drained from `grayagain` last minor
+    /// is cleared and parked here, then reused as the builder next minor —
+    /// the two buffers swap roles each cycle, so steady-state minors
+    /// allocate nothing (spec rev-3 W1 buffer-reuse requirement). Always
+    /// empty outside `sweep_young`; carries no membership and no flags.
+    grayagain_scratch: RefCell<Vec<NonNull<GcBox<dyn Trace>>>>,
     /// In-progress marker state for incremental cycles. `Some` between
     /// `Propagate` start and `Sweep` start; `None` otherwise.
     marker: RefCell<Option<Marker>>,
@@ -1603,7 +1617,8 @@ impl Heap {
             full_collections: Cell::new(0),
             last_mark_stats: Cell::new(MarkerStats::default()),
             last_sweep_stats: Cell::new(SweepStats::default()),
-            grayagain: Cell::new(None),
+            grayagain: RefCell::new(Vec::new()),
+            grayagain_scratch: RefCell::new(Vec::new()),
             marker: RefCell::new(None),
             marker_pool: RefCell::new(None),
             sweep_prev_next: Cell::new(None),
@@ -2026,75 +2041,84 @@ impl Heap {
         true
     }
 
+    /// Append `ptr` to the grayagain revisit set. `HDR_GRAY_LISTED` is the
+    /// O(1) dedup guard: an already-listed object is a no-op, so the set never
+    /// holds a duplicate (`grayagain_links_object_once` pins this). Tail-append
+    /// replaces the intrusive list's prepend; the two consumers are
+    /// order-insensitive (see `mark_minor_revisit_objects` / `sweep_young`).
     fn remember_minor_revisit(&self, ptr: NonNull<GcBox<dyn Trace>>) {
         let header = self.header_from_ptr(ptr);
         if header.gray_listed() {
             return;
         }
-        header.gray_next.set(self.grayagain.get());
         header.set_gray_listed(true);
-        self.grayagain.set(Some(ptr));
+        self.grayagain.borrow_mut().push(ptr);
     }
 
+    /// Re-mark every grayagain entry at the start of a minor mark. Marking is
+    /// idempotent and deduped by `Marker::visited`, so iteration order affects
+    /// only gray-queue push order, not the reachability fixed point. The short
+    /// immutable borrow is safe: `Marker::mark_box` never re-enters grayagain.
     fn mark_minor_revisit_objects(&self, marker: &mut Marker) {
-        let mut cursor = self.grayagain.get();
-        while let Some(ptr) = cursor {
+        let grayagain = self.grayagain.borrow();
+        for &ptr in grayagain.iter() {
             let header = self.header_from_ptr(ptr);
-            cursor = header.gray_next.get();
             let id = ptr.as_ptr() as *const () as usize;
             marker.mark_box(ptr, header, id);
         }
     }
 
+    /// Empty the grayagain set, clearing each entry's `HDR_GRAY_LISTED` bit.
+    /// `Vec::clear` retains capacity so the buffer is recycled across cycles.
     fn clear_grayagain(&self) {
-        let mut cursor = self.grayagain.get();
-        self.grayagain.set(None);
-        while let Some(ptr) = cursor {
-            let header = self.header_from_ptr(ptr);
-            cursor = header.gray_next.get();
-            header.gray_next.set(None);
-            header.set_gray_listed(false);
+        let mut grayagain = self.grayagain.borrow_mut();
+        for &ptr in grayagain.iter() {
+            self.header_from_ptr(ptr).set_gray_listed(false);
         }
+        grayagain.clear();
     }
 
+    /// Drain the grayagain set to an owned `Vec`, clearing each entry's flag.
+    /// Flags are cleared *after* the `borrow_mut` is released so no owner
+    /// borrow is ever held across the header writes. `sweep_young` feeds the
+    /// returned `Vec` to `OldRevisitTracker` unchanged.
     fn take_grayagain(&self) -> Vec<NonNull<GcBox<dyn Trace>>> {
-        let mut objects = Vec::new();
-        let mut cursor = self.grayagain.get();
-        self.grayagain.set(None);
-        while let Some(ptr) = cursor {
-            let header = self.header_from_ptr(ptr);
-            cursor = header.gray_next.get();
-            header.gray_next.set(None);
-            header.set_gray_listed(false);
-            objects.push(ptr);
+        let objects = std::mem::take(&mut *self.grayagain.borrow_mut());
+        for &ptr in &objects {
+            self.header_from_ptr(ptr).set_gray_listed(false);
         }
         objects
     }
 
+    /// Replace the grayagain set with `objects`: clear the current entries'
+    /// flags, then install `objects` as the new buffer and set their flags.
+    /// `objects` is already dedup'd by its producer (`next_revisit_seen` in
+    /// `sweep_young`), so no membership check is needed here.
     fn replace_grayagain(&self, objects: Vec<NonNull<GcBox<dyn Trace>>>) {
         self.clear_grayagain();
-        for ptr in objects.into_iter().rev() {
-            self.remember_minor_revisit(ptr);
+        for &ptr in &objects {
+            self.header_from_ptr(ptr).set_gray_listed(true);
         }
+        *self.grayagain.borrow_mut() = objects;
     }
 
+    /// Remove `removed` from the grayagain set and clear its flag. Called from
+    /// `correct_generation_pointers` whenever a gray-listed object is unlinked
+    /// from an owner list (full-sweep free, young-sweep free, or a cross-list
+    /// move). Order-preserving `retain`; the borrow is dropped before the box
+    /// can be freed.
     fn unlink_grayagain(&self, removed: NonNull<GcBox<dyn Trace>>) {
-        let keep = self
-            .take_grayagain()
-            .into_iter()
-            .filter(|ptr| !std::ptr::addr_eq(ptr.as_ptr(), removed.as_ptr()))
-            .collect();
-        self.replace_grayagain(keep);
+        self.header_from_ptr(removed).set_gray_listed(false);
+        self.grayagain
+            .borrow_mut()
+            .retain(|ptr| !std::ptr::addr_eq(ptr.as_ptr(), removed.as_ptr()));
     }
 
+    /// Number of objects on the grayagain revisit set. Flag-dedup guarantees
+    /// no duplicates, so this equals the intrusive list's old walk count
+    /// (`grayagain_links_object_once` pins it). Read by lua-cli telemetry.
     pub fn grayagain_count(&self) -> usize {
-        let mut count = 0usize;
-        let mut cursor = self.grayagain.get();
-        while let Some(ptr) = cursor {
-            count += 1;
-            cursor = self.header_from_ptr(ptr).gray_next.get();
-        }
-        count
+        self.grayagain.borrow().len()
     }
 
     /// Record a userdata in the Lua 5.1 collect-time finalizability roster.
@@ -2808,7 +2832,8 @@ impl Heap {
 
     fn sweep_young(&self) {
         let mut freed_bytes = 0usize;
-        let mut next_revisit = Vec::new();
+        let mut next_revisit = std::mem::take(&mut *self.grayagain_scratch.borrow_mut());
+        debug_assert!(next_revisit.is_empty(), "grayagain scratch must be parked empty");
         let mut next_revisit_seen = IdentityHashSet::default();
         let mut firstold1 = None;
         let mut stats = SweepStats::default();
@@ -2876,7 +2901,7 @@ impl Heap {
             processed.finish();
         }
 
-        for ptr in old_revisit {
+        for &ptr in &old_revisit {
             let id = ptr.as_ptr() as *const () as usize;
             if processed
                 .as_ref()
@@ -2904,6 +2929,9 @@ impl Heap {
         if freed_bytes > 0 {
             self.bytes.set(self.bytes.get().saturating_sub(freed_bytes));
         }
+        let mut recycled = old_revisit;
+        recycled.clear();
+        *self.grayagain_scratch.borrow_mut() = recycled;
         self.replace_grayagain(next_revisit);
         self.reallyold.set(old1);
         self.old1.set(new_old1);
@@ -3739,6 +3767,249 @@ mod tests {
         assert_eq!(heap.reallyold.get(), None);
         assert_eq!(heap.firstold1.get(), None);
         assert_eq!(heap.last_sweep_stats().freed, 1);
+    }
+
+    /// W1 deletion invariant (test matrix G3, list-mechanics half): a
+    /// cross-list move of a gray-listed object deletes its grayagain entry and
+    /// clears `HDR_GRAY_LISTED`, via `unlink_from_list` ->
+    /// `correct_generation_pointers` -> `unlink_grayagain`. Covers both the
+    /// `allgc -> finobj` and `tobefnz -> allgc` transitions, and every move
+    /// returns `true` (R1 item 7 sync note). Deterministic; identical on
+    /// pristine and W1 code.
+    #[test]
+    fn cross_list_move_deletes_grayagain_entry() {
+        let heap = Heap::new();
+        heap.unpause();
+        let obj = heap.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        obj.set_age(GcAge::Old1);
+        obj.set_color(Color::Gray);
+        heap.remember_minor_revisit(obj.as_trace_ptr());
+        assert_eq!(heap.grayagain_count(), 1);
+        assert!(heap.header_from_ptr(obj.as_trace_ptr()).gray_listed());
+        assert!(heap.move_allgc_to_finobj(obj.as_trace_ptr()));
+        assert_eq!(
+            heap.grayagain_count(),
+            0,
+            "allgc->finobj move deletes the grayagain entry"
+        );
+        assert!(!heap.header_from_ptr(obj.as_trace_ptr()).gray_listed());
+
+        let heap = Heap::new();
+        heap.unpause();
+        let obj = heap.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        assert!(heap.move_allgc_to_finobj(obj.as_trace_ptr()));
+        assert!(heap.move_finobj_to_tobefnz(obj.as_trace_ptr()));
+        obj.set_age(GcAge::Old1);
+        obj.set_color(Color::Gray);
+        heap.remember_minor_revisit(obj.as_trace_ptr());
+        assert_eq!(heap.grayagain_count(), 1);
+        assert!(heap.move_tobefnz_to_allgc(obj.as_trace_ptr()));
+        assert_eq!(
+            heap.grayagain_count(),
+            0,
+            "tobefnz->allgc move deletes the grayagain entry"
+        );
+        assert!(!heap.header_from_ptr(obj.as_trace_ptr()).gray_listed());
+    }
+
+    /// Test matrix G3 (graph-shaped, baseline-first). Root -> exact-`Old`
+    /// parent (skipped by `Marker::should_trace_age` in a minor) -> a
+    /// gray-listed `Old1` transitional object -> a `New` young child. Moving
+    /// the transitional off `allgc` deletes its grayagain entry (the only
+    /// revisit rooting the child), then a minor runs. This is a pure
+    /// generational-liveness property of *today's* collector that W1 inherits
+    /// unchanged — `correct_generation_pointers`' deletion, `should_trace_age`,
+    /// and the minor mark/sweep are all untouched by W1.
+    ///
+    /// BASELINE (recorded against pristine origin/main, via a throwaway
+    /// worktree, 2026-07-13): the young child is FREED by the minor
+    /// (`allgc_count` 3 -> 2). With the transitional's grayagain entry deleted
+    /// by the move and the parent exact-`Old` (so the minor marker never
+    /// descends into it), nothing re-marks the transitional and its `New`
+    /// child is swept. This is the "reachable young child dying" case the spec
+    /// anticipates (§"Every owner-list move"): a pre-existing latent hole in
+    /// the generational collector, filed as issue #263, NOT a W1 regression and
+    /// NOT something W1 fixes. W1 reproduces the baseline exactly. The test is
+    /// `#[ignore]`d because it asserts the *correct* invariant (child should
+    /// survive), which the pre-existing baseline violates; running it
+    /// (`cargo test -p lua-gc -- --ignored g3_`) documents the live gap. This
+    /// test is the acceptance test for the #263 fix — un-`#[ignore]` it then.
+    #[test]
+    #[ignore = "pre-existing generational-liveness gap (issue #263): reachable \
+                young child dies when a gray-listed transitional is moved \
+                cross-list; identical on pristine and W1 — not a W1 bug"]
+    fn g3_moved_transitional_keeps_young_child_reachable() {
+        let heap = Heap::new();
+        heap.unpause();
+        let child = heap.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        let transitional = heap.allocate(Cell0 {
+            next: Cell::new(Some(child)),
+            marker_calls: Cell::new(0),
+        });
+        let parent = heap.allocate(Cell0 {
+            next: Cell::new(Some(transitional)),
+            marker_calls: Cell::new(0),
+        });
+        parent.set_age(GcAge::Old);
+        parent.set_color(Color::Black);
+        transitional.set_age(GcAge::Old1);
+        transitional.set_color(Color::Gray);
+        heap.remember_minor_revisit(transitional.as_trace_ptr());
+        assert_eq!(heap.grayagain_count(), 1);
+        assert_eq!(heap.allgc_count(), 3);
+
+        assert!(heap.move_allgc_to_finobj(transitional.as_trace_ptr()));
+        assert_eq!(
+            heap.grayagain_count(),
+            0,
+            "cross-list move deletes the grayagain entry"
+        );
+
+        heap.minor_collect_with_post_mark(&OneRoot(Some(parent)), |_| {});
+
+        assert_eq!(
+            heap.allgc_count(),
+            3,
+            "reachable young child should survive the minor"
+        );
+    }
+
+    /// Baseline-preservation pin for the #263 scenario (codex W1 review,
+    /// finding 1): the SAME graph as `g3_moved_transitional_keeps_young_child_
+    /// reachable`, but asserting what the collector does TODAY — the
+    /// reachable young child is freed. Runs in normal CI so any W1-era
+    /// divergence in this scenario is caught immediately. When #263 is fixed,
+    /// this test must be inverted/removed together with un-ignoring G3.
+    #[test]
+    fn g3_baseline_child_freed_after_move_allgc_to_finobj() {
+        let heap = Heap::new();
+        heap.unpause();
+        let child = heap.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        let transitional = heap.allocate(Cell0 {
+            next: Cell::new(Some(child)),
+            marker_calls: Cell::new(0),
+        });
+        let parent = heap.allocate(Cell0 {
+            next: Cell::new(Some(transitional)),
+            marker_calls: Cell::new(0),
+        });
+        parent.set_age(GcAge::Old);
+        parent.set_color(Color::Black);
+        transitional.set_age(GcAge::Old1);
+        transitional.set_color(Color::Gray);
+        heap.remember_minor_revisit(transitional.as_trace_ptr());
+
+        assert!(heap.move_allgc_to_finobj(transitional.as_trace_ptr()));
+        assert_eq!(heap.grayagain_count(), 0);
+
+        heap.minor_collect_with_post_mark(&OneRoot(Some(parent)), |_| {});
+
+        assert_eq!(
+            heap.allgc_count(),
+            2,
+            "baseline (pre-#263-fix): the young child is freed; if this \
+             changes, either #263 was fixed (invert this test and un-ignore \
+             G3) or minor liveness regressed"
+        );
+    }
+
+    /// Baseline-preservation pin, `move_tobefnz_to_allgc` variant (codex W1
+    /// review, finding 1): the transitional travels allgc -> finobj ->
+    /// tobefnz, is re-remembered for revisit there, and the move BACK to
+    /// allgc deletes the entry; the following minor frees the reachable
+    /// young child, same as the finobj variant. Invert together with the
+    /// #263 fix.
+    #[test]
+    fn g3_baseline_child_freed_after_move_tobefnz_to_allgc() {
+        let heap = Heap::new();
+        heap.unpause();
+        let child = heap.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        let transitional = heap.allocate(Cell0 {
+            next: Cell::new(Some(child)),
+            marker_calls: Cell::new(0),
+        });
+        let parent = heap.allocate(Cell0 {
+            next: Cell::new(Some(transitional)),
+            marker_calls: Cell::new(0),
+        });
+        parent.set_age(GcAge::Old);
+        parent.set_color(Color::Black);
+        transitional.set_age(GcAge::Old1);
+        transitional.set_color(Color::Gray);
+
+        assert!(heap.move_allgc_to_finobj(transitional.as_trace_ptr()));
+        assert!(heap.move_finobj_to_tobefnz(transitional.as_trace_ptr()));
+        heap.remember_minor_revisit(transitional.as_trace_ptr());
+        assert_eq!(heap.grayagain_count(), 1);
+
+        assert!(heap.move_tobefnz_to_allgc(transitional.as_trace_ptr()));
+        assert_eq!(
+            heap.grayagain_count(),
+            0,
+            "tobefnz->allgc move deletes the grayagain entry"
+        );
+
+        heap.minor_collect_with_post_mark(&OneRoot(Some(parent)), |_| {});
+
+        assert_eq!(
+            heap.allgc_count(),
+            2,
+            "baseline (pre-#263-fix): the young child is freed after the \
+             tobefnz->allgc move deletes the revisit entry; invert together \
+             with the #263 fix"
+        );
+    }
+
+    /// W1 teardown ordering (test matrix G3 teardown case / drop_all). A
+    /// gray-listed object is present when `drop_all` runs;
+    /// `clear_generation_cursors` -> `clear_grayagain` empties the grayagain
+    /// `Vec` (and clears flags) *before* any `drop_list` frees a box, so no
+    /// grayagain entry can point at a freed box. After teardown the set is
+    /// empty and the heap holds nothing.
+    #[test]
+    fn drop_all_clears_grayagain_before_freeing() {
+        let heap = Heap::new();
+        heap.unpause();
+        let obj = heap.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        obj.set_age(GcAge::Old);
+        heap.generational_backward_barrier(obj);
+        assert_eq!(heap.grayagain_count(), 1);
+
+        heap.drop_all();
+
+        assert_eq!(heap.grayagain_count(), 0);
+        assert_eq!(heap.allgc_count(), 0);
+    }
+
+    /// Header-size regression for #113 Wave 1. Removing the `gray_next`
+    /// grayagain fat pointer shrinks `GcHeader` from **40 B to 24 B on
+    /// 64-bit** (`color + age + flags + pad + size(u32) + next(16)`), align 8.
+    /// The wasm32 figure is 24 -> 16 B (an 8-B fat pointer), but that is NOT
+    /// asserted here — a native test cannot observe the wasm32 layout, so the
+    /// assertion is gated to 64-bit targets; the wasm32 size is pinned by the
+    /// W2 `const` assert per the spec.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn gcheader_is_24_bytes_after_grayagain_diet() {
+        assert_eq!(std::mem::size_of::<GcHeader>(), 24);
     }
 
     #[test]
