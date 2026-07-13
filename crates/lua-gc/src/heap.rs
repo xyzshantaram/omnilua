@@ -4618,6 +4618,108 @@ mod tests {
             "after end_bootstrap, an unreachable allocation must be swept normally"
         );
     }
+
+    // ── issue #260: deterministic close — drain-until-stable drop_all + closed flag ──
+
+    /// A `Trace` payload whose `Drop` flips its flag and then allocates a
+    /// fresh drop-flag box into the currently-active heap. Exercises
+    /// `drop_all`'s drain-until-stable loop: a destructor that allocates
+    /// mid-teardown must have its box freed by a later pass, not stranded.
+    struct AllocOnDrop {
+        flag: std::rc::Rc<Cell<bool>>,
+        inner: std::rc::Rc<Cell<bool>>,
+    }
+    impl Trace for AllocOnDrop {
+        fn trace(&self, _m: &mut Marker) {}
+    }
+    impl Drop for AllocOnDrop {
+        fn drop(&mut self) {
+            self.flag.set(true);
+            with_current_heap(|heap| {
+                if let Some(heap) = heap {
+                    let _ = heap.allocate(Tracked(DropFlag(self.inner.clone())));
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn close_frees_objects_while_outer_guard_alive() {
+        let heap = Heap::new();
+        heap.unpause();
+        let guard = HeapGuard::push(&heap);
+
+        let dropped = std::rc::Rc::new(Cell::new(false));
+        let _gc = heap.allocate(Tracked(DropFlag(dropped.clone())));
+        assert!(!dropped.get());
+
+        heap.drop_all();
+        assert!(
+            dropped.get(),
+            "drop_all must run the object's destructor during the close call, \
+             while the outer guard is still alive"
+        );
+        assert!(heap.is_closed());
+        assert_eq!(heap.bytes_used(), 0);
+        drop(guard);
+    }
+
+    #[test]
+    #[should_panic(expected = "closed heap")]
+    fn allocate_into_closed_heap_panics() {
+        let heap = Heap::new();
+        heap.unpause();
+        let _guard = HeapGuard::push(&heap);
+        heap.drop_all();
+        let _ = heap.allocate(Tracked(DropFlag(std::rc::Rc::new(Cell::new(false)))));
+    }
+
+    #[test]
+    fn destructor_allocating_during_teardown_does_not_leak() {
+        let heap = Heap::new();
+        heap.unpause();
+        let _guard = HeapGuard::push(&heap);
+
+        let outer = std::rc::Rc::new(Cell::new(false));
+        let inner = std::rc::Rc::new(Cell::new(false));
+        let _gc = heap.allocate(AllocOnDrop {
+            flag: outer.clone(),
+            inner: inner.clone(),
+        });
+
+        heap.drop_all();
+        assert!(outer.get(), "the destructor itself must have run");
+        assert!(
+            inner.get(),
+            "the box the destructor allocated mid-teardown must be freed by a \
+             later drain pass, not leaked"
+        );
+        assert_eq!(heap.bytes_used(), 0);
+    }
+
+    #[test]
+    fn weak_handles_dead_immediately_after_close() {
+        let heap = Heap::new();
+        heap.unpause();
+        let _guard = HeapGuard::push(&heap);
+
+        let gc = heap.allocate(Tracked(DropFlag(std::rc::Rc::new(Cell::new(false)))));
+        let identity = gc.identity();
+        let token = heap.register_allocation_token(identity);
+        let weak = HeapRef::from_heap(&heap);
+        assert!(
+            weak.contains_allocation(identity, token),
+            "weak handle upgrades while the box is live"
+        );
+
+        heap.drop_all();
+
+        assert!(
+            !weak.contains_allocation(identity, token),
+            "weak handle must fail to upgrade the instant close clears the \
+             allocation tokens, while the heap Rc is still alive"
+        );
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

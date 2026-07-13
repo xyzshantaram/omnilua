@@ -6799,6 +6799,38 @@ mod tests {
         assert!(state.global().external_roots.is_empty());
     }
 
+    /// Issue #260 repro at the VM surface: `free_all_objects` (the body of
+    /// `close_state`) must free heap objects and invalidate a pre-existing
+    /// `GcWeak` immediately, with an outer `HeapGuard` and a strong `Rc<Heap>`
+    /// both still alive — proving the weak dies because close cleared the
+    /// allocation tokens, not because the heap `Rc` was dropped.
+    #[test]
+    fn free_all_objects_kills_weak_handle_while_guard_and_heap_alive() {
+        let mut state = new_state().expect("state should initialize");
+        let heap_rc = state.global().heap.clone();
+        let guard = lua_gc::HeapGuard::push(&heap_rc);
+
+        let table = state.new_table();
+        let weak = table.downgrade();
+        assert!(
+            weak.upgrade().is_some(),
+            "weak handle upgrades while the table is live"
+        );
+
+        state.gc().free_all_objects();
+
+        assert!(
+            weak.upgrade().is_none(),
+            "free_all_objects must free the table and drop its weak token during \
+             the close call, with the outer HeapGuard and a strong heap Rc still alive"
+        );
+        assert!(state.global().heap.is_closed());
+        assert!(std::rc::Rc::strong_count(&heap_rc) >= 1);
+
+        drop(guard);
+        drop(state);
+    }
+
     #[test]
     fn interned_string_table_grows_then_shrinks_on_collection() {
         let mut state = new_state().expect("state should initialize");
