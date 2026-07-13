@@ -3839,13 +3839,11 @@ impl LuaState {
         t.resize(self, na, nh)
     }
     pub fn table_getn(&self, t: &GcRef<LuaTable>) -> i64 {
-        // PORT NOTE: C's `luaH_getn` returns a boundary i such that t[i] is
-        // present and t[i+1] is absent (or 0 if t[1] is absent), exploiting the
-        // hybrid array+hash layout. Phase B's LuaTable (lua-types/src/value.rs)
-        // is a flat Vec<(K,V)> with no array part, so we linearly probe integer
-        // keys starting at 1. The rich array+hash impl in
-        // crates/lua-vm/src/table.rs lights up in Phase D.
-        // PERF(port): O(n) linear scan with O(n) lookups → O(n²); Phase D fixes.
+        // C's `luaH_getn` returns a boundary i such that t[i] is present and
+        // t[i+1] is absent (or 0 if t[1] is absent), found via a binary or
+        // unbound search over the array part. This instead walks integer
+        // keys linearly from 1 — each `get_int` call is O(1), but the walk
+        // itself is O(n) in the boundary rather than C's O(log n).
         let mut i: i64 = 1;
         loop {
             let v = t.get_int(i);
@@ -4193,11 +4191,9 @@ impl LuaState {
     pub fn gc_barrier_upval(&mut self, uv: &GcRef<UpVal>, v: &LuaValue) {
         self.gc().barrier(uv, v);
     }
-    ///
-    /// Phase E-1: compares `GlobalState::current_thread_id` against
-    /// `main_thread_id`. Coroutine resume (slice 02b) is what will swap
-    /// `current_thread_id` in and out; until then the running thread is
-    /// always the main thread and this returns `true`.
+    /// Compares `GlobalState::current_thread_id` against `main_thread_id`;
+    /// `false` while a coroutine resume has swapped `current_thread_id` to
+    /// the child's id.
     pub fn is_main_thread(&mut self) -> bool {
         let g = self.global();
         g.current_thread_id == g.main_thread_id
@@ -5131,7 +5127,8 @@ impl<'a> GcHandle<'a> {
         true
     }
 
-    /// Phase-B stub for `luaC_step(L)`.
+    /// No-op stub for `luaC_step(L)`; unused. See [`GcHandle::check_step`]
+    /// for the real incremental-collection entry point.
     pub fn step(&self) { /* phase-b no-op */
     }
 
@@ -5488,7 +5485,10 @@ impl<'a> GcHandle<'a> {
         }
     }
 
-    /// Phase-B stub for `luaC_fix(L, o)` — pin an object so GC won't collect it.
+    /// No-op stub for `luaC_fix(L, o)` (pin an object so GC won't collect
+    /// it). Called from `tagmethods.rs` for interned tag-method name
+    /// strings, which stay alive via the traced `GlobalState::tmname` root
+    /// instead.
     pub fn fix_object<T: lua_gc::Trace + 'static>(&self, _o: &GcRef<T>) { /* phase-b no-op */
     }
 
