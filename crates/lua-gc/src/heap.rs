@@ -3822,15 +3822,16 @@ mod tests {
     /// descends into it), nothing re-marks the transitional and its `New`
     /// child is swept. This is the "reachable young child dying" case the spec
     /// anticipates (§"Every owner-list move"): a pre-existing latent hole in
-    /// the generational collector, filed separately, NOT a W1 regression and
+    /// the generational collector, filed as issue #263, NOT a W1 regression and
     /// NOT something W1 fixes. W1 reproduces the baseline exactly. The test is
     /// `#[ignore]`d because it asserts the *correct* invariant (child should
     /// survive), which the pre-existing baseline violates; running it
-    /// (`cargo test -p lua-gc -- --ignored g3_`) documents the live gap.
+    /// (`cargo test -p lua-gc -- --ignored g3_`) documents the live gap. This
+    /// test is the acceptance test for the #263 fix — un-`#[ignore]` it then.
     #[test]
-    #[ignore = "pre-existing generational-liveness gap: reachable young child \
-                dies when a gray-listed transitional is moved cross-list; \
-                identical on pristine and W1 — filed separately, not a W1 bug"]
+    #[ignore = "pre-existing generational-liveness gap (issue #263): reachable \
+                young child dies when a gray-listed transitional is moved \
+                cross-list; identical on pristine and W1 — not a W1 bug"]
     fn g3_moved_transitional_keeps_young_child_reachable() {
         let heap = Heap::new();
         heap.unpause();
