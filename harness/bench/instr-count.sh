@@ -88,6 +88,17 @@ TSV="$OUT_DIR/${TS}-${COMMIT}-${LABEL}.tsv"
 docker build -q -t "$IMG" "$ROOT/harness/bench/instr" >/dev/null
 docker volume create "$VOL" >/dev/null
 
+# Cross-commit A/B safety: the cache volume persists cargo's mtime-based
+# fingerprints across invocations, and a fresh worktree checkout is often
+# OLDER than the previous side's cached build — cargo then silently skips
+# the rebuild and this script measures the WRONG binary (caught 2026-07-13:
+# a B-side run reproduced A's Ir to 0.00025% because it re-ran A's binary).
+# Touching the sources forces fingerprint invalidation; the rebuild cost is
+# the price of a valid measurement. Opt out only for same-tree re-runs.
+if [ "${NO_TOUCH:-no}" != "yes" ]; then
+    find "$ROOT/crates" -name '*.rs' -exec touch {} +
+fi
+
 DIRTY="no"
 [ -n "$(git status --porcelain 2>/dev/null)" ] && DIRTY="yes"
 

@@ -26,6 +26,7 @@ export CARGO_HOME=/cache/cargo
 echo "[inside] building lua-rs (release, linux)" >&2
 cargo build --release --manifest-path /src/Cargo.toml -p omnilua-cli -q
 RS_BIN="$CARGO_TARGET_DIR/release/omnilua"
+printf '# rs_bin_sha256: %s\n' "$(sha256sum "$RS_BIN" | cut -d' ' -f1)"
 
 if ! /cache/luaref/src/lua -v >/dev/null 2>&1; then
     echo "[inside] building reference C lua (posix)" >&2
