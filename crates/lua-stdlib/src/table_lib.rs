@@ -933,24 +933,3 @@ pub fn open_table(state: &mut LuaState) -> Result<usize, LuaError> {
     }
     Ok(1)
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   target_crate:  lua-stdlib
-//   unsafe_blocks: 0
-//   deferred:      check_tab leaves the stack dirty on its failure path (C's
-//                  longjmp unwinds it; here the LuaError propagates and the
-//                  frame is torn down, so the leak is behaviorally inert). The
-//                  insert/remove version-gated bounds checks and the sort
-//                  quicksort core (partition/aux_sort/sort_comp/choosePivot) are
-//                  LOAD-BEARING: extract/rename only, never refactor.
-//   net:           behavior is pinned by the behavioral suite — multiversion
-//                  oracle (the P2b __len/pack/unpack/move/remove-gate/sort
-//                  assertions), sort.lua + nextvar.lua, check.sh 5.1-5.5. The
-//                  partition-internal comparator-callback-during-GC safety is
-//                  NOT behaviorally observable; see GRADUATED.md "table".
-//   perf:          remove()/insert() shift loops cache the table value once
-//                  (value_at) and use table_get_i_value/table_set_i_value,
-//                  bypassing per-iteration index_to_value (table_ops_long
-//                  ~4.76x -> ~4.02x vs reference).
-// ──────────────────────────────────────────────────────────────────────────────

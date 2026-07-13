@@ -1015,37 +1015,3 @@ pub fn open_coroutine(state: &mut LuaState) -> Result<usize, LuaError> {
     }
     Ok(1)
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   target_crate:  lua-stdlib
-//   unsafe_blocks: 0
-//   load-bearing:  this module is the cold shell — arg checking, the COS_*
-//                  status mapping, the wrap closure, the cross-thread
-//                  argument/result transfer scaffolding, and version-gated
-//                  registration. The resume/yield CONTROL TRANSFER (stack save
-//                  and restore) lives in lua-vm (lua_vm::do_::lua_resume /
-//                  lua_yieldk) and is load-bearing; so are the cross-thread
-//                  rooting machinery (RootedThreadBorrow, the resume-pool
-//                  buffers, the GC stack snapshots), the LuaThreadClose
-//                  panic-unwind that implements 5.5 self-close, and every
-//                  version gate.
-//   net:           behavior is pinned by tests/coro_strengthen.rs (the version
-//                  seams), the official coroutine.lua suite, multiversion
-//                  oracle, and check.sh 5.1-5.5. See GRADUATED.md "coroutine".
-//   version-gated: get_co/thread_arg_error emit the calling function's name and
-//                  the per-version "expected" body (coroutine vs thread, with vs
-//                  without ", got <type>"). co_create rejects C-function bodies
-//                  on 5.1 only ("Lua function expected").
-//   known-gap:     the 5.1 yield-from-outside / yield-across-C-call wording is
-//                  "attempt to yield across metamethod/C-call boundary" in the
-//                  reference but "attempt to yield from outside a coroutine"
-//                  here — the message originates in lua-vm's lua_yieldk (a
-//                  cross-cutting yield guard, not this module). NOT fixed here:
-//                  the single-source fix is a version gate in lua-vm/src/do_.rs.
-//   known-gap:     a 5.1 arg error raised through pcall (no resolvable namewhat)
-//                  names '?' in the reference but the qualified function here
-//                  ('coroutine.resume', 'coroutine.create', ...). Single-source
-//                  fix is to gate lua-vm arg_error_impl's find_func_name_in_loaded
-//                  fallback off for V51 (same gap hits base/math arg errors).
-// ──────────────────────────────────────────────────────────────────────────────

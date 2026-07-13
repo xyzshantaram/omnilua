@@ -528,20 +528,3 @@ pub(crate) fn dump(
 
     Ok(())
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/ldump.c  (230 lines, 10 functions)
-//   target_crate:  lua-vm
-//   confidence:    medium
-//   todos:         4
-//   port_notes:    12
-//   unsafe_blocks: 0
-//   notes:         Types/imports need Phase B wiring; logic should be faithful.
-//                  Key uncertainties: (1) Instruction newtype inner-field access (.0 vs
-//                  method); (2) UpvalDesc.name optionality; (3) GcRef::ptr_eq method
-//                  existence. Lineinfo bulk-write is done via collect()+dump_block to
-//                  avoid unsafe transmute of &[i8] → &[u8]; revisit with bytemuck in
-//                  Phase B for performance. Native-endian serialisation via to_ne_bytes()
-//                  matches C's raw-memory dumpVector behaviour.
-// ────────────────────────────────────────────────────────────────────────────

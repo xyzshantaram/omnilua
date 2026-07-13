@@ -61,18 +61,3 @@ pub trait LuaFileHandle: Send {
         Ok(())
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        (new abstraction — not a direct port of a C file)
-//   target_crate:  lua-types
-//   confidence:    high
-//   todos:         0
-//   port_notes:    0
-//   unsafe_blocks: 0
-//   notes:         Introduced in Phase B to break the dependency cycle that
-//                  would arise if `lua-vm` tried to use `LuaFileOps` from
-//                  `lua-stdlib`. The concrete `FsFile` implementation in
-//                  `lua-cli` implements this trait; `LuaFileOps` in
-//                  `lua-stdlib` is a type alias for this same trait.
-// ──────────────────────────────────────────────────────────────────────────

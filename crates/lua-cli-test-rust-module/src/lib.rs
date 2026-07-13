@@ -45,18 +45,3 @@ pub fn rust_open(state: &mut LuaState) -> Result<usize, LuaError> {
 pub extern "C" fn luaopen_test() -> i32 {
     0
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        (test fixture; no C origin)
-//   target_crate:  lua-cli-test-rust-module
-//   confidence:    high
-//   todos:         0
-//   port_notes:    0
-//   unsafe_blocks: 0
-//   notes:         cdylib exporting a single Rust-native symbol used by the
-//                  Phase D-3.5 dynlib_*_hook acceptance test. Builds against
-//                  the same lua-vm/lua-types as the host so the
-//                  `fn(&mut LuaState) -> Result<usize, LuaError>` ABI is
-//                  identical on both sides.
-// ──────────────────────────────────────────────────────────────────────────

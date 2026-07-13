@@ -331,22 +331,3 @@ impl ZIO {
         Ok(0)
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/lzio.c  (68 lines, 3 functions)
-//                  src/lzio.h  (66 lines, merged)
-//   target_crate:  lua-vm
-//   confidence:    medium
-//   todos:         1
-//   port_notes:    4
-//   unsafe_blocks: 0   (must be 0 outside explicit unsafe-budget crates)
-//   notes:         Logic is faithful.  The one open question (TODO) is whether
-//                  concrete reader callbacks will need `&mut LuaState` as a
-//                  parameter when load/dofile lands in Phase B.  If so,
-//                  `ZIO::reader`, `fill`, `getc`, and `read` all need a
-//                  threading change.  `LexBuffer::resize` stubs OOM handling
-//                  (real allocator wiring is Phase D).  Import paths for
-//                  `LuaState` and `LuaError` will require crate-graph fixes
-//                  in Phase B.
-// ──────────────────────────────────────────────────────────────────────────────

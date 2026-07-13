@@ -2735,32 +2735,3 @@ pub fn upvalue_join(state: &mut LuaState, fidx1: i32, n1: i32, fidx2: i32, n2: i
         state.gc().obj_barrier(lcl1, &shared);
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/lapi.c  (1464 lines, ~47 functions)
-//   target_crate:  lua-vm
-//   confidence:    low
-//   todos:         18
-//   port_notes:    8
-//   unsafe_blocks: 0   (must be 0 outside explicit unsafe-budget crates)
-//   notes:         Heavy use of interior mutability TODOs (GcRef writes for
-//                  metatables, upvalue writes, userdata uv writes). The
-//                  index2value helper returns cloned LuaValue not a pointer,
-//                  so write-back paths that C achieves with TValue* are
-//                  stubbed. Stack pointer arithmetic faithfully translated to
-//                  StackIdx (u32) arithmetic. va_list functions (pushvfstring,
-//                  pushfstring) replaced by &[u8] forwarders. lua_gc varargs
-//                  replaced by explicit GcArgs enum. Raw pointer returns
-//                  (topointer, touserdata, upvalueid) return Option<usize>
-//                  identity values; actual *mut void only legal in lua-gc.
-//                  lua_pushthread stubbed (needs self_gcref()), lua_xmove
-//                  stubbed (split-borrow), upvalue_join stubbed (GcRef write).
-//                  Phase B must wire up: state.grow_stack, state.call_no_yield,
-//                  state.protected_call_raw, state.adjust_results,
-//                  state.table_get_with_tm, state.table_set_with_tm,
-//                  state.arith_op, state.concat, state.obj_len,
-//                  state.obj_to_string, state.str_to_num, state.table_getn,
-//                  state.registry_value, state.registry_get,
-//                  GcRef::identity, GcRef::ptr_eq, GlobalState GC accessors.
-// ──────────────────────────────────────────────────────────────────────────

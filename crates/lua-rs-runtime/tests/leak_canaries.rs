@@ -183,18 +183,3 @@ fn embedding_lifecycle_is_steady_state() {
         lua.load("collectgarbage('collect')").exec().unwrap();
     });
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        n/a (harness artifact — embedding-lifecycle leak oracle)
-//   target_crate:  omnilua (integration test)
-//   confidence:    high
-//   todos:         0
-//   port_notes:    0
-//   unsafe_blocks: 4
-//   notes:         Counting #[global_allocator] wrapper (4 delegating unsafe
-//                  fns, each // SAFETY-commented) + steady-state assertions
-//                  over create/drop, chunk, coroutine, and callback churn.
-//                  The detached_allocations() delta assertion is the
-//                  permanent tripwire for the issue #249 bug class.
-// ──────────────────────────────────────────────────────────────────────────────

@@ -121,14 +121,3 @@ mod tests {
         assert_eq!(OPNAMES[OP_COUNT - 1], "GETVARG");
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/lopnames.h (103 lines, 1 static array)
-//   target_crate:  lua-code
-//   confidence:    high
-//   todos:         0
-//   port_notes:    1   (dropped NULL sentinel — Rust length is exact)
-//   unsafe_blocks: 0
-//   notes:         opcode name table only; OpCode enum lands separately
-// ──────────────────────────────────────────────────────────────────────────

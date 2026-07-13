@@ -1185,17 +1185,3 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Thread(_) => "thread",
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        (no C analog — Rust-native serde integration)
-//   target_crate:  omnilua
-//   confidence:    high
-//   todos:         0
-//   port_notes:    0
-//   unsafe_blocks: 0
-//   notes:         serde Serializer/Deserializer over Value; mirrors mlua's
-//                  LuaSerdeExt. Pure additive layer on the public Value/Table
-//                  API; integer lowering reuses lower_host_int. Feature-gated
-//                  behind `serde`.
-// ──────────────────────────────────────────────────────────────────────────

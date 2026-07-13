@@ -12,15 +12,3 @@ impl Instruction {
         self.0
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/lopcodes.h, src/lopcodes.c
-//   target_crate:  lua-types
-//   confidence:    high
-//   todos:         0
-//   port_notes:    0
-//   unsafe_blocks: 0
-//   notes:         OpCode enum + Instruction word layout. Mirrors C's opcode numbering and
-//                  the iABC/iABx/iAsBx/iAx/isJ encoding macros.
-// ──────────────────────────────────────────────────────────────────────────────

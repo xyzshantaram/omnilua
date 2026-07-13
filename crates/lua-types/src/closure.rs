@@ -91,19 +91,3 @@ impl LuaCClosure {
         self.upvalues.borrow().capacity() * std::mem::size_of::<LuaValue>()
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/lobject.h (CClosure / LClosure / Closure union)
-//   target_crate:  lua-types
-//   confidence:    high
-//   todos:         0
-//   port_notes:    0
-//   unsafe_blocks: 0
-//   notes:         LuaClosure enum covering the C-Lua C/LightC/Lua closure variants.
-//                  C uses a union with a common header; we use a tagged enum.
-//                  LuaLClosure.upvals uses Cell<GcRef<UpVal>> (not RefCell) so per-
-//                  upvalue reads avoid borrow-tracking; GcRef<UpVal> is Copy. The
-//                  upvals slice is Box<[_]> (fixed count, never resized after
-//                  construction), making LuaLClosure 24 bytes on 64-bit.
-// ──────────────────────────────────────────────────────────────────────────────

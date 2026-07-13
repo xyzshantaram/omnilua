@@ -675,27 +675,3 @@ fn intern_short_str(state: &mut LuaState, bytes: &[u8]) -> Result<GcRef<LuaStrin
 //   ... (full list in PORTING.md §6)
 // For now, reference LuaError as an opaque import from the future lua-types crate.
 use lua_types::LuaError;
-
-// ──────────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/lstring.c  (275 lines, 15 functions)
-//                  src/lstring.h  (57 lines; merged)
-//   target_crate:  lua-vm
-//   confidence:    medium
-//   todos:         14
-//   port_notes:    30
-//   unsafe_blocks: 0   (must be 0 outside explicit unsafe-budget crates)
-//   notes:         Logic is faithful to the C.  The two largest structural changes
-//                  are: (1) `tablerehash` + intrusive `hnext` chain replaced by
-//                  `HashMap` in `StringPool`; (2) `luaS_new`'s `point2uint`
-//                  pointer-hash replaced by a content hash (safe, same semantics).
-//                  Key TODOs: GC registration in create_str_obj (Phase D),
-//                  GC registration in new_userdata (Phase D), luaC_fix in init
-//                  (Phase D), full_collect stub in grow_str_tab (Phase D),
-//                  udatamemoffset size check in new_userdata (Phase B),
-//                  LuaValue in LuaUserData.uv (Phase B), LuaError import path
-//                  (Phase B), GcRef typedef (Phase B).  Phase B priority: wire
-//                  import paths for LuaState, GlobalState, LuaError, LuaValue,
-//                  and move LuaStringImpl/StringPool/LuaUserData to their canonical
-//                  modules (object.rs / state.rs).
-// ──────────────────────────────────────────────────────────────────────────────

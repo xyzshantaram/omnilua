@@ -644,15 +644,3 @@ pub fn open_utf8(state: &mut LuaState) -> Result<usize, LuaError> {
 
     Ok(1)
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   target_crate:  lua-stdlib
-//   unsafe_blocks: 0
-//   load-bearing:  the utf8_decode continuation-byte loop and the
-//                  encode_utf8_codepoint backward-fill — bit-exact arithmetic,
-//                  only the validity ceiling is version-split (DecodeMode).
-//   net:           utf8.lua (official 5.4), multiversion_oracle, and the
-//                  lua-stdlib utf8_strengthen tests (the 5.3-vs-5.4+ decode
-//                  seam), plus check.sh 5.1-5.5. See GRADUATED.md "utf8".
-// ──────────────────────────────────────────────────────────────────────────

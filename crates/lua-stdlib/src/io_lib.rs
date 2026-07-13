@@ -1686,28 +1686,3 @@ pub fn luaopen_io(state: &mut LuaState) -> Result<usize, LuaError> {
     create_std_file(state, StdFileKind::Stderr, None, b"stderr")?;
     Ok(1)
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   target_crate:  lua-stdlib
-//   unsafe_blocks: 0
-//   deferred:      genuine deferred behavior (NOT stale scaffolding): close does
-//                  not surface a close-time I/O error as a failure tuple;
-//                  io.popen does not wait on the child for its real exit status;
-//                  f_tostring prints `0x?` rather than the handle's real (non-
-//                  deterministic) pointer address; number reading uses `.` for
-//                  the decimal point (omnilua is locale-independent).
-//   load-bearing:  the host capability hooks (file_open/popen/stdout/stderr/
-//                  temp_name) and the `wasm32` cfg gates — io is impure, and
-//                  these are the only path to the OS; idiomatize AROUND them.
-//                  The `LSTREAM_REGISTRY` side-table + Rc<RefCell<LStream>>
-//                  borrow-split is the deliberate safe-Rust resolution of C's
-//                  single `LStream *` and must not be "simplified" into payload
-//                  storage.
-//   net:           the deterministic read-format / `*`-prefix-seam / closed-file
-//                  / io.type surface is pinned by tests/io_strengthen.rs against
-//                  the reference binaries; whole-program behavior by the official
-//                  files.lua suite + check.sh 5.1-5.5. Host-specific I/O results
-//                  (OS error text, pointer addresses) are not reproducible and
-//                  are intentionally not pinned. See GRADUATED.md "io".
-// ──────────────────────────────────────────────────────────────────────────────

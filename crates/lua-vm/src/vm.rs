@@ -3802,21 +3802,3 @@ fn return1_hook(
     *trap = true;
     Ok(())
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/lvm.c  (1899 lines, 32 functions)
-//   target_crate:  lua-vm
-//   confidence:    medium
-//   todos:         6
-//   port_notes:    4
-//   unsafe_blocks: 0   (must be 0 outside explicit unsafe-budget crates)
-//   notes:         All opcode handlers and helpers translated; LuaState methods
-//                  referenced (fast_get, precall, poscall, etc.) are stubs that
-//                  Phase B will land.  The execute() goto flow is modelled with
-//                  labelled Rust loops ('startfunc/'returning/'dispatch).
-//                  str_to_number is a stub pending luaO_str2num port (TODO #1).
-//                  strcoll replaced with byte-lexicographic order (TODO #2).
-//                  order_imm_op uses LuaValue as a stand-in for GcRef<LuaClosure>
-//                  (TODO #3).  ClosureRef type alias not yet defined (TODO #4-6).
-// ──────────────────────────────────────────────────────────────────────────

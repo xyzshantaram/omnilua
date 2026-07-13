@@ -4979,17 +4979,3 @@ mod tests {
         );
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        production Rust heap/collector substrate
-//   target_crate:  lua-gc
-//   confidence:    medium
-//   todos:         0
-//   port_notes:    0
-//   unsafe_blocks: 13
-//   notes:         Mark-and-sweep collector heap + the Gc<T> raw-pointer substrate. Uses
-//                  NonNull<GcBox<T>> with linked-list allgc walking; unsafe is
-//                  required for raw pointer ops and Box::into_raw/from_raw. See
-//                  unsafe-budgets.toml for the per-crate ceiling.
-// ──────────────────────────────────────────────────────────────────────────────

@@ -1089,23 +1089,3 @@ pub(crate) fn undump(
 
     Ok(cl_ref)
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/lundump.c  (335 lines, 20 functions/items)
-//                  src/lundump.h  (35 lines, merged)
-//   target_crate:  lua-vm
-//   confidence:    medium
-//   todos:         15
-//   port_notes:    39
-//   unsafe_blocks: 0   (must be 0 outside explicit unsafe-budget crates)
-//   notes:         Logic is faithful to the C.  The main open items for Phase B
-//                  are: (1) import paths for GcRef/LuaProto/LuaClosure/etc.;
-//                  (2) LuaError::syntax byte-string formatting for the chunk
-//                  name in load_error; (3) long-string vs short-string intern
-//                  distinction in load_string_n; (4) the stack placeholder in
-//                  undump must be replaced with the real GcRef<LuaLClosure>
-//                  value once LuaValue conversion is defined; (5) UpvalDesc.name
-//                  and LocalVar.varname need Option<GcRef<LuaString>> in the
-//                  proto type to match the two-pass load order here.
-// ──────────────────────────────────────────────────────────────────────────

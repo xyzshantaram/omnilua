@@ -1108,27 +1108,3 @@ pub fn open_os(state: &mut LuaState) -> Result<usize, LuaError> {
     state.register_lib(b"os", OS_LIB)?;
     Ok(1)
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/loslib.c
-//   target_crate:  lua-stdlib
-//   confidence:    high
-//   todos:         0 stale scaffolding (the Phase-A "needs libc/chrono in
-//                  Phase B" notes were false — date/time is complete pure Rust)
-//   port_notes:    the genuine per-version-behavior and correctness reasons are
-//                  kept in-place (version gates in get_field/os_time/os_date,
-//                  the Hinnant algorithm notes, the local-offset hook mechanism,
-//                  the time_t==i64 representability no-op)
-//   unsafe_blocks: 0  (no libc/strftime bridge — gmtime_r/mktime/strftime are
-//                  replaced by pure-Rust Hinnant algorithms + strftime_one)
-//   notes:         Idiomatization Sprint 2 / Phase 2 (cold module, no perf
-//                  arbiter). The deterministic date/time surface is pinned by
-//                  tests/os_strengthen.rs, which caught four version
-//                  divergences (5.1/5.2 field validation, 5.1/5.2/5.3 missing-
-//                  field order, 5.1 specifier validation) fixed here. The impure
-//                  surface (getenv/tmpname/remove/rename/execute/exit, os.clock,
-//                  os.time's absolute value, locale/zone specifiers) routes
-//                  through host hooks; only its arg-handling/error-shape is
-//                  pinned, never its effects. See GRADUATED.md "os".
-// ──────────────────────────────────────────────────────────────────────────

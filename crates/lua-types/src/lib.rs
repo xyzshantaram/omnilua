@@ -114,16 +114,3 @@ pub enum LuaType {
 impl LuaType {
     pub const NUM_TYPES: usize = 9;
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        (foundation — designed in Phase B, not ported from .c)
-//   target_crate:  lua-types
-//   confidence:    high
-//   todos:         many — submodule impls are stubs
-//   port_notes:    0
-//   unsafe_blocks: 0
-//   notes:         shapes match what Phase A files reference. Method bodies
-//                  panic with todo!() / unimplemented!(); compile-fixer
-//                  iterations will land real impls.
-// ──────────────────────────────────────────────────────────────────────────

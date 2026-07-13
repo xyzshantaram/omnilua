@@ -1329,29 +1329,3 @@ pub fn luaopen_package(state: &mut LuaState) -> Result<usize, LuaError> {
 
     Ok(1)
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   target_crate:  lua-stdlib
-//   unsafe_blocks: 0  (the dlopen/dlsym FFI lives in lua-cli, behind the
-//                  dynlib_*_hook indirection on GlobalState; this crate stays
-//                  unsafe-free per its `unsafe_code = "forbid"`)
-//   deferred:      two genuine TODOs — LUA_VERSUFFIX / LUA_PATH_DEFAULT /
-//                  LUA_CPATH_DEFAULT are hardcoded for 5.4 rather than tracking
-//                  the selected version + a platform install prefix; the Windows
-//                  setprogdir LUA_EXEC_DIR substitution is unimplemented.
-//   notes:         Idiomatization Sprint 2 / Phase 2 (cold module, no perf
-//                  arbiter). The deterministic pure-Lua surface (package.config,
-//                  require + package.loaded caching, the four-searcher not-found
-//                  trace, package.searchpath string logic, the loaders/searchers
-//                  rename, module/seeall 5.1 roster, the nil-vs-false fail value)
-//                  is pinned by tests/loadlib_strengthen.rs, which caught SEVEN
-//                  cross-version divergences fixed here (see GRADUATED.md
-//                  "loadlib"). The platform/FFI surface is left LOAD-BEARING and
-//                  untouched: the dlopen/dlsym bridge (— POSIX/Windows notes on
-//                  lsys_load/lsys_sym/lsys_unloadlib), the file probe + module
-//                  read via file_loader_hook, the "open"/"absent"/"init" tags
-//                  and platform error strings, and the unsupported-stock-C-ABI
-//                  message (DynamicSymbol::LuaCAbi). None of that is
-//                  reference-pinnable without a real .so + host loader.
-// ──────────────────────────────────────────────────────────────────────────

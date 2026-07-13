@@ -130,21 +130,3 @@ mod tests {
         assert_eq!(uv.try_open_payload(), None);
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/lfunc.h, src/lfunc.c (UpVal struct)
-//   target_crate:  lua-types
-//   confidence:    high
-//   todos:         0
-//   port_notes:    0
-//   unsafe_blocks: 0
-//   notes:         UpVal with Open/Closed state. C uses a TValue* that switches
-//                  between stack-pointing (open) and embedded (closed) via union; we
-//                  use three Cell fields as the single source of truth. open_thread_id
-//                  is the open/closed discriminant (CLOSED_TAG = -1 means closed),
-//                  open_idx is the open stack slot, closed_value holds the closed
-//                  payload. Hot-path upvalue_get/_set read the Cells directly with no
-//                  RefCell borrow guards. Read open shape via try_open_payload(),
-//                  closed payload via closed_value()/try_closed_value().
-// ──────────────────────────────────────────────────────────────────────────────

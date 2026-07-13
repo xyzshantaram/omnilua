@@ -1725,38 +1725,3 @@ pub(crate) fn protected_parser(
 
     status
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/ldo.c  (1029 lines, ~37 functions translated, 2 omitted)
-//   target_crate:  lua-vm
-//   confidence:    medium
-//   todos:         23
-//   port_notes:    13
-//   unsafe_blocks: 0
-//   t2c2:          prep_call_info no longer branches on CIST_C to pick a
-//                  CallInfoFrame variant (both default constructors are now
-//                  identical); the ci.callstatus = mask write clears the new
-//                  CIST_TRAP bit on every slot reuse, preserving the old
-//                  per-reuse trap reset. The lua_yieldk u.c.k/ctx write uses
-//                  the set_u_c_* accessors (former phase-b TODO resolved).
-//   notes:         Core call/stack/error machinery translated faithfully.
-//                  setjmp/longjmp → Result<T,LuaError> throughout.
-//                  relstack/correctstack omitted (StackIdx already offset-based).
-//                  Coroutine functions (lua_resume, lua_yieldk, resume, unroll,
-//                  etc.) are translated but require Phase E stack-switching to
-//                  actually work.  Hook-callback borrow conflict flagged as
-//                  TODO(port) in hook() and finish_ccall(); Phase E must solve.
-//                  All method calls (check_stack, gc_check_step, get_ci*,
-//                  set_ci*, next_ci, etc.) are best-guess stubs to be wired
-//                  up in Phase B once the LuaState API is finalised.
-//                  PERF: `precall` split into a `#[inline(always)]` fast-path
-//                  Lua-closure handler plus a `#[cold]` `precall_slow` for the
-//                  C-closure / LightC / __call-metamethod arms.  Nil-fill of
-//                  missing fixed params lives in a `#[cold] #[inline(never)]`
-//                  helper so the no-fill case (overwhelmingly common — fib,
-//                  any direct call with matching arity) is the predicted-taken
-//                  branch.  fibonacci 2.65→2.38× (best-of-5) following this
-//                  change, with proportional wins on closure_ops, table_ops,
-//                  and table_ops_long.
-// ──────────────────────────────────────────────────────────────────────────

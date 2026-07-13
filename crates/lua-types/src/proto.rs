@@ -101,16 +101,3 @@ pub struct AbsLineInfo {
     pub pc: i32,
     pub line: i32,
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// PORT STATUS
-//   source:        src/lobject.h (Proto struct)
-//   target_crate:  lua-types
-//   confidence:    high
-//   todos:         0
-//   port_notes:    0
-//   unsafe_blocks: 0
-//   notes:         Function prototype: bytecode, constants, line info, debug info,
-//                  upvalue descriptors. Faithful layout of C's Proto struct using
-//                  Vec<T> in place of T*+size pairs.
-// ──────────────────────────────────────────────────────────────────────────────
