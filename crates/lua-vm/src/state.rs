@@ -2778,11 +2778,11 @@ impl LuaState {
     /// raise `top` to signal "these are now live"; nil-filling here would
     /// erase the just-written values.
     ///
-    /// setnilvalue(s2v(L->top.p++))` clear loop in `lua_settop` (lapi.c) is
-    /// part of the public API path and lives in `api::set_top` instead.
-    /// PORT NOTE: callers pass an absolute `StackIdx`, not the relative `idx`
-    /// of the public `lua_settop`. The to-be-closed (`tbclist`) close path
-    /// is Phase E and not handled here.
+    /// The `setnilvalue(s2v(L->top.p++))` clear loop in `lua_settop` (lapi.c)
+    /// is part of the public API path and lives in `api::set_top` instead.
+    /// Callers here pass an absolute `StackIdx`, not the relative `idx` of
+    /// the public `lua_settop`. The to-be-closed (`tbclist`) close path
+    /// lives in `func.rs`, not here.
     #[inline(always)]
     pub fn set_top(&mut self, idx: impl Into<StackIdxConv>) {
         let new_top: StackIdx = idx.into().0;
@@ -2794,9 +2794,9 @@ impl LuaState {
     }
     /// Primitive "set top index" — just writes `self.top`, no nil-fill.
     ///
-    /// PORT NOTE: callers (`api.rs::set_top`, `raw_set`, etc.) pre-nil-fill or
-    /// only shrink, so this routine intentionally does no clearing or resizing.
-    /// The to-be-closed (`tbclist`) close path is Phase E.
+    /// Callers (`api.rs::set_top`, `raw_set`, etc.) pre-nil-fill or only
+    /// shrink, so this routine intentionally does no clearing or resizing.
+    /// The to-be-closed (`tbclist`) close path lives in `func.rs`, not here.
     #[inline(always)]
     pub fn set_top_idx(&mut self, idx: impl Into<StackIdxConv>) {
         let new_top: StackIdx = idx.into().0;
@@ -3181,17 +3181,16 @@ impl LuaState {
         self.intern_or_create_str(bytes)
     }
 
-    // ── Phase D-1a: state-owned allocation API ──────────────────────────────
+    // ── State-owned allocation API ──────────────────────────────────────────
     // These methods are the canonical allocation surface. They wrap
-    // `GcRef::new` today; at D-1e they route through `state.global.heap.allocate`.
-    // Callers must reach them through `&mut LuaState`, which mirrors C-Lua's
+    // `GcRef::new`, which allocates on the currently active heap. Callers
+    // must reach them through `&mut LuaState`, which mirrors C-Lua's
     // requirement that every allocation passes `lua_State *L`.
 
     /// Allocate a new Lua function prototype.
     ///
-    /// Caller mutates the returned proto in place (it's behind GcRef, which is
-    /// Rc during Phase D-1; mutable access via `Rc::get_mut` only works while
-    /// no other GcRefs alias it — true at construction).
+    /// The caller is expected to populate fields on the returned value while
+    /// it has no other outstanding references (immediately after allocation).
     pub fn new_proto(&mut self) -> GcRef<LuaProto> {
         self.mark_gc_check_needed();
         GcRef::new(LuaProto::placeholder())
@@ -3284,8 +3283,9 @@ impl LuaState {
                 }
             }
         }
-        // TODO(D-1c-bridge): upvals are pre-populated from parent frame; state.new_lclosure
-        // fills with fresh Nil upvals which would drop the captured bindings.
+        // Upvals are pre-populated from the parent frame here, so this builds
+        // the closure directly rather than through `state.new_lclosure`,
+        // which would fill fresh Nil upvals and drop the captured bindings.
         self.mark_gc_check_needed();
         let new_cl = GcRef::new(LuaClosureLua {
             proto: child_proto.clone(),
