@@ -1,7 +1,8 @@
 //! Load precompiled Lua chunks.
 //!
-//! Direct port of `reference/lua-5.4.7/src/lundump.c` (335 lines, 20 items).
-//! Declarations from `lundump.h` are merged here per PORTING.md §1.
+//! The binary chunk format matches the reference C implementation
+//! (`lundump.c`/`lundump.h`) byte-for-byte, so `string.dump` output and
+//! precompiled chunks stay interchangeable with stock Lua.
 //!
 //! The public entry point is [`undump`], which reads a binary Lua chunk from
 //! a [`ZIO`] stream and returns a Lua closure ready to call.
