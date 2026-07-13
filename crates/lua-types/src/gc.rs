@@ -95,8 +95,10 @@ impl<T: Trace + 'static> GcRef<T> {
     ///
     /// A `GcRef` obtained before its heap closed (`Heap::drop_all` /
     /// `close`) is dangling afterwards, and calling this on it is
-    /// use-after-free — the same contract as after `Heap::drop`, detectable
-    /// under `LUA_RS_GC_QUARANTINE=1`. When the *closed* heap is the active
+    /// use-after-free — the same contract as after `Heap::drop`. (Quarantine
+    /// mode detects use-after-*sweep* while the heap is alive; teardown
+    /// frees even quarantined boxes for real, so post-close dereferences are
+    /// plain UB with no tripwire.) When the *closed* heap is the active
     /// guard, the closed-heap token refusal makes the resulting weak handle
     /// permanently dead; with no guard or a different heap active, the
     /// guard-mismatch cases above apply unchanged. A `Gc` box carries no

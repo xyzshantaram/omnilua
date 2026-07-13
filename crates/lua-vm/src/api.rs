@@ -1862,11 +1862,21 @@ const CLOSE_FINALIZER_MAX_PASSES: usize = 1000;
 /// first pass has that object's `__gc` run by a later pass. The `seen` set
 /// spans all passes, so each object identity is finalized at most once per
 /// close — a finalizer that re-registers its own object cannot loop the
-/// drain. (C refuses close-time registrations outright via `GCSTPCLS`;
-/// running fresh registrations exactly once is the deliberate divergence
-/// here, adjudicated on the #260 review.)
+/// drain. `seen` is seeded with the identities already parked in
+/// `to_be_finalized` at entry — those objects are finalized by the first
+/// `run_pending_finalizers` call without ever passing through `pending`,
+/// and without the seed a self-re-registering queue-only finalizer would
+/// run twice (codex round-3 finding). (C refuses close-time registrations
+/// outright via `GCSTPCLS`; running fresh registrations exactly once is
+/// the deliberate divergence here, adjudicated on the #260 review.)
 pub fn run_close_finalizers(state: &mut LuaState) {
     let mut seen = std::collections::HashSet::<usize>::new();
+    {
+        let g = state.global();
+        for object in g.finalizers.to_be_finalized() {
+            seen.insert(object.identity());
+        }
+    }
     let mut passes = 0usize;
     loop {
         {

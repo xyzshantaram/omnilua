@@ -3137,9 +3137,11 @@ impl Heap {
     /// dereferences a pre-close `Gc`/`GcRef` after this returns — deref,
     /// `downgrade` header reads, `account_buffer` — is use-after-free,
     /// exactly as it always was after `Heap::drop`; close does not widen or
-    /// narrow that contract, it only makes the free deterministic.
-    /// `LUA_RS_GC_QUARANTINE=1` turns such stale dereferences into
-    /// deterministic `HDR_FREED` assertion panics. The VM's own close paths
+    /// narrow that contract, it only makes the free deterministic. Note the
+    /// quarantine caveat: `LUA_RS_GC_QUARANTINE=1` catches use-after-*sweep*
+    /// while the heap lives, but this teardown drains the quarantined list
+    /// and frees its boxes for real — post-close stale dereferences have no
+    /// `HDR_FREED` tripwire left to hit. The VM's own close paths
     /// cannot hit this (`free_all_objects` clears every registry that holds
     /// handles); giving boxes a checkable owner identity at `downgrade` time
     /// is the #252-follow-up ownership redesign, out of scope here.

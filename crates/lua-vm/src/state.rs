@@ -6975,6 +6975,56 @@ mod tests {
         );
     }
 
+    /// `__gc` probe that counts its run and re-registers ITS OWN object for
+    /// finalization again (setmetatable with the same probe). Used to prove
+    /// close's cross-pass exactly-once holds for queue-only objects: their
+    /// identities enter `seen` via the entry seed, not via `take_pending`.
+    fn self_reregister_gc_probe(state: &mut LuaState) -> Result<usize, LuaError> {
+        CLOSE_GC_RUNS.with(|c| c.set(c.get() + 1));
+        crate::api::push_value(state, 1);
+        crate::api::create_table(state, 0, 1)?;
+        crate::api::push_cclosure(state, self_reregister_gc_probe, 0)?;
+        crate::api::set_field(state, -2, b"__gc")?;
+        crate::api::set_metatable(state, -2)?;
+        state.pop();
+        Ok(0)
+    }
+
+    /// Codex round-3 finding on #260: a queue-only object (already parked in
+    /// `to_be_finalized` when close starts) never passes through
+    /// `take_pending`, so without seeding `seen` from `to_be_finalized` at
+    /// entry, its self-re-registration would pass the seen-check and its
+    /// `__gc` would run a second time. Must run exactly once.
+    #[test]
+    fn queue_only_self_reregistering_finalizer_runs_exactly_once() {
+        CLOSE_GC_RUNS.with(|c| c.set(0));
+        let mut state = new_state().expect("state should initialize");
+        install_finalizable_table_with(&mut state, self_reregister_gc_probe);
+
+        {
+            let mut g = state.global_mut();
+            let pending: Vec<FinalizerObject> = g.finalizers.take_pending();
+            assert!(!pending.is_empty());
+            for object in pending.into_iter().rev() {
+                let heap_ptr = object.heap_ptr();
+                g.finalizers.push_to_be_finalized(object);
+                if let Some(ptr) = heap_ptr {
+                    g.heap.move_finobj_to_tobefnz(ptr);
+                }
+            }
+            assert_eq!(g.finalizers.pending_len(), 0);
+            assert!(g.finalizers.has_to_be_finalized());
+        }
+
+        close(state);
+        assert_eq!(
+            CLOSE_GC_RUNS.with(|c| c.get()),
+            1,
+            "a self-re-registering queue-only finalizer must run exactly \
+             once at close — seen must be seeded from to_be_finalized"
+        );
+    }
+
     fn regen_gc_probe(state: &mut LuaState) -> Result<usize, LuaError> {
         CLOSE_GC_RUNS.with(|c| c.set(c.get() + 1));
         crate::api::create_table(state, 0, 0)?;
