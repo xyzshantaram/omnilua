@@ -1,22 +1,13 @@
-//! Global State — port of `lstate.c` (445 lines, 25 functions) + `lstate.h` (merged).
+//! Global interpreter state.
 //!
 //! Manages per-thread ([`LuaState`]) and process-wide ([`GlobalState`]) Lua state:
-//! creation, initialization, teardown, and coroutine lifecycle helpers.
+//! creation, initialization, teardown, and coroutine lifecycle helpers. Mirrors
+//! the responsibilities of Lua's `lstate.c`/`lstate.h`.
 //!
-//! The `lstate.h` header is merged into this module per PORTING.md §1.
-//!
-//! # C source files
-//! - `reference/lua-5.4.7/src/lstate.c`  (445 lines, 25 functions)
-//! - `reference/lua-5.4.7/src/lstate.h`  (408 lines; struct + macro definitions merged)
-
-// PORT NOTE: The C `LX` (thread + extra space) and `LG` (LX + global state) layout
-// wrappers are C-only pointer-arithmetic helpers for allocating the main thread and
-// GlobalState as one contiguous block. In Rust, `GlobalState` and `LuaState` are
-// separate heap-allocated values linked via `Rc<RefCell<GlobalState>>`. No LX/LG
-// equivalents are needed.
-
-// PORT NOTE: C macro `fromstate(L)` (cast LX* from lua_State*) is C-only pointer
-// arithmetic and is not translated. Rust owns the allocations via Rc/Box.
+//! C's `LX`/`LG` structs and the `fromstate` macro exist only to allocate the
+//! main thread and global state as one contiguous block via pointer
+//! arithmetic; here `GlobalState` and `LuaState` are separate heap-allocated
+//! values linked via `Rc<RefCell<GlobalState>>`, so no equivalent is needed.
 
 use std::cell::RefCell;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -26,14 +17,12 @@ use crate::string::StringPool;
 pub use lua_types::error::LuaError;
 pub use lua_types::{CallInfoIdx, StackIdx};
 
-/// Internal: a thin wrapper used so stubbed methods can accept either
-/// `StackIdx` or `u32` (Phase A code mixes both). Phase B will normalise.
+/// Thin wrapper letting stack-indexing methods accept either `StackIdx` or a
+/// raw integer via a single `impl Into<StackIdxConv>` bound.
 pub struct StackIdxConv(pub StackIdx);
 
-/// Phase-A code casts `StackIdx as i32`; provide a `From` so it compiles.
-/// TODO(phase-b): expressions like `state.top_idx().0 as i32` should become
-/// `state.top_idx().raw() as i32`. The non-primitive-cast error is silenced
-/// here by promoting the StackIdx through a free-function conversion.
+/// Explicit `StackIdx` → `i32` conversion for call sites that need a signed
+/// index and would otherwise hit an ambiguous non-primitive-cast error.
 #[inline(always)]
 pub fn stack_idx_to_i32(i: StackIdx) -> i32 {
     i.0 as i32
@@ -237,10 +226,9 @@ impl InternedStringMap {
 
 /// A Lua-callable function pointer. C: `lua_CFunction`.
 ///
-/// TODO(phase-b): the lua-types crate uses a placeholder
-/// `LuaCFnPtr = fn() -> i32` since it can't reference `LuaState` without a
-/// circular dep. The real signature is `fn(&mut LuaState) -> Result<usize, LuaError>`,
-/// kept here as the lua-vm-facing type alias.
+/// `lua_types::closure::LuaCFnPtr` is a `usize`-sized placeholder in that
+/// crate (which cannot reference `LuaState` without a circular dependency);
+/// this alias carries the real, lua-vm-facing signature.
 pub type LuaCFunction = fn(&mut LuaState) -> Result<usize, LuaError>;
 
 pub type LuaRustFunction = Rc<dyn Fn(&mut LuaState) -> Result<usize, LuaError>>;
@@ -410,15 +398,12 @@ impl lua_gc::WeakEntry for WeakTableEntry {
     }
 }
 
-// ─── Constants (from macros.tsv) ──────────────────────────────────────────────
+// ─── Constants ───────────────────────────────────────────────────────────────
 
-// macros.tsv: EXTRA_STACK → const EXTRA_STACK: u32 = 5
 pub(crate) const EXTRA_STACK: usize = 5;
 
-// macros.tsv: LUA_MINSTACK → const LUA_MINSTACK: u32 = 20
 pub(crate) const LUA_MINSTACK: usize = 20;
 
-// macros.tsv: BASIC_STACK_SIZE → const BASIC_STACK_SIZE: u32 = 2 * LUA_MINSTACK
 pub(crate) const BASIC_STACK_SIZE: usize = 2 * LUA_MINSTACK;
 
 /// Maximum nested non-yielding C-call recursion depth — the single source of
@@ -442,10 +427,8 @@ pub(crate) const BASIC_STACK_SIZE: usize = 2 * LUA_MINSTACK;
 
 pub(crate) const LUAI_MAXCCALLS: u32 = 200;
 
-// macros.tsv: CIST_C → const CIST_C: u16 = 1 << 1
 pub(crate) const CIST_C: u16 = 1 << 1;
 
-// Remaining CIST_* bits from macros.tsv
 pub(crate) const CIST_OAH: u16 = 1 << 0;
 pub(crate) const CIST_FRESH: u16 = 1 << 2;
 pub(crate) const CIST_HOOKED: u16 = 1 << 3;
@@ -455,12 +438,11 @@ pub(crate) const CIST_HOOKYIELD: u16 = 1 << 6;
 pub(crate) const CIST_FIN: u16 = 1 << 7;
 pub(crate) const CIST_TRAN: u16 = 1 << 8;
 pub(crate) const CIST_RECST: u32 = 10;
-// macros.tsv: CIST_LEQ → const CIST_LEQ: u16 = 1 << 13 (LUA_COMPAT_LT_LE).
-// Marks a CallInfo whose `__lt` call is standing in for a missing `__le`, so
-// that if the `__lt` metamethod yields, the comparison-resume path
-// (`vm::finish_op`) knows to negate the result — the synchronous derive in
-// `tagmethods::call_order_tm` cannot, since the negation happens after the
-// yield unwinds the stack. Bits 10-12 are CIST_RECST, so this is bit 13 (as C).
+/// Marks a CallInfo whose `__lt` call is standing in for a missing `__le`, so
+/// that if the `__lt` metamethod yields, the comparison-resume path
+/// (`vm::finish_op`) knows to negate the result — the synchronous derive in
+/// `tagmethods::call_order_tm` cannot, since the negation happens after the
+/// yield unwinds the stack. Bits 10-12 are CIST_RECST, so this is bit 13.
 pub(crate) const CIST_LEQ: u16 = 1 << 13;
 
 /// Per-frame hook trap flag, folded out of `CallInfoFrame` into a free
@@ -472,14 +454,11 @@ pub(crate) const CIST_LEQ: u16 = 1 << 13;
 /// CallInfo slot is repurposed for a new call (see `prep_call_info`).
 pub(crate) const CIST_TRAP: u16 = 1 << 14;
 
-// macros.tsv: LUA_NUMTYPES → const LUA_NUMTYPES: usize = 9
 const LUA_NUMTYPES: usize = 9;
 
-// TODO(port): import from crate::gc (lgc.c → gc.rs) once it exists in Phase D
 const GCSTPUSR: u8 = 1;
 const GCSTPGC: u8 = 2;
 
-// TODO(port): import from crate::gc in Phase D
 const GCS_PAUSE: u8 = 0;
 
 const LUAI_GCPAUSE: u32 = 200;
@@ -496,8 +475,6 @@ const STRCACHE_M: usize = 2;
 // ─── GcKind enum ─────────────────────────────────────────────────────────────
 
 /// Garbage collector operating mode.
-///
-/// macros.tsv: `KGC_INC → GcKind::Incremental`, `KGC_GEN → GcKind::Generational`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GcKind {
     Incremental = 0,
@@ -543,9 +520,6 @@ pub use lua_types::status::LuaStatus;
 /// stays 16 bytes — matching C's slot size without the union. A vestigial
 /// `tbc_delta: u16` field (written, never read) padded every slot to 24 bytes
 /// until it was removed on 2026-06-09 (PERF_PUSH_SPEC.md P3).
-///
-/// types.tsv: `StackValue → StackValue { val: LuaValue }` (tbclist.delta →
-/// `LuaState.tbclist: Vec<StackIdx>`)
 #[derive(Clone)]
 pub struct StackValue {
     pub val: LuaValue,
@@ -563,32 +537,25 @@ impl Default for StackValue {
 
 /// Saved state for a Lua or C call frame.
 ///
-/// types.tsv: CallInfo → CallInfo (several fields renamed / adapted).
-///
 /// The C intrusive doubly-linked list (`previous`, `next` as raw pointers) is
 /// replaced by `Option<CallInfoIdx>` indices into `LuaState::call_info`.
 #[derive(Clone)]
 pub struct CallInfo {
-    // types.tsv: CallInfo.func → StackIdx
     pub func: StackIdx,
 
-    // types.tsv: CallInfo.top → StackIdx
     pub top: StackIdx,
 
-    // types.tsv: CallInfo.previous → CallInfoIdx (Option at boundary)
     pub previous: Option<CallInfoIdx>,
 
-    // types.tsv: CallInfo.next → CallInfoIdx (Option at tail)
     pub next: Option<CallInfoIdx>,
 
     pub u: CallInfoFrame,
 
     pub u2: CallInfoExtra,
 
-    // types.tsv: CallInfo.nresults → i16
     pub nresults: i16,
 
-    // types.tsv: CallInfo.callstatus → u16 (bit-packed CIST_* flags)
+    /// Bit-packed `CIST_*` flags.
     pub callstatus: u16,
 
     /// Lua 5.5: number of `__call` metamethods traversed before entering this
@@ -640,19 +607,14 @@ const _: () = {
 #[derive(Clone, Copy)]
 pub struct CallInfoFrame {
     /// Lua-frame: index of the next bytecode instruction. C: `u.l.savedpc`.
-    /// types.tsv: CallInfo.u.l.savedpc → u32
     pub savedpc: u32,
     /// Lua-frame: count of extra varargs collected at entry. C: `u.l.nextraargs`.
-    /// types.tsv: CallInfo.u.l.nextraargs → i32
     pub nextraargs: i32,
     /// C-frame: continuation function for a yieldable C call. C: `u.c.k`.
-    /// types.tsv: CallInfo.u.c.k → Option<lua_KFunction>
     pub k: Option<LuaKFunction>,
     /// C-frame: saved `errfunc` to restore on pcall recovery. C: `u.c.old_errfunc`.
-    /// types.tsv: CallInfo.u.c.old_errfunc → isize
     pub old_errfunc: isize,
     /// C-frame: continuation context. C: `u.c.ctx`.
-    /// types.tsv: CallInfo.u.c.ctx → isize
     pub ctx: isize,
 }
 
@@ -660,8 +622,6 @@ pub struct CallInfoFrame {
 pub type LuaKFunction = fn(&mut LuaState, status: i32, ctx: isize) -> Result<usize, LuaError>;
 
 /// Payload of `CallInfo.u2`.
-///
-/// types.tsv: CallInfo.u2 → CallInfoExtra (Rust: struct with all fields, interpretation by context)
 #[derive(Default, Clone, Copy)]
 pub struct CallInfoExtra {
     pub value: i32,
@@ -728,8 +688,6 @@ impl CallInfo {
     ///
     /// Currently returns `false` unconditionally — vararg introspection via
     /// `debug.getinfo` reports no vararg info instead of panicking.
-    ///
-    /// TODO(port): wire when CallInfo carries proto access for vararg detection.
     pub fn is_vararg_func(&self) -> bool {
         false
     }
@@ -847,11 +805,10 @@ impl CallInfo {
     }
 }
 
-// ─── Phase-B value/proto/instruction helpers ──────────────────────────────────
+// ─── Value/proto/instruction helpers ───────────────────────────────────────────
 
-/// Extension methods on `LuaValue`. TODO(phase-b): move these to
-/// `lua_types::value` (or wherever the canonical impl lives) once the type
-/// helpers stabilise.
+/// Extension methods on `LuaValue`, kept in lua-vm alongside `LuaState`
+/// rather than in `lua_types::value`.
 pub trait LuaValueExt {
     fn base_type(&self) -> lua_types::LuaType;
     fn to_number_no_strconv(&self) -> Option<f64>;
@@ -965,7 +922,7 @@ impl LuaTypeExt for lua_types::LuaType {
     }
 }
 
-/// StackIdx checked-arithmetic helpers. Returns the raw `u32` because Phase A
+/// StackIdx checked-arithmetic helpers. Returns the raw `u32` because
 /// callers use the result in arithmetic comparisons against other `u32`
 /// quantities (stack-distance offsets).
 pub trait StackIdxExt {
@@ -988,15 +945,12 @@ impl StackIdxExt for StackIdx {
     }
 }
 
-/// `GcRef<LuaTable>` / `GcRef<LuaUserData>` field-access helpers. These
-/// methods are needed by api.rs and tagmethods.rs but the lua-types
-/// placeholders don't yet expose them. TODO(phase-b): replace with real
-/// accessor methods on the canonical types in lua-types.
+/// `GcRef<LuaTable>` / `GcRef<LuaUserData>` field-access helpers, forwarding
+/// to the canonical `LuaTable`/`LuaUserData` methods through the deref, for
+/// use by api.rs and tagmethods.rs.
 ///
-/// PORT NOTE: the historical `reject_invalid_table_key` precheck used to
-/// guard nil/NaN keys at this layer; it has moved inside
-/// [`LuaTable::try_raw_set`] (alongside the integer-fast-path match) so
-/// the lua-vm wrapper does not double-check.
+/// Nil/NaN key validation lives inside [`LuaTable::try_raw_set`] (alongside
+/// the integer-fast-path match), so this wrapper does not double-check.
 pub trait LuaTableRefExt {
     fn metatable(&self) -> Option<GcRef<LuaTable>>;
     fn has_metatable(&self) -> bool;
