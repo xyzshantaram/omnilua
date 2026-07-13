@@ -1547,6 +1547,13 @@ pub struct Heap {
     /// object's header by one fat pointer; the `Vec` slot exists only while
     /// an object is on the revisit list.
     grayagain: RefCell<Vec<NonNull<GcBox<dyn Trace>>>>,
+    /// Capacity-recycling scratch for [`sweep_young`](Self::sweep_young)'s
+    /// next-revisit builder: the buffer drained from `grayagain` last minor
+    /// is cleared and parked here, then reused as the builder next minor —
+    /// the two buffers swap roles each cycle, so steady-state minors
+    /// allocate nothing (spec rev-3 W1 buffer-reuse requirement). Always
+    /// empty outside `sweep_young`; carries no membership and no flags.
+    grayagain_scratch: RefCell<Vec<NonNull<GcBox<dyn Trace>>>>,
     /// In-progress marker state for incremental cycles. `Some` between
     /// `Propagate` start and `Sweep` start; `None` otherwise.
     marker: RefCell<Option<Marker>>,
@@ -1611,6 +1618,7 @@ impl Heap {
             last_mark_stats: Cell::new(MarkerStats::default()),
             last_sweep_stats: Cell::new(SweepStats::default()),
             grayagain: RefCell::new(Vec::new()),
+            grayagain_scratch: RefCell::new(Vec::new()),
             marker: RefCell::new(None),
             marker_pool: RefCell::new(None),
             sweep_prev_next: Cell::new(None),
@@ -2824,7 +2832,8 @@ impl Heap {
 
     fn sweep_young(&self) {
         let mut freed_bytes = 0usize;
-        let mut next_revisit = Vec::new();
+        let mut next_revisit = std::mem::take(&mut *self.grayagain_scratch.borrow_mut());
+        debug_assert!(next_revisit.is_empty(), "grayagain scratch must be parked empty");
         let mut next_revisit_seen = IdentityHashSet::default();
         let mut firstold1 = None;
         let mut stats = SweepStats::default();
@@ -2892,7 +2901,7 @@ impl Heap {
             processed.finish();
         }
 
-        for ptr in old_revisit {
+        for &ptr in &old_revisit {
             let id = ptr.as_ptr() as *const () as usize;
             if processed
                 .as_ref()
@@ -2920,6 +2929,9 @@ impl Heap {
         if freed_bytes > 0 {
             self.bytes.set(self.bytes.get().saturating_sub(freed_bytes));
         }
+        let mut recycled = old_revisit;
+        recycled.clear();
+        *self.grayagain_scratch.borrow_mut() = recycled;
         self.replace_grayagain(next_revisit);
         self.reallyold.set(old1);
         self.old1.set(new_old1);
@@ -3868,6 +3880,98 @@ mod tests {
             heap.allgc_count(),
             3,
             "reachable young child should survive the minor"
+        );
+    }
+
+    /// Baseline-preservation pin for the #263 scenario (codex W1 review,
+    /// finding 1): the SAME graph as `g3_moved_transitional_keeps_young_child_
+    /// reachable`, but asserting what the collector does TODAY — the
+    /// reachable young child is freed. Runs in normal CI so any W1-era
+    /// divergence in this scenario is caught immediately. When #263 is fixed,
+    /// this test must be inverted/removed together with un-ignoring G3.
+    #[test]
+    fn g3_baseline_child_freed_after_move_allgc_to_finobj() {
+        let heap = Heap::new();
+        heap.unpause();
+        let child = heap.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        let transitional = heap.allocate(Cell0 {
+            next: Cell::new(Some(child)),
+            marker_calls: Cell::new(0),
+        });
+        let parent = heap.allocate(Cell0 {
+            next: Cell::new(Some(transitional)),
+            marker_calls: Cell::new(0),
+        });
+        parent.set_age(GcAge::Old);
+        parent.set_color(Color::Black);
+        transitional.set_age(GcAge::Old1);
+        transitional.set_color(Color::Gray);
+        heap.remember_minor_revisit(transitional.as_trace_ptr());
+
+        assert!(heap.move_allgc_to_finobj(transitional.as_trace_ptr()));
+        assert_eq!(heap.grayagain_count(), 0);
+
+        heap.minor_collect_with_post_mark(&OneRoot(Some(parent)), |_| {});
+
+        assert_eq!(
+            heap.allgc_count(),
+            2,
+            "baseline (pre-#263-fix): the young child is freed; if this \
+             changes, either #263 was fixed (invert this test and un-ignore \
+             G3) or minor liveness regressed"
+        );
+    }
+
+    /// Baseline-preservation pin, `move_tobefnz_to_allgc` variant (codex W1
+    /// review, finding 1): the transitional travels allgc -> finobj ->
+    /// tobefnz, is re-remembered for revisit there, and the move BACK to
+    /// allgc deletes the entry; the following minor frees the reachable
+    /// young child, same as the finobj variant. Invert together with the
+    /// #263 fix.
+    #[test]
+    fn g3_baseline_child_freed_after_move_tobefnz_to_allgc() {
+        let heap = Heap::new();
+        heap.unpause();
+        let child = heap.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        let transitional = heap.allocate(Cell0 {
+            next: Cell::new(Some(child)),
+            marker_calls: Cell::new(0),
+        });
+        let parent = heap.allocate(Cell0 {
+            next: Cell::new(Some(transitional)),
+            marker_calls: Cell::new(0),
+        });
+        parent.set_age(GcAge::Old);
+        parent.set_color(Color::Black);
+        transitional.set_age(GcAge::Old1);
+        transitional.set_color(Color::Gray);
+
+        assert!(heap.move_allgc_to_finobj(transitional.as_trace_ptr()));
+        assert!(heap.move_finobj_to_tobefnz(transitional.as_trace_ptr()));
+        heap.remember_minor_revisit(transitional.as_trace_ptr());
+        assert_eq!(heap.grayagain_count(), 1);
+
+        assert!(heap.move_tobefnz_to_allgc(transitional.as_trace_ptr()));
+        assert_eq!(
+            heap.grayagain_count(),
+            0,
+            "tobefnz->allgc move deletes the grayagain entry"
+        );
+
+        heap.minor_collect_with_post_mark(&OneRoot(Some(parent)), |_| {});
+
+        assert_eq!(
+            heap.allgc_count(),
+            2,
+            "baseline (pre-#263-fix): the young child is freed after the \
+             tobefnz->allgc move deletes the revisit entry; invert together \
+             with the #263 fix"
         );
     }
 
