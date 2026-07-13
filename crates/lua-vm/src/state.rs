@@ -5663,11 +5663,24 @@ impl<'a> GcHandle<'a> {
     /// the heap `closed`, so a `HeapGuard` that outlived close panics instead
     /// of resurrecting a torn-down heap.
     ///
-    /// This does not *run* finalizers: `close_state`'s upstream-mirroring paths
-    /// already do that before teardown; this only frees.
+    /// This does not *run* finalizers: `close_state` calls
+    /// `api::run_close_finalizers` before invoking this on the complete-state
+    /// branch (mirroring C's `luaC_freeallobjects` = `separatetobefnz` +
+    /// `callallpendingfinalizers` + free); this only frees.
+    ///
+    /// A [`HeapGuard`](lua_gc::HeapGuard) for **this state's own heap** is
+    /// pushed around the drain: a destructor that allocates via `GcRef::new`
+    /// resolves the top of the TLS guard stack, so without the push its box
+    /// would land in whatever heap the caller happened to have active — a
+    /// different VM's heap under a foreign guard, or a panic with no guard at
+    /// all. With it, teardown-time allocations always land in (and are drained
+    /// from) the heap being closed, regardless of ambient guard state.
     pub fn free_all_objects(&self) {
         let heap = self._state.global().heap.clone();
-        heap.drop_all();
+        {
+            let _own_heap = lua_gc::HeapGuard::push(&heap);
+            heap.drop_all();
+        }
         let mut g = self._state.global_mut();
         g.weak_tables_registry = lua_gc::WeakRegistry::default();
         g.finalizers = lua_gc::FinalizerRegistry::default();
@@ -6107,6 +6120,17 @@ fn preinit_thread(thread: &mut LuaState, global: Rc<RefCell<GlobalState>>) {
     thread.gc_check_needed = true;
 }
 
+/// Tear down a state: run the remaining close-time `__gc` finalizers, then
+/// free every heap object, mirroring C's `close_state` → `luaC_freeallobjects`
+/// (= `separatetobefnz` + `callallpendingfinalizers` + free).
+///
+/// On the complete-state branch, `api::run_close_finalizers` fires the
+/// finalizers BEFORE `free_all_objects` tears the boxes down (issue #260).
+/// `run_close_finalizers` drains the pending registry via `take_pending`, so
+/// it is idempotent — a host that already ran it (lua-cli's `pmain` does, and
+/// then never calls `close`) sees a no-op here, never a double-run. The
+/// incomplete branch (`lua_open` failed mid-bootstrap) has no registered
+/// finalizers, so it goes straight to the free, as C does.
 fn close_state(state: &mut LuaState) {
     let is_complete = state.global().is_complete();
 
@@ -6117,6 +6141,7 @@ fn close_state(state: &mut LuaState) {
         state.ci = CallInfoIdx(0);
         // TODO(port): crate::do_::close_protected(state, StackIdx(1), LuaStatus::Ok)
         // Ignoring result here because we are in teardown (same as C behavior).
+        crate::api::run_close_finalizers(state);
         state.gc().free_all_objects();
         // macros.tsv: luai_userstateclose → (extension hook; drop)
     }

@@ -2090,7 +2090,21 @@ impl Heap {
     /// holds a duplicate (`grayagain_links_object_once` pins this). Tail-append
     /// replaces the intrusive list's prepend; the two consumers are
     /// order-insensitive (see `mark_minor_revisit_objects` / `sweep_young`).
+    ///
+    /// Inert once the heap is `closed`: no collection can ever run again on a
+    /// closed heap, so the revisit obligation is void — and accepting entries
+    /// would be a use-after-free factory. A destructor running inside the
+    /// teardown drain can fire a generational barrier on a box it just
+    /// allocated; a later drain pass frees that box, and if the pointer had
+    /// been recorded here a second `drop_all` (or `Heap::drop` after an
+    /// explicit close) would dereference the freed header in
+    /// `clear_grayagain`. This is the single grayagain entry point (both
+    /// generational barriers route through it), so gating it here covers
+    /// every barrier path.
     fn remember_minor_revisit(&self, ptr: NonNull<GcBox<dyn Trace>>) {
+        if self.closed.get() {
+            return;
+        }
         let header = self.header_from_ptr(ptr);
         if header.gray_listed() {
             return;
@@ -2218,7 +2232,16 @@ impl Heap {
     /// (a freed identity re-registered by a fresh object) the new token differs
     /// from any stale handle's, preventing address reuse from resurrecting a
     /// dead handle. Objects that are never weak-referenced never enter the map.
+    ///
+    /// On a `closed` heap this refuses to mint: it returns 0 — a value
+    /// [`next_token`](Self::next_token) never issues, so it can never
+    /// validate — without touching the map. A downgrade of a stale `GcRef`
+    /// after close would otherwise re-register the freed box's address and
+    /// resurrect it as an upgradable weak target.
     pub fn register_allocation_token(&self, identity: usize) -> usize {
+        if self.closed.get() {
+            return 0;
+        }
         let mut tokens = self.allocation_tokens.borrow_mut();
         if let Some(token) = tokens.get(&identity) {
             return *token;
@@ -2231,8 +2254,13 @@ impl Heap {
     /// Return true when `identity` still names the same heap allocation.
     ///
     /// The token check prevents allocator address reuse from making a stale
-    /// weak handle look live again.
+    /// weak handle look live again. Unconditionally false once the heap is
+    /// `closed`: every box is freed (or about to be, mid-drain), so no weak
+    /// handle may upgrade regardless of what the token map transiently holds.
     pub fn contains_allocation(&self, identity: usize, token: usize) -> bool {
+        if self.closed.get() {
+            return false;
+        }
         self.allocation_token(identity) == Some(token)
     }
 
@@ -3071,11 +3099,46 @@ impl Heap {
     /// [`clear_generation_cursors`](Self::clear_generation_cursors)) before any
     /// free, preserving the pre-existing ordering.
     ///
+    /// **Nonconvergence is a panic, in every build.** A destructor that
+    /// allocates a new box on every pass would spin this loop forever; after
+    /// 10,000 passes the loop panics naming that cause. An unconditional
+    /// panic is deliberate — a silent infinite hang inside `close()` in a
+    /// release build is strictly worse than a loud failure.
+    ///
+    /// **Panic safety.** `tearing_down` is restored by an RAII guard, so a
+    /// panicking destructor (or the pass-cap panic) leaves the heap `closed`
+    /// with the closed-heap allocation panic correctly re-armed, never stuck
+    /// in a state that accepts allocations forever. A destructor that panics
+    /// mid-teardown does, however, leak the not-yet-freed remainder of the
+    /// list chain being drained: the local cursor into that chain dies with
+    /// the unwinding frame. Panicking in `Drop` is programmer error; the
+    /// guarantee kept here is that the heap's state machine stays sound, not
+    /// that a panicking destructor is leak-free.
+    ///
     /// After this returns, every outstanding `Gc<T>` is dangling — callers
     /// must ensure no `Gc<T>` outlives the `Heap`.
     pub fn drop_all(&self) {
+        /// Restores `tearing_down` on scope exit — including panic unwind —
+        /// but only for the outermost `drop_all` frame (`armed`), so a
+        /// re-entrant `drop_all` from inside a payload `Drop` cannot clear
+        /// the flag out from under the outer drain.
+        struct TearingDownReset<'a> {
+            flag: &'a Cell<bool>,
+            armed: bool,
+        }
+        impl Drop for TearingDownReset<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.flag.set(false);
+                }
+            }
+        }
+
         self.closed.set(true);
-        let outermost = !self.tearing_down.replace(true);
+        let _reset = TearingDownReset {
+            armed: !self.tearing_down.replace(true),
+            flag: &self.tearing_down,
+        };
         self.recycle_marker_cell();
         self.sweep_prev_next.set(None);
         self.clear_generation_cursors();
@@ -3094,18 +3157,18 @@ impl Heap {
                 break;
             }
             passes = passes.saturating_add(1);
-            debug_assert!(
-                passes < 10_000,
-                "drop_all drain did not converge — a payload Drop is allocating without bound"
-            );
+            if passes >= 10_000 {
+                panic!(
+                    "Heap::drop_all did not converge after 10000 passes — a \
+                     nonconvergent destructor is allocating a new GC box on \
+                     every teardown pass"
+                );
+            }
         }
 
         self.allocation_tokens.borrow_mut().clear();
         self.bytes.set(0);
         self.objects.set(0);
-        if outermost {
-            self.tearing_down.set(false);
-        }
     }
 
     /// Free every box on one owner list, returning whether any box was freed.
