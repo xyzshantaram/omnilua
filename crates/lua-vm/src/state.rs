@@ -5675,6 +5675,14 @@ impl<'a> GcHandle<'a> {
     /// different VM's heap under a foreign guard, or a panic with no guard at
     /// all. With it, teardown-time allocations always land in (and are drained
     /// from) the heap being closed, regardless of ambient guard state.
+    /// The registry clears below also break the `GlobalState` ↔ coroutine
+    /// reference cycle: each [`ThreadRegistryEntry`] holds an
+    /// `Rc<RefCell<LuaState>>` whose `LuaState.global` is a strong
+    /// `Rc<RefCell<GlobalState>>` back-edge, so a live suspended coroutine at
+    /// close would otherwise keep the `GlobalState` — and its `Rc<Heap>` —
+    /// alive forever after the outer state drops. The sibling cross-thread
+    /// maps hold only `Copy` `GcRef` handles (no cycle), but those handles
+    /// dangle once `drop_all` frees the boxes, so they are cleared with it.
     pub fn free_all_objects(&self) {
         let heap = self._state.global().heap.clone();
         {
@@ -5685,6 +5693,12 @@ impl<'a> GcHandle<'a> {
         g.weak_tables_registry = lua_gc::WeakRegistry::default();
         g.finalizers = lua_gc::FinalizerRegistry::default();
         g.external_roots = ExternalRootSet::default();
+        g.threads.clear();
+        g.thread_globals.clear();
+        g.cross_thread_upvals.clear();
+        g.suspended_parent_stacks.clear();
+        g.suspended_parent_open_upvals.clear();
+        g.twups.clear();
     }
 
     /// GC write barrier for a TValue.

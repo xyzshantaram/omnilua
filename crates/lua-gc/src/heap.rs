@@ -1815,12 +1815,29 @@ impl Heap {
 
     /// Cheap predicate: would a `step()` actually do work? Equivalent to
     /// `!paused && bytes_used() >= threshold_bytes()`. Callers that build
-    /// snapshot state before invoking the heap should gate on this.
+    /// snapshot state before invoking the heap should gate on this. Always
+    /// false once the heap is closed (see [`collection_inert`](Self::collection_inert)).
     pub fn would_collect(&self) -> bool {
-        if self.stress {
-            return !self.paused.get();
+        if self.collection_inert() {
+            return false;
         }
-        !self.paused.get() && self.bytes.get() >= self.threshold.get()
+        if self.stress {
+            return true;
+        }
+        self.bytes.get() >= self.threshold.get()
+    }
+
+    /// True when every collection entry point must be a no-op: the heap is
+    /// paused, or it is `closed` (teardown has begun or completed). The
+    /// closed arm is load-bearing for teardown soundness (issue #260 codex
+    /// round 2, finding 1): a destructor running inside the `drop_all` drain
+    /// can invoke a collection, and `sweep_young` re-installs grayagain
+    /// entries via `replace_grayagain` — pointers a later drain pass frees,
+    /// recreating the second-`drop_all` use-after-free that gating only the
+    /// barrier path was meant to prevent. No collection may ever run on a
+    /// closed heap; every public collect/step/mark entry checks this.
+    fn collection_inert(&self) -> bool {
+        self.paused.get() || self.closed.get()
     }
 
     pub fn collections(&self) -> usize {
@@ -2367,7 +2384,7 @@ impl Heap {
     /// short-circuit path. The runtime uses this to bridge weak-table
     /// pruning into implicit GC steps fired from inside the VM loop.
     pub fn step_with_post_mark<F: FnMut(&mut Marker)>(&self, roots: &dyn Trace, post_mark: F) {
-        if self.paused.get() {
+        if self.collection_inert() {
             return;
         }
         if !self.stress && self.bytes.get() < self.threshold.get() {
@@ -2391,7 +2408,7 @@ impl Heap {
         roots: &dyn Trace,
         mut post_mark: F,
     ) {
-        if self.paused.get() {
+        if self.collection_inert() {
             return;
         }
         let mut marker = self.marker_from_pool(MarkerMode::Full);
@@ -2435,7 +2452,7 @@ impl Heap {
         roots: &dyn Trace,
         mut post_mark: F,
     ) {
-        if self.paused.get() {
+        if self.collection_inert() {
             return;
         }
         if !self.state.get().is_pause() {
@@ -2476,7 +2493,7 @@ impl Heap {
         roots: &dyn Trace,
         mut post_mark: F,
     ) {
-        if self.paused.get() {
+        if self.collection_inert() {
             return;
         }
         if !self.state.get().is_pause() {
@@ -2515,7 +2532,7 @@ impl Heap {
         mut budget: StepBudget,
         mut post_mark: F,
     ) -> StepOutcome {
-        if self.paused.get() {
+        if self.collection_inert() {
             return StepOutcome::SkippedStopped;
         }
         self.run_budgeted(roots, &mut budget, &mut post_mark);
@@ -2666,7 +2683,7 @@ impl Heap {
         max_work: isize,
         mut post_mark: F,
     ) -> StepOutcome {
-        if self.paused.get() {
+        if self.collection_inert() {
             return StepOutcome::SkippedStopped;
         }
         let work = max_work.max(1);
@@ -3116,7 +3133,16 @@ impl Heap {
     /// that a panicking destructor is leak-free.
     ///
     /// After this returns, every outstanding `Gc<T>` is dangling — callers
-    /// must ensure no `Gc<T>` outlives the `Heap`.
+    /// must ensure no `Gc<T>` outlives the `Heap`. **Any** operation that
+    /// dereferences a pre-close `Gc`/`GcRef` after this returns — deref,
+    /// `downgrade` header reads, `account_buffer` — is use-after-free,
+    /// exactly as it always was after `Heap::drop`; close does not widen or
+    /// narrow that contract, it only makes the free deterministic.
+    /// `LUA_RS_GC_QUARANTINE=1` turns such stale dereferences into
+    /// deterministic `HDR_FREED` assertion panics. The VM's own close paths
+    /// cannot hit this (`free_all_objects` clears every registry that holds
+    /// handles); giving boxes a checkable owner identity at `downgrade` time
+    /// is the #252-follow-up ownership redesign, out of scope here.
     pub fn drop_all(&self) {
         /// Restores `tearing_down` on scope exit — including panic unwind —
         /// but only for the outermost `drop_all` frame (`armed`), so a
@@ -3194,6 +3220,16 @@ impl Heap {
     }
 }
 
+/// Last-resort teardown when the final `Rc<Heap>` drops without an explicit
+/// close. Runs the same drain as [`Heap::drop_all`], but with one contract
+/// difference callers must know: no `HeapGuard` can be active for *this*
+/// heap here — the `Rc` is mid-destruction, so there is no sound handle to
+/// push (do not try to smuggle one in). A payload destructor that allocates
+/// via `GcRef::new` during a plain unguarded `Heap::drop` therefore panics
+/// loudly with the #253 no-guard message instead of allocating into a dying
+/// heap. The supported deterministic-teardown path for VM heaps is
+/// state-level close (`close_state` → `free_all_objects`), which pushes the
+/// guard around the drain so such destructors work.
 impl Drop for Heap {
     fn drop(&mut self) {
         self.drop_all();

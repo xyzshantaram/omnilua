@@ -1834,6 +1834,15 @@ fn run_pending_finalizers_limited(
     Ok(processed)
 }
 
+/// Ceiling on close-finalizer drain iterations. Each iteration runs at least
+/// one never-before-finalized object's `__gc` (or terminates), so hitting
+/// this requires a `__gc` chain that registers fresh finalizable objects
+/// thousands of levels deep — at that point remaining entries are freed
+/// unfinalized, which is C's disposition for close-time registrations
+/// (`GCSTPCLS`) anyway. A break, not a panic: Lua code must not be able to
+/// wedge or crash `lua_close`.
+const CLOSE_FINALIZER_MAX_PASSES: usize = 1000;
+
 /// Run every still-pending `__gc` finalizer at state close.
 ///
 /// Mirrors C-Lua's `luaC_freeallobjects` (`lgc.c`), which calls
@@ -1844,33 +1853,47 @@ fn run_pending_finalizers_limited(
 /// e.g. a table held by a global — still have their finalizer run; that is
 /// what emits messages like `>>> closing state <<<` from `gc.lua`.
 ///
-/// The typed registry of finalizable objects is `pending_finalizers`. A single
-/// snapshot of that list is promoted into `to_be_finalized` and drained by
-/// [`run_pending_finalizers`]. We snapshot
-/// once (matching C's single `separatetobefnz` call): a finalizer may
-/// resurrect its object or register new finalizables via `setmetatable`, but
-/// C does not re-finalize those at close (`gcstp = GCSTPCLS`), so neither do
-/// we — the freshly-registered entries are left in `pending_finalizers` and
-/// simply dropped with the state.
+/// **Drains both queues until stable** (issue #260 codex round 2, finding 3):
+/// the loop runs while either `pending_finalizers` or `to_be_finalized` is
+/// non-empty, so (a) leftovers parked in `to_be_finalized` by an earlier
+/// bounded incremental pass (`run_some_pending_finalizers_inner` caps at
+/// `GC_FIN_MAX` per step) still run at close even when `pending` is empty,
+/// and (b) a finalizer that registers a *new* finalizable object during the
+/// first pass has that object's `__gc` run by a later pass. The `seen` set
+/// spans all passes, so each object identity is finalized at most once per
+/// close — a finalizer that re-registers its own object cannot loop the
+/// drain. (C refuses close-time registrations outright via `GCSTPCLS`;
+/// running fresh registrations exactly once is the deliberate divergence
+/// here, adjudicated on the #260 review.)
 pub fn run_close_finalizers(state: &mut LuaState) {
-    let pending: Vec<FinalizerObject> = state.global_mut().finalizers.take_pending();
-    if pending.is_empty() {
-        return;
-    }
     let mut seen = std::collections::HashSet::<usize>::new();
-    {
-        let mut g = state.global_mut();
-        for object in pending.into_iter().rev() {
-            let heap_ptr = object.heap_ptr();
-            if seen.insert(object.identity()) {
-                g.finalizers.push_to_be_finalized(object);
-                if let Some(ptr) = heap_ptr {
-                    g.heap.move_finobj_to_tobefnz(ptr);
+    let mut passes = 0usize;
+    loop {
+        {
+            let g = state.global();
+            if g.finalizers.pending_len() == 0 && !g.finalizers.has_to_be_finalized() {
+                break;
+            }
+        }
+        passes += 1;
+        if passes > CLOSE_FINALIZER_MAX_PASSES {
+            break;
+        }
+        let pending: Vec<FinalizerObject> = state.global_mut().finalizers.take_pending();
+        {
+            let mut g = state.global_mut();
+            for object in pending.into_iter().rev() {
+                let heap_ptr = object.heap_ptr();
+                if seen.insert(object.identity()) {
+                    g.finalizers.push_to_be_finalized(object);
+                    if let Some(ptr) = heap_ptr {
+                        g.heap.move_finobj_to_tobefnz(ptr);
+                    }
                 }
             }
         }
+        run_pending_finalizers(state);
     }
-    run_pending_finalizers(state);
 }
 
 /// Snapshot the currently-live weak tables from

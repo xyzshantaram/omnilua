@@ -92,6 +92,17 @@ impl<T: Trace + 'static> GcRef<T> {
     /// check, so it keeps upgrading after sweep frees the target. That case
     /// panics unconditionally in every build; detached (process-lifetime)
     /// targets keep the legacy always-upgrades behavior.
+    ///
+    /// A `GcRef` obtained before its heap closed (`Heap::drop_all` /
+    /// `close`) is dangling afterwards, and calling this on it is
+    /// use-after-free — the same contract as after `Heap::drop`, detectable
+    /// under `LUA_RS_GC_QUARANTINE=1`. When the *closed* heap is the active
+    /// guard, the closed-heap token refusal makes the resulting weak handle
+    /// permanently dead; with no guard or a different heap active, the
+    /// guard-mismatch cases above apply unchanged. A `Gc` box carries no
+    /// owner identity of its own to validate against — fixing that is the
+    /// heap-ownership redesign tracked as the #252 follow-up, not a #260
+    /// teardown property.
     pub fn downgrade(&self) -> GcWeak<T> {
         let identity = self.identity();
         let tracked = lua_gc::with_current_heap(|heap| {
