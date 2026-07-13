@@ -3757,6 +3757,19 @@ mod tests {
         assert_eq!(heap.last_sweep_stats().freed, 1);
     }
 
+    /// Header-size regression for #113 Wave 1. Removing the `gray_next`
+    /// grayagain fat pointer shrinks `GcHeader` from **40 B to 24 B on
+    /// 64-bit** (`color + age + flags + pad + size(u32) + next(16)`), align 8.
+    /// The wasm32 figure is 24 -> 16 B (an 8-B fat pointer), but that is NOT
+    /// asserted here — a native test cannot observe the wasm32 layout, so the
+    /// assertion is gated to 64-bit targets; the wasm32 size is pinned by the
+    /// W2 `const` assert per the spec.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn gcheader_is_24_bytes_after_grayagain_diet() {
+        assert_eq!(std::mem::size_of::<GcHeader>(), 24);
+    }
+
     #[test]
     fn full_sweep_unlinks_freed_grayagain_entries() {
         let heap = Heap::new();
