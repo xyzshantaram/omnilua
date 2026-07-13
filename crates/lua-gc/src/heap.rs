@@ -3757,6 +3757,143 @@ mod tests {
         assert_eq!(heap.last_sweep_stats().freed, 1);
     }
 
+    /// W1 deletion invariant (test matrix G3, list-mechanics half): a
+    /// cross-list move of a gray-listed object deletes its grayagain entry and
+    /// clears `HDR_GRAY_LISTED`, via `unlink_from_list` ->
+    /// `correct_generation_pointers` -> `unlink_grayagain`. Covers both the
+    /// `allgc -> finobj` and `tobefnz -> allgc` transitions, and every move
+    /// returns `true` (R1 item 7 sync note). Deterministic; identical on
+    /// pristine and W1 code.
+    #[test]
+    fn cross_list_move_deletes_grayagain_entry() {
+        let heap = Heap::new();
+        heap.unpause();
+        let obj = heap.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        obj.set_age(GcAge::Old1);
+        obj.set_color(Color::Gray);
+        heap.remember_minor_revisit(obj.as_trace_ptr());
+        assert_eq!(heap.grayagain_count(), 1);
+        assert!(heap.header_from_ptr(obj.as_trace_ptr()).gray_listed());
+        assert!(heap.move_allgc_to_finobj(obj.as_trace_ptr()));
+        assert_eq!(
+            heap.grayagain_count(),
+            0,
+            "allgc->finobj move deletes the grayagain entry"
+        );
+        assert!(!heap.header_from_ptr(obj.as_trace_ptr()).gray_listed());
+
+        let heap = Heap::new();
+        heap.unpause();
+        let obj = heap.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        assert!(heap.move_allgc_to_finobj(obj.as_trace_ptr()));
+        assert!(heap.move_finobj_to_tobefnz(obj.as_trace_ptr()));
+        obj.set_age(GcAge::Old1);
+        obj.set_color(Color::Gray);
+        heap.remember_minor_revisit(obj.as_trace_ptr());
+        assert_eq!(heap.grayagain_count(), 1);
+        assert!(heap.move_tobefnz_to_allgc(obj.as_trace_ptr()));
+        assert_eq!(
+            heap.grayagain_count(),
+            0,
+            "tobefnz->allgc move deletes the grayagain entry"
+        );
+        assert!(!heap.header_from_ptr(obj.as_trace_ptr()).gray_listed());
+    }
+
+    /// Test matrix G3 (graph-shaped, baseline-first). Root -> exact-`Old`
+    /// parent (skipped by `Marker::should_trace_age` in a minor) -> a
+    /// gray-listed `Old1` transitional object -> a `New` young child. Moving
+    /// the transitional off `allgc` deletes its grayagain entry (the only
+    /// revisit rooting the child), then a minor runs. This is a pure
+    /// generational-liveness property of *today's* collector that W1 inherits
+    /// unchanged — `correct_generation_pointers`' deletion, `should_trace_age`,
+    /// and the minor mark/sweep are all untouched by W1.
+    ///
+    /// BASELINE (recorded against pristine origin/main, via a throwaway
+    /// worktree, 2026-07-13): the young child is FREED by the minor
+    /// (`allgc_count` 3 -> 2). With the transitional's grayagain entry deleted
+    /// by the move and the parent exact-`Old` (so the minor marker never
+    /// descends into it), nothing re-marks the transitional and its `New`
+    /// child is swept. This is the "reachable young child dying" case the spec
+    /// anticipates (§"Every owner-list move"): a pre-existing latent hole in
+    /// the generational collector, filed separately, NOT a W1 regression and
+    /// NOT something W1 fixes. W1 reproduces the baseline exactly. The test is
+    /// `#[ignore]`d because it asserts the *correct* invariant (child should
+    /// survive), which the pre-existing baseline violates; running it
+    /// (`cargo test -p lua-gc -- --ignored g3_`) documents the live gap.
+    #[test]
+    #[ignore = "pre-existing generational-liveness gap: reachable young child \
+                dies when a gray-listed transitional is moved cross-list; \
+                identical on pristine and W1 — filed separately, not a W1 bug"]
+    fn g3_moved_transitional_keeps_young_child_reachable() {
+        let heap = Heap::new();
+        heap.unpause();
+        let child = heap.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        let transitional = heap.allocate(Cell0 {
+            next: Cell::new(Some(child)),
+            marker_calls: Cell::new(0),
+        });
+        let parent = heap.allocate(Cell0 {
+            next: Cell::new(Some(transitional)),
+            marker_calls: Cell::new(0),
+        });
+        parent.set_age(GcAge::Old);
+        parent.set_color(Color::Black);
+        transitional.set_age(GcAge::Old1);
+        transitional.set_color(Color::Gray);
+        heap.remember_minor_revisit(transitional.as_trace_ptr());
+        assert_eq!(heap.grayagain_count(), 1);
+        assert_eq!(heap.allgc_count(), 3);
+
+        assert!(heap.move_allgc_to_finobj(transitional.as_trace_ptr()));
+        assert_eq!(
+            heap.grayagain_count(),
+            0,
+            "cross-list move deletes the grayagain entry"
+        );
+
+        heap.minor_collect_with_post_mark(&OneRoot(Some(parent)), |_| {});
+
+        assert_eq!(
+            heap.allgc_count(),
+            3,
+            "reachable young child should survive the minor"
+        );
+    }
+
+    /// W1 teardown ordering (test matrix G3 teardown case / drop_all). A
+    /// gray-listed object is present when `drop_all` runs;
+    /// `clear_generation_cursors` -> `clear_grayagain` empties the grayagain
+    /// `Vec` (and clears flags) *before* any `drop_list` frees a box, so no
+    /// grayagain entry can point at a freed box. After teardown the set is
+    /// empty and the heap holds nothing.
+    #[test]
+    fn drop_all_clears_grayagain_before_freeing() {
+        let heap = Heap::new();
+        heap.unpause();
+        let obj = heap.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        obj.set_age(GcAge::Old);
+        heap.generational_backward_barrier(obj);
+        assert_eq!(heap.grayagain_count(), 1);
+
+        heap.drop_all();
+
+        assert_eq!(heap.grayagain_count(), 0);
+        assert_eq!(heap.allgc_count(), 0);
+    }
+
     /// Header-size regression for #113 Wave 1. Removing the `gray_next`
     /// grayagain fat pointer shrinks `GcHeader` from **40 B to 24 B on
     /// 64-bit** (`color + age + flags + pad + size(u32) + next(16)`), align 8.
