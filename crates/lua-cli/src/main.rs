@@ -1574,6 +1574,8 @@ fn main() -> ExitCode {
             eprintln!("[opcode-profile] failed to write report: {}", err);
         }
 
+        lua_vm::state::close(state);
+
         Ok(code)
     }));
 

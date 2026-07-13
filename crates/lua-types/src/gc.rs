@@ -92,6 +92,19 @@ impl<T: Trace + 'static> GcRef<T> {
     /// check, so it keeps upgrading after sweep frees the target. That case
     /// panics unconditionally in every build; detached (process-lifetime)
     /// targets keep the legacy always-upgrades behavior.
+    ///
+    /// A `GcRef` obtained before its heap closed (`Heap::drop_all` /
+    /// `close`) is dangling afterwards, and calling this on it is
+    /// use-after-free — the same contract as after `Heap::drop`. (Quarantine
+    /// mode detects use-after-*sweep* while the heap is alive; teardown
+    /// frees even quarantined boxes for real, so post-close dereferences are
+    /// plain UB with no tripwire.) When the *closed* heap is the active
+    /// guard, the closed-heap token refusal makes the resulting weak handle
+    /// permanently dead; with no guard or a different heap active, the
+    /// guard-mismatch cases above apply unchanged. A `Gc` box carries no
+    /// owner identity of its own to validate against — fixing that is the
+    /// heap-ownership redesign tracked as the #252 follow-up, not a #260
+    /// teardown property.
     pub fn downgrade(&self) -> GcWeak<T> {
         let identity = self.identity();
         let tracked = lua_gc::with_current_heap(|heap| {
@@ -282,6 +295,28 @@ mod tests {
             GcRef::new(Cell0)
         };
         strong.account_buffer(64);
+    }
+
+    /// Codex finding 2 on issue #260: downgrading a stale `GcRef` AFTER the
+    /// heap closed (its box already freed by `drop_all`) must yield a weak
+    /// handle that never upgrades. Before the closed-heap token refusal,
+    /// `downgrade` re-registered the freed box's address in the token map and
+    /// the weak handle upgraded into freed memory.
+    #[test]
+    fn downgrade_after_close_cannot_resurrect_freed_box() {
+        let heap = lua_gc::Heap::new();
+        heap.unpause();
+        let _guard = lua_gc::HeapGuard::push(&heap);
+
+        let stale = GcRef::new(Cell0);
+        heap.drop_all();
+
+        let weak = stale.downgrade();
+        assert!(
+            weak.upgrade().is_none(),
+            "a weak handle minted after close must never upgrade — the box \
+             is freed and the heap is closed"
+        );
     }
 }
 

@@ -1508,6 +1508,23 @@ pub struct Heap {
     /// `Gc::new_uncollected` boxes, which carry no heap reference at all
     /// (allocated before any `Heap` exists, or with no `HeapGuard` active).
     uncollected: Cell<Option<NonNull<GcBox<dyn Trace>>>>,
+    /// Set once at the top of [`drop_all`](Self::drop_all) and never cleared:
+    /// this heap has begun (or completed) teardown. This is the durable half
+    /// of a deliberate two-state distinction with [`tearing_down`](Self::tearing_down),
+    /// which is true *only* while the drain loop runs. A post-close
+    /// [`allocate`](Self::allocate) / [`allocate_uncollected`](Self::allocate_uncollected)
+    /// panics precisely when `closed && !tearing_down` — the signature of a
+    /// [`HeapGuard`] that outlived `close()` and tried to allocate into a
+    /// torn-down heap. Read through [`is_closed`](Self::is_closed).
+    closed: Cell<bool>,
+    /// True for the duration of the [`drop_all`](Self::drop_all) drain loop
+    /// only, and the transient half of the two-state teardown distinction with
+    /// [`closed`](Self::closed). Re-entrant allocation from a payload `Drop`
+    /// running *inside* the drain is legitimate — drain-until-stable frees
+    /// whatever a destructor allocates on a later pass — so the closed-heap
+    /// allocation panic is suppressed while this is set. It re-arms the instant
+    /// the final (empty) pass completes and this clears.
+    tearing_down: Cell<bool>,
     /// While non-zero, [`allocate`](Self::allocate) routes through
     /// [`allocate_uncollected`](Self::allocate_uncollected) instead of the
     /// normal collectable `head` list. Raised around VM construction
@@ -1608,6 +1625,8 @@ impl Heap {
             quarantine: std::env::var_os("LUA_RS_GC_QUARANTINE").is_some_and(|v| v == "1"),
             quarantined: Cell::new(None),
             uncollected: Cell::new(None),
+            closed: Cell::new(false),
+            tearing_down: Cell::new(false),
             bootstrap_depth: std::rc::Rc::new(Cell::new(0)),
             pause_multiplier: Cell::new(200), // 200% = collect when bytes 2x threshold
             state: Cell::new(GcState::Pause),
@@ -1634,6 +1653,17 @@ impl Heap {
 
     pub fn is_paused(&self) -> bool {
         self.paused.get()
+    }
+
+    /// True once [`drop_all`](Self::drop_all) has begun tearing this heap
+    /// down. After this returns true, [`allocate`](Self::allocate) and
+    /// [`allocate_uncollected`](Self::allocate_uncollected) panic — a
+    /// [`HeapGuard`] that outlived `close()` cannot allocate into a
+    /// torn-down heap — with one exception: re-entrant allocation from a
+    /// destructor running inside the teardown drain itself, which the drain
+    /// is designed to accept.
+    pub fn is_closed(&self) -> bool {
+        self.closed.get()
     }
 
     /// Enter bootstrap mode: [`allocate`](Self::allocate) routes new boxes
@@ -1677,10 +1707,23 @@ impl Heap {
         }
     }
 
+    /// Guard both allocation entry points against a closed heap. Fires only
+    /// when the heap is `closed` and no longer `tearing_down` — i.e. `close()`
+    /// (via `drop_all`) has fully completed and a [`HeapGuard`] that outlived
+    /// it is trying to allocate. Re-entrant allocation from a destructor
+    /// *during* the drain sees `tearing_down` set and is allowed through,
+    /// because drain-until-stable frees whatever it allocates on a later pass.
+    fn assert_open(&self) {
+        if self.closed.get() && !self.tearing_down.get() {
+            panic!("allocation into a closed heap — a HeapGuard outlived close()");
+        }
+    }
+
     /// Allocate a new `GcBox<T>` and prepend it to the allgc chain. While
     /// [`is_bootstrapping`](Self::is_bootstrapping) is true, delegates to
     /// [`allocate_uncollected`](Self::allocate_uncollected) instead.
     pub fn allocate<T: Trace + 'static>(&self, value: T) -> Gc<T> {
+        self.assert_open();
         if self.is_bootstrapping() {
             return self.allocate_uncollected(value);
         }
@@ -1717,6 +1760,7 @@ impl Heap {
     /// diagnostics for the collectable set; an object that sweep never visits
     /// would inflate them permanently.
     pub fn allocate_uncollected<T: Trace + 'static>(&self, value: T) -> Gc<T> {
+        self.assert_open();
         let size = std::mem::size_of::<GcBox<T>>();
         let boxed = Box::new(GcBox {
             header: GcHeader::new_white(size, self.current_white.get(), HDR_HEAP_OWNED),
@@ -1771,12 +1815,29 @@ impl Heap {
 
     /// Cheap predicate: would a `step()` actually do work? Equivalent to
     /// `!paused && bytes_used() >= threshold_bytes()`. Callers that build
-    /// snapshot state before invoking the heap should gate on this.
+    /// snapshot state before invoking the heap should gate on this. Always
+    /// false once the heap is closed (see [`collection_inert`](Self::collection_inert)).
     pub fn would_collect(&self) -> bool {
-        if self.stress {
-            return !self.paused.get();
+        if self.collection_inert() {
+            return false;
         }
-        !self.paused.get() && self.bytes.get() >= self.threshold.get()
+        if self.stress {
+            return true;
+        }
+        self.bytes.get() >= self.threshold.get()
+    }
+
+    /// True when every collection entry point must be a no-op: the heap is
+    /// paused, or it is `closed` (teardown has begun or completed). The
+    /// closed arm is load-bearing for teardown soundness (issue #260 codex
+    /// round 2, finding 1): a destructor running inside the `drop_all` drain
+    /// can invoke a collection, and `sweep_young` re-installs grayagain
+    /// entries via `replace_grayagain` — pointers a later drain pass frees,
+    /// recreating the second-`drop_all` use-after-free that gating only the
+    /// barrier path was meant to prevent. No collection may ever run on a
+    /// closed heap; every public collect/step/mark entry checks this.
+    fn collection_inert(&self) -> bool {
+        self.paused.get() || self.closed.get()
     }
 
     pub fn collections(&self) -> usize {
@@ -2046,7 +2107,21 @@ impl Heap {
     /// holds a duplicate (`grayagain_links_object_once` pins this). Tail-append
     /// replaces the intrusive list's prepend; the two consumers are
     /// order-insensitive (see `mark_minor_revisit_objects` / `sweep_young`).
+    ///
+    /// Inert once the heap is `closed`: no collection can ever run again on a
+    /// closed heap, so the revisit obligation is void — and accepting entries
+    /// would be a use-after-free factory. A destructor running inside the
+    /// teardown drain can fire a generational barrier on a box it just
+    /// allocated; a later drain pass frees that box, and if the pointer had
+    /// been recorded here a second `drop_all` (or `Heap::drop` after an
+    /// explicit close) would dereference the freed header in
+    /// `clear_grayagain`. This is the single grayagain entry point (both
+    /// generational barriers route through it), so gating it here covers
+    /// every barrier path.
     fn remember_minor_revisit(&self, ptr: NonNull<GcBox<dyn Trace>>) {
+        if self.closed.get() {
+            return;
+        }
         let header = self.header_from_ptr(ptr);
         if header.gray_listed() {
             return;
@@ -2174,7 +2249,16 @@ impl Heap {
     /// (a freed identity re-registered by a fresh object) the new token differs
     /// from any stale handle's, preventing address reuse from resurrecting a
     /// dead handle. Objects that are never weak-referenced never enter the map.
+    ///
+    /// On a `closed` heap this refuses to mint: it returns 0 — a value
+    /// [`next_token`](Self::next_token) never issues, so it can never
+    /// validate — without touching the map. A downgrade of a stale `GcRef`
+    /// after close would otherwise re-register the freed box's address and
+    /// resurrect it as an upgradable weak target.
     pub fn register_allocation_token(&self, identity: usize) -> usize {
+        if self.closed.get() {
+            return 0;
+        }
         let mut tokens = self.allocation_tokens.borrow_mut();
         if let Some(token) = tokens.get(&identity) {
             return *token;
@@ -2187,8 +2271,13 @@ impl Heap {
     /// Return true when `identity` still names the same heap allocation.
     ///
     /// The token check prevents allocator address reuse from making a stale
-    /// weak handle look live again.
+    /// weak handle look live again. Unconditionally false once the heap is
+    /// `closed`: every box is freed (or about to be, mid-drain), so no weak
+    /// handle may upgrade regardless of what the token map transiently holds.
     pub fn contains_allocation(&self, identity: usize, token: usize) -> bool {
+        if self.closed.get() {
+            return false;
+        }
         self.allocation_token(identity) == Some(token)
     }
 
@@ -2295,7 +2384,7 @@ impl Heap {
     /// short-circuit path. The runtime uses this to bridge weak-table
     /// pruning into implicit GC steps fired from inside the VM loop.
     pub fn step_with_post_mark<F: FnMut(&mut Marker)>(&self, roots: &dyn Trace, post_mark: F) {
-        if self.paused.get() {
+        if self.collection_inert() {
             return;
         }
         if !self.stress && self.bytes.get() < self.threshold.get() {
@@ -2319,7 +2408,7 @@ impl Heap {
         roots: &dyn Trace,
         mut post_mark: F,
     ) {
-        if self.paused.get() {
+        if self.collection_inert() {
             return;
         }
         let mut marker = self.marker_from_pool(MarkerMode::Full);
@@ -2363,7 +2452,7 @@ impl Heap {
         roots: &dyn Trace,
         mut post_mark: F,
     ) {
-        if self.paused.get() {
+        if self.collection_inert() {
             return;
         }
         if !self.state.get().is_pause() {
@@ -2404,7 +2493,7 @@ impl Heap {
         roots: &dyn Trace,
         mut post_mark: F,
     ) {
-        if self.paused.get() {
+        if self.collection_inert() {
             return;
         }
         if !self.state.get().is_pause() {
@@ -2443,7 +2532,7 @@ impl Heap {
         mut budget: StepBudget,
         mut post_mark: F,
     ) -> StepOutcome {
-        if self.paused.get() {
+        if self.collection_inert() {
             return StepOutcome::SkippedStopped;
         }
         self.run_budgeted(roots, &mut budget, &mut post_mark);
@@ -2594,7 +2683,7 @@ impl Heap {
         max_work: isize,
         mut post_mark: F,
     ) -> StepOutcome {
-        if self.paused.get() {
+        if self.collection_inert() {
             return StepOutcome::SkippedStopped;
         }
         let work = max_work.max(1);
@@ -3009,28 +3098,118 @@ impl Heap {
         count
     }
 
-    /// Drop every allocation, ignoring reachability. Called at shutdown.
+    /// Drop every allocation, ignoring reachability. Called at shutdown
+    /// (`Heap::drop`, and the VM's `close_state` / `free_all_objects`).
+    ///
+    /// **Drain until stable.** A single pass over the owner lists is not
+    /// enough: a payload `Drop` may itself allocate — a `GcRef::new` in a
+    /// destructor relinks a fresh box onto `head` (or onto `uncollected`
+    /// inside a bootstrap window) — and that box would be stranded on a
+    /// just-emptied list and leaked outright if the walk were `Heap::drop`'s
+    /// own. So this loops over every owner list until a full pass frees
+    /// nothing, then zeroes accounting.
+    ///
+    /// `closed` is set at the top and never cleared; `tearing_down` is held
+    /// across the loop so those re-entrant allocations are accepted rather
+    /// than panicking against the now-closed heap, and re-arms the panic once
+    /// the loop settles. Grayagain is emptied and its flags cleared (via
+    /// [`clear_generation_cursors`](Self::clear_generation_cursors)) before any
+    /// free, preserving the pre-existing ordering.
+    ///
+    /// **Nonconvergence is a panic, in every build.** A destructor that
+    /// allocates a new box on every pass would spin this loop forever; after
+    /// 10,000 passes the loop panics naming that cause. An unconditional
+    /// panic is deliberate — a silent infinite hang inside `close()` in a
+    /// release build is strictly worse than a loud failure.
+    ///
+    /// **Panic safety.** `tearing_down` is restored by an RAII guard, so a
+    /// panicking destructor (or the pass-cap panic) leaves the heap `closed`
+    /// with the closed-heap allocation panic correctly re-armed, never stuck
+    /// in a state that accepts allocations forever. A destructor that panics
+    /// mid-teardown does, however, leak the not-yet-freed remainder of the
+    /// list chain being drained: the local cursor into that chain dies with
+    /// the unwinding frame. Panicking in `Drop` is programmer error; the
+    /// guarantee kept here is that the heap's state machine stays sound, not
+    /// that a panicking destructor is leak-free.
+    ///
     /// After this returns, every outstanding `Gc<T>` is dangling — callers
-    /// must ensure no `Gc<T>` outlives the `Heap`.
+    /// must ensure no `Gc<T>` outlives the `Heap`. **Any** operation that
+    /// dereferences a pre-close `Gc`/`GcRef` after this returns — deref,
+    /// `downgrade` header reads, `account_buffer` — is use-after-free,
+    /// exactly as it always was after `Heap::drop`; close does not widen or
+    /// narrow that contract, it only makes the free deterministic. Note the
+    /// quarantine caveat: `LUA_RS_GC_QUARANTINE=1` catches use-after-*sweep*
+    /// while the heap lives, but this teardown drains the quarantined list
+    /// and frees its boxes for real — post-close stale dereferences have no
+    /// `HDR_FREED` tripwire left to hit. The VM's own close paths
+    /// cannot hit this (`free_all_objects` clears every registry that holds
+    /// handles); giving boxes a checkable owner identity at `downgrade` time
+    /// is the #252-follow-up ownership redesign, out of scope here.
     pub fn drop_all(&self) {
+        /// Restores `tearing_down` on scope exit — including panic unwind —
+        /// but only for the outermost `drop_all` frame (`armed`), so a
+        /// re-entrant `drop_all` from inside a payload `Drop` cannot clear
+        /// the flag out from under the outer drain.
+        struct TearingDownReset<'a> {
+            flag: &'a Cell<bool>,
+            armed: bool,
+        }
+        impl Drop for TearingDownReset<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.flag.set(false);
+                }
+            }
+        }
+
+        self.closed.set(true);
+        let _reset = TearingDownReset {
+            armed: !self.tearing_down.replace(true),
+            flag: &self.tearing_down,
+        };
         self.recycle_marker_cell();
         self.sweep_prev_next.set(None);
         self.clear_generation_cursors();
         self.state.set(GcState::Pause);
         self.allocation_tokens.borrow_mut().clear();
-        self.drop_list(&self.head);
-        self.drop_list(&self.finobj);
-        self.drop_list(&self.tobefnz);
-        self.drop_list(&self.quarantined);
-        self.drop_list(&self.uncollected);
+
+        let mut passes = 0usize;
+        loop {
+            let mut freed_any = false;
+            freed_any |= self.drop_list(&self.head);
+            freed_any |= self.drop_list(&self.finobj);
+            freed_any |= self.drop_list(&self.tobefnz);
+            freed_any |= self.drop_list(&self.quarantined);
+            freed_any |= self.drop_list(&self.uncollected);
+            if !freed_any {
+                break;
+            }
+            passes = passes.saturating_add(1);
+            if passes >= 10_000 {
+                panic!(
+                    "Heap::drop_all did not converge after 10000 passes — a \
+                     nonconvergent destructor is allocating a new GC box on \
+                     every teardown pass"
+                );
+            }
+        }
+
+        self.allocation_tokens.borrow_mut().clear();
         self.bytes.set(0);
         self.objects.set(0);
     }
 
-    fn drop_list(&self, list: &Cell<Option<NonNull<GcBox<dyn Trace>>>>) {
+    /// Free every box on one owner list, returning whether any box was freed.
+    /// A payload `Drop` run by the `Box::from_raw` here may relink a fresh box
+    /// onto this same list head; `next` is read before the drop so the local
+    /// walk is unaffected, and the fresh box is caught by a later drain pass in
+    /// [`drop_all`](Self::drop_all).
+    fn drop_list(&self, list: &Cell<Option<NonNull<GcBox<dyn Trace>>>>) -> bool {
         let mut cursor = list.get();
         list.set(None);
+        let mut freed = false;
         while let Some(ptr) = cursor {
+            freed = true;
             // SAFETY: same chain invariant as full_collect's sweep.
             let next = unsafe {
                 let next = (*ptr.as_ptr()).header.next.get();
@@ -3039,9 +3218,20 @@ impl Heap {
             };
             cursor = next;
         }
+        freed
     }
 }
 
+/// Last-resort teardown when the final `Rc<Heap>` drops without an explicit
+/// close. Runs the same drain as [`Heap::drop_all`], but with one contract
+/// difference callers must know: no `HeapGuard` can be active for *this*
+/// heap here — the `Rc` is mid-destruction, so there is no sound handle to
+/// push (do not try to smuggle one in). A payload destructor that allocates
+/// via `GcRef::new` during a plain unguarded `Heap::drop` therefore panics
+/// loudly with the #253 no-guard message instead of allocating into a dying
+/// heap. The supported deterministic-teardown path for VM heaps is
+/// state-level close (`close_state` → `free_all_objects`), which pushes the
+/// guard around the drain so such destructors work.
 impl Drop for Heap {
     fn drop(&mut self) {
         self.drop_all();
@@ -4527,6 +4717,265 @@ mod tests {
             heap.allgc_count(),
             0,
             "after end_bootstrap, an unreachable allocation must be swept normally"
+        );
+    }
+
+    // ── issue #260: deterministic close — drain-until-stable drop_all + closed flag ──
+
+    /// A `Trace` payload whose `Drop` flips its flag and then allocates a
+    /// fresh drop-flag box into the currently-active heap. Exercises
+    /// `drop_all`'s drain-until-stable loop: a destructor that allocates
+    /// mid-teardown must have its box freed by a later pass, not stranded.
+    struct AllocOnDrop {
+        flag: std::rc::Rc<Cell<bool>>,
+        inner: std::rc::Rc<Cell<bool>>,
+    }
+    impl Trace for AllocOnDrop {
+        fn trace(&self, _m: &mut Marker) {}
+    }
+    impl Drop for AllocOnDrop {
+        fn drop(&mut self) {
+            self.flag.set(true);
+            with_current_heap(|heap| {
+                if let Some(heap) = heap {
+                    let _ = heap.allocate(Tracked(DropFlag(self.inner.clone())));
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn close_frees_objects_while_outer_guard_alive() {
+        let heap = Heap::new();
+        heap.unpause();
+        let guard = HeapGuard::push(&heap);
+
+        let dropped = std::rc::Rc::new(Cell::new(false));
+        let _gc = heap.allocate(Tracked(DropFlag(dropped.clone())));
+        assert!(!dropped.get());
+
+        heap.drop_all();
+        assert!(
+            dropped.get(),
+            "drop_all must run the object's destructor during the close call, \
+             while the outer guard is still alive"
+        );
+        assert!(heap.is_closed());
+        assert_eq!(heap.bytes_used(), 0);
+        drop(guard);
+    }
+
+    #[test]
+    #[should_panic(expected = "closed heap")]
+    fn allocate_into_closed_heap_panics() {
+        let heap = Heap::new();
+        heap.unpause();
+        let _guard = HeapGuard::push(&heap);
+        heap.drop_all();
+        let _ = heap.allocate(Tracked(DropFlag(std::rc::Rc::new(Cell::new(false)))));
+    }
+
+    #[test]
+    fn destructor_allocating_during_teardown_does_not_leak() {
+        let heap = Heap::new();
+        heap.unpause();
+        let _guard = HeapGuard::push(&heap);
+
+        let outer = std::rc::Rc::new(Cell::new(false));
+        let inner = std::rc::Rc::new(Cell::new(false));
+        let _gc = heap.allocate(AllocOnDrop {
+            flag: outer.clone(),
+            inner: inner.clone(),
+        });
+
+        heap.drop_all();
+        assert!(outer.get(), "the destructor itself must have run");
+        assert!(
+            inner.get(),
+            "the box the destructor allocated mid-teardown must be freed by a \
+             later drain pass, not leaked"
+        );
+        assert_eq!(heap.bytes_used(), 0);
+    }
+
+    #[test]
+    fn weak_handles_dead_immediately_after_close() {
+        let heap = Heap::new();
+        heap.unpause();
+        let _guard = HeapGuard::push(&heap);
+
+        let gc = heap.allocate(Tracked(DropFlag(std::rc::Rc::new(Cell::new(false)))));
+        let identity = gc.identity();
+        let token = heap.register_allocation_token(identity);
+        let weak = HeapRef::from_heap(&heap);
+        assert!(
+            weak.contains_allocation(identity, token),
+            "weak handle upgrades while the box is live"
+        );
+
+        heap.drop_all();
+
+        assert!(
+            !weak.contains_allocation(identity, token),
+            "weak handle must fail to upgrade the instant close clears the \
+             allocation tokens, while the heap Rc is still alive"
+        );
+    }
+
+    /// A `Trace` payload whose `Drop` allocates a fresh box and fires the
+    /// generational-barrier path (`remember_minor_revisit`) on it, mid-drain.
+    /// Codex finding 1 on #260: before the closed-heap gate, that pushed a
+    /// pointer into grayagain which a later drain pass freed — a second
+    /// `drop_all` (or `Heap::drop` after an explicit close) then dereferenced
+    /// the freed header in `clear_grayagain`.
+    struct BarrierOnDrop {
+        flag: std::rc::Rc<Cell<bool>>,
+        inner: std::rc::Rc<Cell<bool>>,
+    }
+    impl Trace for BarrierOnDrop {
+        fn trace(&self, _m: &mut Marker) {}
+    }
+    impl Drop for BarrierOnDrop {
+        fn drop(&mut self) {
+            self.flag.set(true);
+            with_current_heap(|heap| {
+                if let Some(heap) = heap {
+                    let fresh = heap.allocate(Tracked(DropFlag(self.inner.clone())));
+                    heap.remember_minor_revisit(fresh.as_trace_ptr());
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn teardown_barrier_cannot_repopulate_grayagain() {
+        let heap = Heap::new();
+        heap.unpause();
+        let _guard = HeapGuard::push(&heap);
+
+        let outer = std::rc::Rc::new(Cell::new(false));
+        let inner = std::rc::Rc::new(Cell::new(false));
+        let _gc = heap.allocate(BarrierOnDrop {
+            flag: outer.clone(),
+            inner: inner.clone(),
+        });
+
+        heap.drop_all();
+        assert!(outer.get(), "the destructor itself must have run");
+        assert!(
+            inner.get(),
+            "the box the destructor allocated must still be drained"
+        );
+        assert_eq!(
+            heap.grayagain_count(),
+            0,
+            "a barrier fired during teardown must not park a soon-freed \
+             pointer in grayagain"
+        );
+
+        heap.drop_all();
+        assert_eq!(heap.grayagain_count(), 0);
+        assert_eq!(heap.bytes_used(), 0);
+    }
+
+    /// A `Trace` payload whose `Drop` allocates a fresh box, roots it, and
+    /// invokes minor + full collections mid-drain. Codex round 2 finding 1 on
+    /// #260: with only the barrier path gated, a destructor-run
+    /// `minor_collect` reaches `sweep_young` → `replace_grayagain` and
+    /// re-installs grayagain entries a later drain pass frees — recreating
+    /// the second-`drop_all` UAF. Every collection entry point must be inert
+    /// on a closed heap.
+    struct CollectOnDrop {
+        flag: std::rc::Rc<Cell<bool>>,
+        inner: std::rc::Rc<Cell<bool>>,
+    }
+    struct TrackedRoot(Option<Gc<Tracked>>);
+    impl Trace for TrackedRoot {
+        fn trace(&self, m: &mut Marker) {
+            if let Some(g) = self.0 {
+                m.mark(g);
+            }
+        }
+    }
+    impl Trace for CollectOnDrop {
+        fn trace(&self, _m: &mut Marker) {}
+    }
+    impl Drop for CollectOnDrop {
+        fn drop(&mut self) {
+            self.flag.set(true);
+            with_current_heap(|heap| {
+                if let Some(heap) = heap {
+                    let fresh = heap.allocate(Tracked(DropFlag(self.inner.clone())));
+                    let root = TrackedRoot(Some(fresh));
+                    heap.minor_collect_with_post_mark(&root, |_: &mut Marker| {});
+                    heap.full_collect(&root);
+                    heap.step(&root);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn collections_invoked_by_teardown_destructor_are_inert() {
+        let heap = Heap::new();
+        heap.unpause();
+        let _guard = HeapGuard::push(&heap);
+
+        let outer = std::rc::Rc::new(Cell::new(false));
+        let inner = std::rc::Rc::new(Cell::new(false));
+        let _gc = heap.allocate(CollectOnDrop {
+            flag: outer.clone(),
+            inner: inner.clone(),
+        });
+
+        heap.drop_all();
+        assert!(outer.get(), "the destructor itself must have run");
+        assert!(
+            inner.get(),
+            "the box the destructor allocated must still be drained"
+        );
+        assert_eq!(
+            heap.minor_collections(),
+            0,
+            "a minor collection invoked from a teardown destructor must be inert"
+        );
+        assert_eq!(
+            heap.full_collections(),
+            0,
+            "a full collection invoked from a teardown destructor must be inert"
+        );
+        assert_eq!(heap.grayagain_count(), 0);
+
+        heap.drop_all();
+        assert_eq!(heap.grayagain_count(), 0);
+        assert_eq!(heap.bytes_used(), 0);
+        assert!(!heap.would_collect());
+    }
+
+    /// Codex finding 2 on #260, heap-level half: after close, the token
+    /// machinery must refuse to mint (0 is never a valid token) and
+    /// `contains_allocation` must be unconditionally false, so a post-close
+    /// downgrade cannot resurrect a freed box as an upgradable weak target.
+    #[test]
+    fn post_close_token_minting_is_refused() {
+        let heap = Heap::new();
+        heap.unpause();
+        let _guard = HeapGuard::push(&heap);
+
+        let gc = heap.allocate(Tracked(DropFlag(std::rc::Rc::new(Cell::new(false)))));
+        let identity = gc.identity();
+
+        heap.drop_all();
+
+        let token = heap.register_allocation_token(identity);
+        assert_eq!(token, 0, "a closed heap must refuse to mint a token");
+        assert!(
+            !heap.contains_allocation(identity, token),
+            "the refused token must never validate"
+        );
+        assert!(
+            heap.allocation_token(identity).is_none(),
+            "the refusal must not have touched the token map"
         );
     }
 }
