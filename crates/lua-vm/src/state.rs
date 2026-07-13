@@ -1958,8 +1958,6 @@ impl GlobalState {
 
     /// Total live bytes allocated, as reported by the collector-owned heap
     /// accounting model.
-    ///
-    /// macros.tsv: `gettotalbytes → g.total_bytes()`
     pub fn total_bytes(&self) -> usize {
         self.heap.bytes_used().max(1)
     }
@@ -1983,63 +1981,47 @@ impl GlobalState {
         }
     }
 
-    /// Returns `true` when the state has been fully initialized.
-    ///
-    /// macros.tsv: `completestate → g.is_complete()`
-    ///
-    /// PORT NOTE: C uses `g->nilvalue` being nil as the "complete" signal.
-    /// We replicate the same logic: `nilvalue == Nil` means complete.
+    /// Returns `true` when the state has been fully initialized. Checks
+    /// `nilvalue == Nil`, mirroring C's check of `ttisnil(&g->nilvalue)`.
     pub fn is_complete(&self) -> bool {
         matches!(self.nilvalue, LuaValue::Nil)
     }
 
     /// Returns the "current white" GC color bitmask.
     ///
-    /// macros.tsv: `luaC_white → g.current_white()`
-    ///
-    /// PORT NOTE: the effective dual-white collector state lives in
-    /// `lua_gc::Heap`; this field preserves the translated `global_State`
-    /// shape for code that still reads the upstream bitmask.
+    /// The effective dual-white collector state lives in `lua_gc::Heap`;
+    /// this field preserves the translated `global_State` shape for code
+    /// that still reads the upstream bitmask.
     pub fn current_white(&self) -> u8 {
         self.currentwhite
     }
 
     /// Returns the "other white" GC color bitmask.
-    ///
-    /// macros.tsv: `otherwhite → g.other_white()`
     pub fn other_white(&self) -> u8 {
         self.currentwhite ^ 0x03
     }
 
     /// Returns `true` if the GC is in generational mode.
-    ///
-    /// macros.tsv: `isdecGCmodegen → g.is_gen_mode()`
     pub fn is_gen_mode(&self) -> bool {
         self.gckind == GcKind::Generational as u8 || self.lastatomic != 0
     }
 
     /// Returns `true` if the GC is currently running.
-    ///
-    /// macros.tsv: `gcrunning → g.gc_running()`
     pub fn gc_running(&self) -> bool {
         self.gcstp == 0
     }
 
     /// Returns `true` while the GC is in its propagation phase.
-    ///
-    /// macros.tsv: `keepinvariant → g.keep_invariant()`
     pub fn keep_invariant(&self) -> bool {
         self.heap.gc_state().is_invariant()
     }
 
     /// Returns `true` while the GC is in a sweep phase.
-    ///
-    /// macros.tsv: `issweepphase → g.is_sweep_phase()`
     pub fn is_sweep_phase(&self) -> bool {
         self.heap.gc_state().is_sweep()
     }
 
-    // ── Phase-B stubs ─────────────────────────────────────────────────────────
+    // ── GC parameter accessors ────────────────────────────────────────────────
     pub fn gc_debt(&self) -> isize {
         self.gc_debt
     }
@@ -2115,10 +2097,8 @@ impl GlobalState {
     /// Returns the interned `__xxx` name string for tag method `tm`, or
     /// `None` if `tmname` has not yet been initialised (early bootstrap).
     ///
-    /// macros.tsv: `getshrstr(G(L)->tmname[tm]) → g.tm_name(tm)`.
-    ///
-    /// PORT NOTE: The lua-vm crate carries two distinct `TagMethod` enums
-    /// (one in `lua-types`, one in `crate::tagmethods`) with identical
+    /// The lua-vm crate carries two distinct `TagMethod` enums (one in
+    /// `lua-types`, one in `crate::tagmethods`) with identical
     /// `#[repr(u8)]` ordering. The [`TmIndex`] trait bridges them so callers
     /// from either side can index `tmname` uniformly.
     pub fn tm_name<T: TmIndex>(&self, tm: T) -> Option<GcRef<LuaString>> {
@@ -2160,8 +2140,6 @@ use lua_types::tagmethod::TagMethod;
 // ─── LuaState ────────────────────────────────────────────────────────────────
 
 /// Per-thread Lua execution state.
-///
-/// types.tsv: `lua_State → LuaState`
 ///
 /// All stack-pointer fields in C (`StkIdRel`, `StkId`) become `StackIdx` (u32
 /// index into `stack: Vec<StackValue>`).  The C intrusive `CallInfo` linked list
@@ -2523,8 +2501,6 @@ impl LuaState {
     }
 
     /// Push a value onto the stack, incrementing `top`.
-    ///
-    /// macros.tsv: `api_incr_top → gone — state.push() already increments`
     #[inline(always)]
     pub fn push(&mut self, val: LuaValue) {
         let top = self.top.0 as usize;
