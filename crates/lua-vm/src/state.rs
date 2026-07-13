@@ -2341,36 +2341,26 @@ impl LuaState {
     }
 
     /// Return the current C-call recursion depth (lower 16 bits of `n_ccalls`).
-    ///
-    /// macros.tsv: `getCcalls → state.c_calls()`
     pub fn c_calls(&self) -> u32 {
         self.n_ccalls & 0xffff
     }
 
     /// Increment the non-yieldable call count (upper 16 bits of `n_ccalls`).
-    ///
-    /// macros.tsv: `incnny → state.inc_nny()`
     pub fn inc_nny(&mut self) {
         self.n_ccalls += 0x10000;
     }
 
     /// Decrement the non-yieldable call count.
-    ///
-    /// macros.tsv: `decnny → state.dec_nny()`
     pub fn dec_nny(&mut self) {
         self.n_ccalls -= 0x10000;
     }
 
     /// Returns `true` if the thread can yield (no non-yieldable frames on the stack).
-    ///
-    /// macros.tsv: `yieldable → state.is_yieldable()`
     pub fn is_yieldable(&self) -> bool {
         (self.n_ccalls & 0xffff0000) == 0
     }
 
     /// Reset the hook countdown to the baseline.
-    ///
-    /// macros.tsv: `resethookcount → state.reset_hook_count()`
     pub fn reset_hook_count(&mut self) {
         self.hookcount = self.basehookcount;
     }
@@ -2528,8 +2518,6 @@ impl LuaState {
     }
 
     /// Returns the current stack capacity (slots between base and stack_last).
-    ///
-    /// macros.tsv: `stacksize → state.stack_size()`
     pub fn stack_size(&self) -> usize {
         self.stack_last.0 as usize
     }
@@ -2560,8 +2548,6 @@ impl LuaState {
     }
 
     /// Retrieve the value at the given stack index without removing it.
-    ///
-    /// macros.tsv: `s2v → state.stack_at(idx)` → returns `&LuaValue`
     #[inline(always)]
     pub fn stack_val(&self, idx: StackIdx) -> &LuaValue {
         &self.stack[idx.0 as usize].val
@@ -2573,12 +2559,8 @@ impl LuaState {
         self.stack[idx.0 as usize].val = val;
     }
 
-    /// Returns a no-op GC handle.
-    ///
-    /// macros.tsv: `luaC_checkGC → state.gc().check_step()`, etc.
-    ///
-    /// PORT NOTE: In Phases A–C the GC is `Rc`-based and all GC operations are
-    /// no-ops. Phase D replaces this with real GC logic in `lua-gc`.
+    /// Returns a handle for GC operations (checked/forced collection,
+    /// barriers) implemented in `lua-gc`.
     pub fn gc(&mut self) -> GcHandle<'_> {
         GcHandle { _state: self }
     }
@@ -2619,10 +2601,7 @@ impl LuaState {
     }
 
     /// Create a new empty table and register it with the GC.
-    ///
-    /// macros.tsv: `lua_newtable → state.new_table()`
     pub fn new_table(&mut self) -> GcRef<LuaTable> {
-        // TODO(port): register with GC tracking (state.global_mut().allgc) in Phase D
         self.mark_gc_check_needed();
         GcRef::new(LuaTable::placeholder())
     }
@@ -2651,7 +2630,6 @@ impl LuaState {
     /// long-string literals within a single chunk through `luaX_newstring`'s
     /// `ls->h` anchor table.
     ///
-    /// macros.tsv: `luaS_new → state.intern_str(s)`
     /// Short-string interning, `luaS_newlstr` shape: one hash of the input
     /// bytes, a bucket walk on hit (zero allocation), and an insert that
     /// reuses the same hash on miss. See the `InternedStringMap` doc for why
@@ -2685,13 +2663,9 @@ impl LuaState {
     }
 }
 
-// ─── Phase-B stub methods ─────────────────────────────────────────────────────
+// ─── Stack / register access ───────────────────────────────────────────────
 //
-// The methods in the impl blocks below were referenced by api.rs, debug.rs,
-// do_.rs, vm.rs, tagmethods.rs etc. during Phase A. Each body is a `todo!()`
-// pinned to a phase-b task; once the corresponding C function is faithfully
-// ported the stub will be replaced. Signatures are inferred from call sites
-// and should be treated as Phase-B-grade approximations.
+// Methods used by api.rs, debug.rs, do_.rs, vm.rs, tagmethods.rs, etc.
 
 impl LuaState {
     #[inline(always)]
@@ -4288,19 +4262,17 @@ impl LuaState {
     }
 }
 
-// ─── GcHandle — no-op GC facade ───────────────────────────────────────────────
+// ─── GcHandle ───────────────────────────────────────────────────────────────
 
 /// A short-lived handle returned by `state.gc()` for GC operations.
-///
-/// In Phases A–C all methods are no-ops. Phase D replaces with real GC.
 pub struct GcHandle<'a> {
     _state: &'a mut LuaState,
 }
 
-/// Composite root passed to `Heap::full_collect`. The Phase-A workaround in
-/// `new_state` leaves `GlobalState.mainthread = None` (to break the
-/// self-referential Rc cycle pre-D), so the running thread's stack and
-/// openupval list are not reachable from `GlobalState::trace`. Wrapping both
+/// Composite root passed to `Heap::full_collect`. `new_state` leaves
+/// `GlobalState.mainthread = None` (to break the self-referential Rc
+/// cycle — see the field doc), so the running thread's stack and openupval
+/// list are not reachable from `GlobalState::trace`. Wrapping both
 /// references in a single `Trace`-implementing root injects the active
 /// thread as a second mark source for the duration of the collection.
 struct CollectRoots<'a> {
@@ -4710,10 +4682,8 @@ fn remove_dead_interned_strings(global: &mut GlobalState, dead_pairs: Vec<(u32, 
 }
 
 impl<'a> GcHandle<'a> {
-    /// macros.tsv: `luaC_checkGC → state.gc().check_step()`
-    ///
-    /// Phase D-2: drives implicit collection when the heap's byte threshold
-    /// is exceeded. Without this hook, loops that allocate without an
+    /// Drives implicit collection when the heap's byte threshold is
+    /// exceeded. Without this hook, loops that allocate without an
     /// explicit `collectgarbage()` call (e.g. `closure.lua`'s
     /// `while x[1] do local a = A..A end` GC-driven loop) never settle.
     pub fn check_step(&self) {
@@ -4733,7 +4703,6 @@ impl<'a> GcHandle<'a> {
         }
     }
 
-    /// macros.tsv: `luaC_fullgc → state.gc().full_collect()`
     pub fn full_collect(&self) {
         if self._state.global().is_gen_mode() {
             self.fullgen();
