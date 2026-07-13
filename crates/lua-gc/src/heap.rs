@@ -1508,6 +1508,23 @@ pub struct Heap {
     /// `Gc::new_uncollected` boxes, which carry no heap reference at all
     /// (allocated before any `Heap` exists, or with no `HeapGuard` active).
     uncollected: Cell<Option<NonNull<GcBox<dyn Trace>>>>,
+    /// Set once at the top of [`drop_all`](Self::drop_all) and never cleared:
+    /// this heap has begun (or completed) teardown. This is the durable half
+    /// of a deliberate two-state distinction with [`tearing_down`](Self::tearing_down),
+    /// which is true *only* while the drain loop runs. A post-close
+    /// [`allocate`](Self::allocate) / [`allocate_uncollected`](Self::allocate_uncollected)
+    /// panics precisely when `closed && !tearing_down` — the signature of a
+    /// [`HeapGuard`] that outlived `close()` and tried to allocate into a
+    /// torn-down heap. Read through [`is_closed`](Self::is_closed).
+    closed: Cell<bool>,
+    /// True for the duration of the [`drop_all`](Self::drop_all) drain loop
+    /// only, and the transient half of the two-state teardown distinction with
+    /// [`closed`](Self::closed). Re-entrant allocation from a payload `Drop`
+    /// running *inside* the drain is legitimate — drain-until-stable frees
+    /// whatever a destructor allocates on a later pass — so the closed-heap
+    /// allocation panic is suppressed while this is set. It re-arms the instant
+    /// the final (empty) pass completes and this clears.
+    tearing_down: Cell<bool>,
     /// While non-zero, [`allocate`](Self::allocate) routes through
     /// [`allocate_uncollected`](Self::allocate_uncollected) instead of the
     /// normal collectable `head` list. Raised around VM construction
@@ -1608,6 +1625,8 @@ impl Heap {
             quarantine: std::env::var_os("LUA_RS_GC_QUARANTINE").is_some_and(|v| v == "1"),
             quarantined: Cell::new(None),
             uncollected: Cell::new(None),
+            closed: Cell::new(false),
+            tearing_down: Cell::new(false),
             bootstrap_depth: std::rc::Rc::new(Cell::new(0)),
             pause_multiplier: Cell::new(200), // 200% = collect when bytes 2x threshold
             state: Cell::new(GcState::Pause),
@@ -1634,6 +1653,17 @@ impl Heap {
 
     pub fn is_paused(&self) -> bool {
         self.paused.get()
+    }
+
+    /// True once [`drop_all`](Self::drop_all) has begun tearing this heap
+    /// down. After this returns true, [`allocate`](Self::allocate) and
+    /// [`allocate_uncollected`](Self::allocate_uncollected) panic — a
+    /// [`HeapGuard`] that outlived `close()` cannot allocate into a
+    /// torn-down heap — with one exception: re-entrant allocation from a
+    /// destructor running inside the teardown drain itself, which the drain
+    /// is designed to accept.
+    pub fn is_closed(&self) -> bool {
+        self.closed.get()
     }
 
     /// Enter bootstrap mode: [`allocate`](Self::allocate) routes new boxes
@@ -1677,10 +1707,23 @@ impl Heap {
         }
     }
 
+    /// Guard both allocation entry points against a closed heap. Fires only
+    /// when the heap is `closed` and no longer `tearing_down` — i.e. `close()`
+    /// (via `drop_all`) has fully completed and a [`HeapGuard`] that outlived
+    /// it is trying to allocate. Re-entrant allocation from a destructor
+    /// *during* the drain sees `tearing_down` set and is allowed through,
+    /// because drain-until-stable frees whatever it allocates on a later pass.
+    fn assert_open(&self) {
+        if self.closed.get() && !self.tearing_down.get() {
+            panic!("allocation into a closed heap — a HeapGuard outlived close()");
+        }
+    }
+
     /// Allocate a new `GcBox<T>` and prepend it to the allgc chain. While
     /// [`is_bootstrapping`](Self::is_bootstrapping) is true, delegates to
     /// [`allocate_uncollected`](Self::allocate_uncollected) instead.
     pub fn allocate<T: Trace + 'static>(&self, value: T) -> Gc<T> {
+        self.assert_open();
         if self.is_bootstrapping() {
             return self.allocate_uncollected(value);
         }
@@ -1717,6 +1760,7 @@ impl Heap {
     /// diagnostics for the collectable set; an object that sweep never visits
     /// would inflate them permanently.
     pub fn allocate_uncollected<T: Trace + 'static>(&self, value: T) -> Gc<T> {
+        self.assert_open();
         let size = std::mem::size_of::<GcBox<T>>();
         let boxed = Box::new(GcBox {
             header: GcHeader::new_white(size, self.current_white.get(), HDR_HEAP_OWNED),
@@ -3009,28 +3053,72 @@ impl Heap {
         count
     }
 
-    /// Drop every allocation, ignoring reachability. Called at shutdown.
+    /// Drop every allocation, ignoring reachability. Called at shutdown
+    /// (`Heap::drop`, and the VM's `close_state` / `free_all_objects`).
+    ///
+    /// **Drain until stable.** A single pass over the owner lists is not
+    /// enough: a payload `Drop` may itself allocate — a `GcRef::new` in a
+    /// destructor relinks a fresh box onto `head` (or onto `uncollected`
+    /// inside a bootstrap window) — and that box would be stranded on a
+    /// just-emptied list and leaked outright if the walk were `Heap::drop`'s
+    /// own. So this loops over every owner list until a full pass frees
+    /// nothing, then zeroes accounting.
+    ///
+    /// `closed` is set at the top and never cleared; `tearing_down` is held
+    /// across the loop so those re-entrant allocations are accepted rather
+    /// than panicking against the now-closed heap, and re-arms the panic once
+    /// the loop settles. Grayagain is emptied and its flags cleared (via
+    /// [`clear_generation_cursors`](Self::clear_generation_cursors)) before any
+    /// free, preserving the pre-existing ordering.
+    ///
     /// After this returns, every outstanding `Gc<T>` is dangling — callers
     /// must ensure no `Gc<T>` outlives the `Heap`.
     pub fn drop_all(&self) {
+        self.closed.set(true);
+        let outermost = !self.tearing_down.replace(true);
         self.recycle_marker_cell();
         self.sweep_prev_next.set(None);
         self.clear_generation_cursors();
         self.state.set(GcState::Pause);
         self.allocation_tokens.borrow_mut().clear();
-        self.drop_list(&self.head);
-        self.drop_list(&self.finobj);
-        self.drop_list(&self.tobefnz);
-        self.drop_list(&self.quarantined);
-        self.drop_list(&self.uncollected);
+
+        let mut passes = 0usize;
+        loop {
+            let mut freed_any = false;
+            freed_any |= self.drop_list(&self.head);
+            freed_any |= self.drop_list(&self.finobj);
+            freed_any |= self.drop_list(&self.tobefnz);
+            freed_any |= self.drop_list(&self.quarantined);
+            freed_any |= self.drop_list(&self.uncollected);
+            if !freed_any {
+                break;
+            }
+            passes = passes.saturating_add(1);
+            debug_assert!(
+                passes < 10_000,
+                "drop_all drain did not converge — a payload Drop is allocating without bound"
+            );
+        }
+
+        self.allocation_tokens.borrow_mut().clear();
         self.bytes.set(0);
         self.objects.set(0);
+        if outermost {
+            self.tearing_down.set(false);
+        }
     }
 
-    fn drop_list(&self, list: &Cell<Option<NonNull<GcBox<dyn Trace>>>>) {
+    /// Free every box on one owner list, returning whether any box was freed.
+    /// A payload `Drop` run by the `Box::from_raw` here may relink a fresh box
+    /// onto this same list head; `next` is read before the drop so the local
+    /// walk is unaffected, and the fresh box is caught by a later drain pass in
+    /// [`drop_all`](Self::drop_all).
+    fn drop_list(&self, list: &Cell<Option<NonNull<GcBox<dyn Trace>>>>) -> bool {
         let mut cursor = list.get();
         list.set(None);
+        let mut freed = false;
         while let Some(ptr) = cursor {
+            freed = true;
             // SAFETY: same chain invariant as full_collect's sweep.
             let next = unsafe {
                 let next = (*ptr.as_ptr()).header.next.get();
@@ -3039,6 +3127,7 @@ impl Heap {
             };
             cursor = next;
         }
+        freed
     }
 }
 

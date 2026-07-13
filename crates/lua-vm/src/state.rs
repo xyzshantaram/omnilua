@@ -5648,11 +5648,30 @@ impl<'a> GcHandle<'a> {
     pub fn fix_object<T: lua_gc::Trace + 'static>(&self, _o: &GcRef<T>) { /* phase-b no-op */
     }
 
-    /// Free all collectable objects (called during state teardown).
+    /// Free all collectable objects deterministically (called during state
+    /// teardown by `close_state`), mirroring C-Lua `lua_close`'s guarantee
+    /// that finalizers and frees complete before the call returns.
     ///
-    /// PORT NOTE: In Phases A–C, Rc drop chains handle deallocation automatically.
+    /// Object destruction historically rode on `GlobalState`'s eventual `Rc`
+    /// drop, so `close_state` could return with every heap object still live
+    /// (issue #260). This now drains the heap through
+    /// [`Heap::drop_all`](lua_gc::Heap::drop_all) — every destructor runs
+    /// before this returns — and clears the `GlobalState`-side GC bookkeeping
+    /// (weak-table registry, finalizer registry, external roots) whose entries
+    /// would otherwise name freed boxes. `drop_all` clears the allocation-token
+    /// map, so a pre-existing `GcWeak` stops upgrading immediately, and leaves
+    /// the heap `closed`, so a `HeapGuard` that outlived close panics instead
+    /// of resurrecting a torn-down heap.
+    ///
+    /// This does not *run* finalizers: `close_state`'s upstream-mirroring paths
+    /// already do that before teardown; this only frees.
     pub fn free_all_objects(&self) {
-        // PORT NOTE: Phase A–C no-op; Rc::drop handles deallocation
+        let heap = self._state.global().heap.clone();
+        heap.drop_all();
+        let mut g = self._state.global_mut();
+        g.weak_tables_registry = lua_gc::WeakRegistry::default();
+        g.finalizers = lua_gc::FinalizerRegistry::default();
+        g.external_roots = ExternalRootSet::default();
     }
 
     /// GC write barrier for a TValue.
