@@ -1169,9 +1169,6 @@ impl LuaProtoExt for LuaProto {
 // ─── Collectable trait (GC interface) ────────────────────────────────────────
 
 /// Marker trait for GC-managed objects.
-///
-/// Phase D: real tracing GC.
-/// types.tsv: `GCObject → (trait Collectable; concrete = GcRef<T>)`
 pub trait Collectable: std::fmt::Debug {}
 
 impl std::fmt::Debug for LuaState {
@@ -1404,9 +1401,9 @@ pub type DynLibUnloadHook = fn(handle: DynLibId);
 
 /// One row of [`GlobalState::threads`]. Pairs the per-thread `LuaState`
 /// with the canonical `GcRef<LuaThread>` so every `push_thread` for the
-/// same id shares pointer-identity. Phase E-1 adds this; Phase E-2
-/// extends it with interior-mutability bookkeeping when `resume`/`yield`
-/// need to mutate the child thread while the parent holds a borrow.
+/// same id shares pointer-identity; the state is wrapped in
+/// `Rc<RefCell<...>>` so `resume`/`yield` can mutate the child thread while
+/// the parent holds a borrow.
 pub struct ThreadRegistryEntry {
     /// The owned coroutine `LuaState`. Wrapped in `Rc<RefCell<...>>` so
     /// that `coroutine.resume` can borrow the child mutably while the
@@ -1519,11 +1516,9 @@ impl ExternalRootSet {
 
 /// Process-wide state shared by all Lua threads.
 ///
-/// types.tsv: `global_State → GlobalState`
-///
 /// Not exposed directly at the API; accessed via `state.global()` / `state.global_mut()`.
 pub struct GlobalState {
-    /// Phase-B hook for the Lua text parser. Set by the embedder (`lua-cli`
+    /// Hook for the Lua text parser. Set by the embedder (`lua-cli`
     /// or stdlib host) to bridge the cyclic crate split between `lua-vm` and
     /// `lua-parse`: when `f_parser` decides the chunk is text, it invokes
     /// this hook instead of the parser stub. `None` leaves the stub in place
@@ -1551,13 +1546,13 @@ pub struct GlobalState {
     /// version keeps the existing 5.4 behavior unchanged.
     pub lua_version: lua_types::LuaVersion,
 
-    /// Phase-B hook for reading a Lua source file from disk. Set by `lua-cli`
+    /// Hook for reading a Lua source file from disk. Set by `lua-cli`
     /// (or any embedder that wants `require`/`loadfile` to reach the file
     /// system) since `std::fs` is banned in `lua-stdlib`. `None` makes
     /// `loadfile` and the Lua-file searcher report a file-not-found error.
     pub file_loader_hook: Option<FileLoaderHook>,
 
-    /// Phase-B hook for opening a file handle for read/write/append. Set by
+    /// Hook for opening a file handle for read/write/append. Set by
     /// `lua-cli` since `std::fs` is banned in `lua-stdlib`. `None` causes
     /// `io.open` and `io.output(name)` to return an error; standard output and
     /// error are controlled separately through output hooks/native fallbacks.
@@ -1599,37 +1594,37 @@ pub struct GlobalState {
     /// Hook for host temporary filenames. Used by `os.tmpname` and `io.tmpfile`.
     pub temp_name_hook: Option<TempNameHook>,
 
-    /// Phase-G hook for spawning a child process and connecting one stream
+    /// Hook for spawning a child process and connecting one stream
     /// (stdin or stdout) to a Lua file handle. Set by `lua-cli` since
     /// `std::process::Command` is banned in `lua-stdlib`. `None` causes
     /// `io.popen` to raise a Lua error rather than panic.
     pub popen_hook: Option<PopenHook>,
 
-    /// Phase-B hook for removing a file. Set by `lua-cli` since `std::fs` is
+    /// Hook for removing a file. Set by `lua-cli` since `std::fs` is
     /// banned in `lua-stdlib`. `None` causes `os.remove` to return an error.
     pub file_remove_hook: Option<FileRemoveHook>,
 
-    /// Phase-B hook for renaming a file. Set by `lua-cli` since `std::fs` is
+    /// Hook for renaming a file. Set by `lua-cli` since `std::fs` is
     /// banned in `lua-stdlib`. `None` causes `os.rename` to return an error.
     pub file_rename_hook: Option<FileRenameHook>,
 
-    /// Phase-G hook for executing a shell command. Set by `lua-cli` since
+    /// Hook for executing a shell command. Set by `lua-cli` since
     /// `std::process` is banned in `lua-stdlib`. `None` causes `os.execute`
     /// to report no shell available (matching C-Lua's `system(NULL) == 0`).
     pub os_execute_hook: Option<OsExecuteHook>,
 
-    /// Phase-D-3.5 hook for loading a dynamic library (`dlopen` /
+    /// Hook for loading a dynamic library (`dlopen` /
     /// `LoadLibraryEx`). Set by `lua-cli` since `libloading` is FFI and
     /// requires `unsafe`, which is banned in `lua-stdlib`. `None` causes
     /// `package.loadlib` to return the `"absent"` fallback shape.
     pub dynlib_load_hook: Option<DynLibLoadHook>,
 
-    /// Phase-D-3.5 hook for resolving a symbol in a previously loaded
+    /// Hook for resolving a symbol in a previously loaded
     /// dynamic library (`dlsym` / `GetProcAddress`). Set by `lua-cli`.
     /// `None` is treated as "absent" by `package.loadlib`.
     pub dynlib_symbol_hook: Option<DynLibSymbolHook>,
 
-    /// Phase-D-3.5 hook for unloading a dynamic library (`dlclose` /
+    /// Hook for unloading a dynamic library (`dlclose` /
     /// `FreeLibrary`). Set by `lua-cli`. `None` keeps libraries loaded
     /// until process exit, which matches `libloading`'s safety model.
     pub dynlib_unload_hook: Option<DynLibUnloadHook>,
@@ -1638,42 +1633,34 @@ pub struct GlobalState {
     /// default (`interval == 0`); see [`SandboxLimits`].
     pub sandbox: SandboxLimits,
 
-    // types.tsv: global_State.GCdebt → isize
     pub gc_debt: isize,
 
     pub gc_estimate: usize,
 
-    // types.tsv: global_State.lastatomic → usize
     pub lastatomic: usize,
 
-    // types.tsv: global_State.strt → StringPool
     pub strt: StringPool,
 
-    // types.tsv: global_State.l_registry → LuaValue
     pub l_registry: LuaValue,
 
     /// External Rust handles root their referents here while they are live.
     /// Traced from `GlobalState::trace`.
     pub external_roots: ExternalRootSet,
 
-    // PORT NOTE (phase-b-reconcile): The lua-types LuaTable placeholder has
-    // no storage, so we cannot persist `registry[LUA_RIDX_GLOBALS] = globals`
-    // via the canonical registry path. Until the placeholder reconciles with
-    // lua-vm::table::LuaTable, the globals table lives in a direct field
-    // and `get_global_table` reads it from here. Same for `loaded` (the
-    // module cache normally at `registry[_LOADED]`).
+    /// The globals table, kept as a direct field rather than through the
+    /// canonical registry path (`registry[LUA_RIDX_GLOBALS]`) because the
+    /// lua-types `LuaTable` placeholder has no storage of its own;
+    /// `get_global_table` reads it from here. Same reasoning for `loaded`
+    /// (the module cache normally at `registry[_LOADED]`).
     pub globals: LuaValue,
     pub loaded: LuaValue,
 
-    // types.tsv: global_State.nilvalue → LuaValue
-    // PORT NOTE: In Rust we use a dedicated `is_complete: bool` flag rather than
-    // the C trick of checking `ttisnil(&g->nilvalue)`. See `is_complete()`.
+    /// A dedicated completeness flag rather than C's trick of checking
+    /// `ttisnil(&g->nilvalue)`. See `is_complete()`.
     pub nilvalue: LuaValue,
 
-    // types.tsv: global_State.seed → u32
     pub seed: u32,
 
-    // types.tsv: global_State.currentwhite → u8
     pub currentwhite: u8,
 
     pub gcstate: u8,
@@ -1682,7 +1669,6 @@ pub struct GlobalState {
 
     pub gcstopem: bool,
 
-    // types.tsv: global_State.genminormul → u8
     pub genminormul: u8,
 
     pub genmajormul: u8,
@@ -1691,10 +1677,8 @@ pub struct GlobalState {
 
     pub gcemergency: bool,
 
-    // types.tsv: global_State.gcpause → u8
     pub gcpause: u8,
 
-    // types.tsv: global_State.gcstepmul → u8
     pub gcstepmul: u8,
 
     pub gcstepsize: u8,
@@ -1709,10 +1693,8 @@ pub struct GlobalState {
     /// values observed on the reference `lua5.5.0` binary.
     pub gc55_params: [i64; 6],
 
-    // Phase-D NOTE: the old C-Lua intrusive GC list mirrors were declared here as
-    // `Vec<GcRef<dyn Collectable>>` during Phase A but never populated or
-    // read. The real GC owns its allgc/finobj/tobefnz/grayagain intrusive
-    // lists inside `self.heap` (lua_gc::Heap).
+    /// The GC owns its allgc/finobj/tobefnz/grayagain intrusive lists inside
+    /// `self.heap` (`lua_gc::Heap`), not on `GlobalState` directly.
     pub sweepgc_cursor: usize,
 
     /// Cross-table weak-sweep registry.
@@ -1741,28 +1723,18 @@ pub struct GlobalState {
     /// paths never do (matching `GCTM(L, 0)` and the dispatch-loop swallow).
     pub gc_finalizer_error: Option<LuaValue>,
 
-    // Phase-D NOTE: fixedgc removed (dead since Phase A — see sibling note
-    // above re allgc et al). Finalizable typed handles live in `finalizers`
-    // above; fixed objects live in heap.allgc with the GC's own `fixed` bit.
-
-    // Generational cohort markers — Phase D only
-    // types.tsv: global_State.survival/old1/reallyold/firstold1/finobjsur/finobjold1/finobjrold
-    //   → (removed; replaced by index cursors in Phase D)
-
-    // types.tsv: global_State.twups → Vec<GcRef<LuaState>>
     pub twups: Vec<GcRef<LuaState>>,
 
-    // types.tsv: global_State.panic → Option<lua_CFunction>
     pub panic: Option<LuaCFunction>,
 
-    // types.tsv: global_State.mainthread → GcRef<LuaState>
-    // TODO(port): self-referential Rc cycle; Phase D GC handles cycles properly
+    /// Always `None`: populating this would create a self-referential `Rc`
+    /// cycle from the main thread's `LuaState` back to its own
+    /// `GlobalState`. See `new_state`.
     pub mainthread: Option<GcRef<LuaState>>,
 
-    /// Registry of all live coroutine threads, keyed by `ThreadId`. Phase E-1
-    /// replaces the `thread_token` placeholder with a real id-indexed map so
-    /// `coroutine.create` allocates a fresh `LuaState`, registers it, and
-    /// returns a value that resolves back to the same state on every
+    /// Registry of all live coroutine threads, keyed by `ThreadId`.
+    /// `coroutine.create` allocates a fresh `LuaState`, registers it here,
+    /// and returns a value that resolves back to the same state on every
     /// `coroutine.status` / `coroutine.resume` call.
     ///
     /// Each entry pairs the per-thread `LuaState` with the canonical
@@ -1779,10 +1751,9 @@ pub struct GlobalState {
     /// pointer-equal under `LuaValue::PartialEq`.
     pub main_thread_value: GcRef<lua_types::value::LuaThread>,
 
-    /// Identity of the currently-running thread. `0` (main) until a
-    /// coroutine resume swaps it in slice 02b. The Phase E-1 slice
-    /// always leaves this at `main_thread_id` because resume is not yet
-    /// implemented.
+    /// Identity of the currently-running thread. `0` (main) until
+    /// `coro_lib::resume` swaps it to the child coroutine's id; restored to
+    /// the parent's id on yield or return.
     pub current_thread_id: u64,
 
     /// Thread currently being reset/closed by `coroutine.close`, if any. This is
@@ -1828,17 +1799,12 @@ pub struct GlobalState {
     /// root and pruned of dead-closure entries after each collection.
     pub closure_envs: std::collections::HashMap<usize, LuaValue>,
 
-    // types.tsv: global_State.memerrmsg → GcRef<LuaString>
     pub memerrmsg: GcRef<LuaString>,
 
-    // types.tsv: global_State.tmname → [GcRef<LuaString>; TM_N]
-    // TODO(port): TM_N constant and TagMethod enum come from ltm.c → tagmethods.rs
     pub tmname: Vec<GcRef<LuaString>>,
 
-    // types.tsv: global_State.mt → [Option<GcRef<LuaTable>>; LUA_NUMTYPES]
     pub mt: [Option<GcRef<LuaTable>>; LUA_NUMTYPES],
 
-    // types.tsv: global_State.strcache → [[GcRef<LuaString>; STRCACHE_M]; STRCACHE_N]
     pub strcache: [[GcRef<LuaString>; STRCACHE_M]; STRCACHE_N],
 
     /// Stable intern map for the public [`LuaString`] type. Distinct from
@@ -1848,7 +1814,6 @@ pub struct GlobalState {
     /// call allocates a fresh `GcRef` and locals/upvalues fail to resolve.
     pub interned_lt: InternedStringMap,
 
-    // types.tsv: global_State.warnf → Option<Box<dyn FnMut(&[u8], bool)>>
     pub warnf: Option<Box<dyn FnMut(&[u8], bool)>>,
 
     /// State of the default warning handler (the `warnfoff`/`warnfon`/
@@ -1873,13 +1838,12 @@ pub struct GlobalState {
     /// registers the function and stores the resulting index in the closure.
     pub c_functions: Vec<LuaCallable>,
 
-    /// Phase-D heap. Owns the allgc intrusive list and runs collections.
-    /// During Phase A-C this is `paused=true`, so allocations don't auto-
-    /// register and `step` is a no-op. Phase D-1d wires `unpause()` after
-    /// state initialization, at which point `step` runs during VM dispatch.
+    /// Owns the allgc intrusive list and runs collections. Starts paused;
+    /// `new_state` unpauses it once the state is fully initialized, after
+    /// which `step` runs during VM dispatch.
     pub heap: std::rc::Rc<lua_gc::Heap>,
 
-    /// Phase E-3 cross-thread open-upvalue mirror. Maps `(thread_id, stack_idx)`
+    /// Cross-thread open-upvalue mirror. Maps `(thread_id, stack_idx)`
     /// to the live value of an open upvalue whose home thread is currently
     /// suspended while another thread runs. `coroutine.resume` snapshots the
     /// parent's open upvalues into this map before yielding control to the
@@ -1894,7 +1858,7 @@ pub struct GlobalState {
     /// shared scratchpad that bridges the gap for the duration of a resume.
     pub cross_thread_upvals: std::collections::HashMap<(u64, StackIdx), LuaValue>,
 
-    /// Phase F-1.a workaround for GC use-after-free across coroutine boundaries.
+    /// Workaround for GC use-after-free across coroutine boundaries.
     /// When `aux_resume` switches to a child thread, the parent's live stack
     /// values would otherwise become unreachable to the tracer for the duration
     /// of the resume (the parent `LuaState` is held only as a stack-borrowed
@@ -1904,9 +1868,9 @@ pub struct GlobalState {
     /// completion. The tracer visits every snapshot as a GC root via the
     /// `Trace for GlobalState` impl in `trace_impls.rs`.
     ///
-    /// Phase F-2.b added a reachability-driven thread sweep that supersedes
-    /// most of this, but the snapshot still guards values that live only on
-    /// the parent's stack (i.e. not yet rooted by any thread node).
+    /// A reachability-driven thread sweep supersedes most of this, but the
+    /// snapshot still guards values that live only on the parent's stack
+    /// (i.e. not yet rooted by any thread node).
     pub suspended_parent_stacks: Vec<Vec<LuaValue>>,
 
     /// Open-upvalue handles belonging to the same suspended parent windows as
@@ -2205,38 +2169,31 @@ use lua_types::tagmethod::TagMethod;
 pub struct LuaState {
     // ── Thread status ──
 
-    // types.tsv: lua_State.status → u8
     pub status: u8,
 
-    // types.tsv: lua_State.allowhook → bool
     pub allowhook: bool,
 
-    // types.tsv: lua_State.nci → u32
     pub nci: u32,
 
     // ── Stack ──
 
-    // types.tsv: lua_State.top → StackIdx
     pub top: StackIdx,
 
-    // types.tsv: lua_State.stack_last → StackIdx (redundant once Vec; kept for parity)
+    /// Redundant once the stack is a `Vec` (kept for parity with the C
+    /// field).
     pub stack_last: StackIdx,
 
-    // types.tsv: lua_State.stack → Vec<StackValue>
     pub stack: Vec<StackValue>,
 
     // ── Call info ──
 
-    // types.tsv: lua_State.ci → CallInfoIdx
     pub ci: CallInfoIdx,
 
-    // types.tsv: lua_State.base_ci → CallInfo  (Vec element 0)
-    // PORT NOTE: In Rust, base_ci is call_info[0]. There is no separate field.
+    /// C's `base_ci` is `call_info[0]` here; there is no separate field.
     pub call_info: Vec<CallInfo>,
 
     // ── Upvalues / to-be-closed ──
 
-    // types.tsv: lua_State.openupval → Vec<GcRef<UpVal>>
     pub openupval: Vec<GcRef<UpVal>>,
 
     /// Per-thread mirror of C 5.3's per-open-upvalue `touched` flag
@@ -2252,50 +2209,42 @@ pub struct LuaState {
     /// for modern versions and the baked 5.4/5.5 behavior is unchanged.
     pub legacy_open_upval_touched: std::cell::Cell<bool>,
 
-    // types.tsv: lua_State.tbclist → Vec<StackIdx>
     pub tbclist: Vec<StackIdx>,
 
     // ── Global state ──
 
-    // types.tsv: lua_State.l_G → (accessed via method)
-    // PORT NOTE: Rc<RefCell<>> for shared ownership across coroutine threads.
+    /// Shared via `Rc<RefCell<>>` for shared ownership across coroutine
+    /// threads. C's `l_G` is accessed through the [`LuaState::global`] /
+    /// [`LuaState::global_mut`] methods rather than a raw field.
     pub(crate) global: Rc<RefCell<GlobalState>>,
 
     // ── Hooks ──
 
-    // types.tsv: lua_State.hook → Option<Box<dyn FnMut(&mut LuaState, &LuaDebug)>>
     pub hook: Option<Box<dyn FnMut(&mut LuaState, &crate::debug::LuaDebug)>>,
 
-    // types.tsv: lua_State.hookmask → u8
     pub hookmask: u8,
 
-    // types.tsv: lua_State.basehookcount → i32
     pub basehookcount: i32,
 
-    // types.tsv: lua_State.hookcount → i32
     pub hookcount: i32,
 
     // ── Error handling ──
 
-    // types.tsv: lua_State.errorJmp → (removed; replaced by Result<T, LuaError>)
-    // PORT NOTE: Entirely removed. The `?` operator replaces setjmp/longjmp.
+    // C's `errorJmp` (setjmp/longjmp chain) has no field here — the `?`
+    // operator on `Result<T, LuaError>` replaces it entirely.
 
-    // types.tsv: lua_State.errfunc → isize
     pub errfunc: isize,
 
     // ── C-call depth ──
 
-    // types.tsv: lua_State.n_ccalls → u32
     pub n_ccalls: u32,
 
     // ── Debug / hooks ──
 
-    // types.tsv: lua_State.oldpc → u32
     pub oldpc: u32,
 
-    // ── GC color (Phase D) ──
+    // ── GC color ──
 
-    // types.tsv: GCObject.marked → u8
     pub marked: u8,
 
     /// Owner thread id for this `LuaState`, cached as a plain `u64` so the
@@ -2325,18 +2274,14 @@ pub struct LuaState {
 impl LuaState {
     /// Access the process-wide `GlobalState` immutably.
     ///
-    /// macros.tsv: `G → state.global()`
-    ///
-    /// PORT NOTE: Returns `std::cell::Ref<GlobalState>` because GlobalState is held in
-    /// `Rc<RefCell<...>>`. Call sites that do `state.global().field` should work fine
+    /// Returns `std::cell::Ref<GlobalState>` because `GlobalState` is held in
+    /// `Rc<RefCell<...>>`. Call sites that do `state.global().field` work fine
     /// via `Deref`. Callers must not hold the `Ref` across a `global_mut()` call.
     pub fn global(&self) -> std::cell::Ref<'_, GlobalState> {
         self.global.borrow()
     }
 
     /// Access the process-wide `GlobalState` mutably.
-    ///
-    /// macros.tsv: `G → state.global()` (writes use `state.global_mut()`)
     pub fn global_mut(&self) -> std::cell::RefMut<'_, GlobalState> {
         self.global.borrow_mut()
     }
