@@ -438,6 +438,42 @@ the malloc/free pair was not), double-stored intern bytes (map key + string).
 Standing question for any hot frame: "does C-Lua do this work at all?" —
 distinct from the macro-boundary rule, which asks whether C compiles it away.
 
+## Patterns from the owner-vector negative (added 2026-07-13)
+
+From the #113 Wave-2 kill (`docs/PERF_EVIDENCE_113_W2_OWNERVEC_20260713.md`
+— built, proven correct, measured RSS-negative, closed unmerged).
+
+### Relocation is not removal
+
+Moving per-object state out of the object does not delete it. An external
+table of `dyn`-erased pointers costs a fat pointer per object on 64-bit —
+exactly the 16 B an intrusive-link diet saves — plus strictly-positive
+slack (tombstones, compaction headroom). Header diets pay only when bytes
+are genuinely deleted (W1's grayagain link had no per-object replacement:
+the revisit list is sparse) or when the smaller box crosses an allocator
+size class. Before any layout surgery, write the per-object ledger BOTH
+sides: bytes removed vs bytes added elsewhere × expected occupancy.
+
+### Allocator size-class crossings are the real RSS mechanism
+
+Every RSS win in this arc came from a bucket boundary, not raw byte count:
+UpVal 104→72 (June), `GcBox<UpVal>` 56→40 here (closure_ops −8% while the
+same change LOST on binarytrees). A 16-byte shrink that stays inside one
+malloc bucket buys nothing; an 8-byte shrink that crosses one buys the
+whole bucket step. Target boundaries deliberately: dump the live-object
+size histogram against the allocator's class table and rank candidates by
+crossings × population, not by bytes.
+
+### Collector side-structures must be pacer-charged
+
+Any collector-owned allocation that scales with object count (owner
+vectors, revisit lists, token maps) must be charged to the pacer's byte
+counter, or cadence drifts: shrinking *charged* box bytes while growing
+*uncharged* side bytes admits more live objects per cycle and peak RSS
+rises even when per-object totals fall. Symmetric rule: if a diet shrinks
+charged sizes, re-examine cadence explicitly (the pacer's thresholds were
+tuned against the old sizes).
+
 ## Profile discipline
 
 - **Wall-clock sampling ≠ CPU profiling.** `/usr/bin/sample` and the

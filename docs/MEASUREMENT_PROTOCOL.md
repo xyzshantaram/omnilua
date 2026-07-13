@@ -66,6 +66,13 @@ wall with Ir exactly flat. T2-B2 was a latency win: pingpong −32% wall, Ir
 - **Bench host is exclusive**: one measurement process at a time across all
   repos on this machine (see `../AGENT_COORDINATION_BOARD.md`). Parallel cert
   generation and parallel benches both fabricate regressions.
+- **Verify binary identity on every A/B — sha256 both sides.** Two same-day
+  near-misses (2026-07-13): the instr-count cache volume silently reused
+  side A's binary for side B (cargo mtime fingerprinting vs fresh-checkout
+  timestamps — would have fabricated a flat verdict; instr-count.sh now
+  force-invalidates and stamps `rs_bin_sha256` into the TSV), and a manual
+  RSS A/B resolved a relative binary path inside the B worktree and measured
+  B-vs-B. Absolute paths, distinct hashes printed, or the numbers are void.
 - **The wasm gate is part of the ladder**: `cargo check -p lua-vm --target
   wasm32-unknown-unknown` before any PR — size/layout assertions are 64-bit
   claims unless gated (`#[cfg(target_pointer_width = "64")]`), and this broke
