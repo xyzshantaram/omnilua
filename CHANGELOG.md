@@ -4,7 +4,30 @@ All notable changes to `omniLua` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] - 2026-07-13
+
+### Fixed — deterministic close (#260)
+
+`close(state)` now does what `lua_close` does: runs close finalizers
+(draining both queues, exactly-once per object) and then frees every heap
+object deterministically before returning — previously `free_all_objects`
+was a no-op and destruction rode on scope drop, so a lingering guard or
+handle could delay teardown indefinitely. The heap gains a closed state
+(allocation after close panics with a clear message; re-entrant allocation
+from destructors during teardown is supported via drain-until-stable), and
+the CLI now exits through the deterministic path. Weak handles die
+immediately at close.
+
+### Performance — GC header diet, Wave 1 (#113)
+
+Every GC object's header shrank 40 → 24 bytes (the grayagain revisit list
+moved from an intrusive per-object link to one heap-owned vector). Measured:
+closure_ops peak RSS −11.8%, binarytrees ~−5%, compute-workload instruction
+counts flat. Wave 2 (removing the second link) was built, adversarially
+reviewed, measured RSS-negative on churn workloads, and closed unmerged
+with full evidence — see `docs/PERF_EVIDENCE_113_W2_OWNERVEC_20260713.md`
+and the new "Patterns from the owner-vector negative" section of
+`docs/PERFORMANCE_PRINCIPLES.md`.
 
 ### Changed — GC guard-coverage panics are unconditional
 
