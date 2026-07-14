@@ -5617,14 +5617,6 @@ pub(crate) fn set_debt(g: &mut GlobalState, mut debt: isize) {
 }
 
 /// Deprecated no-op that returns `LUAI_MAXCCALLS`.
-///
-///
-/// ```c
-///
-/// //   UNUSED(L); UNUSED(limit);
-/// //   return LUAI_MAXCCALLS;  /* warning?? */
-/// // }
-/// ```
 pub fn set_c_stack_limit(_state: &mut LuaState, _limit: u32) -> i32 {
     let _ = (_state, _limit);
     LUAI_MAXCCALLS as i32
