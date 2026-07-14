@@ -697,7 +697,7 @@ fn popen_hook(cmd: &[u8], mode: &[u8]) -> Result<Box<dyn LuaFileHandle>, LuaErro
         })
 }
 
-// ─── Dynamic library backend (Phase D-3.5) ────────────────────────────────────
+// ─── Dynamic library backend ──────────────────────────────────────────────────
 //
 // `lua-stdlib` cannot use `libloading` because it forbids `unsafe`. The CLI
 // owns a per-process registry of loaded libraries and exposes it to
@@ -730,10 +730,10 @@ fn path_from_bytes(path: &[u8]) -> Result<std::path::PathBuf, LuaError> {
 /// it in the per-thread registry; the returned [`DynLibId`] is the
 /// registry-vector index, which keeps the library alive until process exit.
 ///
-/// PORT NOTE: a missing path is reported as `LuaError::File`, which
-/// `lua-stdlib`'s `package.loadlib` maps to the `"absent"` failure tag (the
-/// `lua-rs` build behaves like C-Lua's no-dlfcn fallback for plain file-not-
-/// found, and like POSIX/Windows dlopen for every other open failure).
+/// A missing path is reported as `LuaError::File`, which `lua-stdlib`'s
+/// `package.loadlib` maps to the `"absent"` failure tag (this build behaves
+/// like C-Lua's no-dlfcn fallback for plain file-not-found, and like
+/// POSIX/Windows dlopen for every other open failure).
 fn dynlib_load(
     _state: &mut LuaState,
     path: &[u8],
@@ -1417,7 +1417,7 @@ fn write_gc_profile(mut writer: impl Write, state: &LuaState) -> io::Result<()> 
 /// each entry written to `package.preload[name]` becomes a loader that
 /// `require(name)` will invoke through the preload searcher.
 ///
-/// Phase G-1 ships `lfs`, the Rust-native LuaFileSystem port from the
+/// This preloads `lfs`, the Rust-native LuaFileSystem port from the
 /// `lua-rs-lfs` crate. `LUA_RS_TESTC=1` also installs a small internal `T`
 /// table for official-test instrumentation.
 fn register_preloaded_modules(state: &mut LuaState) -> Result<(), LuaError> {
