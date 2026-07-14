@@ -5740,14 +5740,12 @@ fn stack_init(thread: &mut LuaState) {
     let total_slots = BASIC_STACK_SIZE + EXTRA_STACK;
     thread.stack = vec![StackValue::default(); total_slots];
 
-    // types.tsv: lua_State.tbclist → Vec<StackIdx>
-    // PORT NOTE: In C, tbclist.p = stack.p is a sentinel meaning "no tbc vars".
-    // In Rust the Vec is empty when there are no tbc variables.
+    // In C, tbclist.p = stack.p is a sentinel meaning "no tbc vars"; here
+    // the Vec is simply empty when there are no tbc variables.
     thread.tbclist = Vec::new();
 
-    //      setnilvalue(s2v(L1->stack.p + i));  /* erase new stack */
-    // macros.tsv: setnilvalue → *o = LuaValue::Nil
-    // Already initialized to LuaValue::Nil via StackValue::default().
+    // The new stack slots are already initialized to LuaValue::Nil via
+    // StackValue::default().
 
     thread.top = StackIdx(0);
 
@@ -5969,14 +5967,14 @@ pub fn new_thread(state: &mut LuaState, initial_body: Option<LuaValue>) -> Resul
 
     new_thread.hookmask = hookmask;
     new_thread.basehookcount = basehookcount;
-    // TODO(port): lua_Hook is Box<dyn FnMut(...)>; not Clone.
-    // Sharing a hook between threads would require Arc<Mutex<...>> (Phase E debug).
+    // The hook function itself does not propagate to the new thread: `hook`
+    // is a non-`Clone` `Box<dyn FnMut(...)>`, so only the mask/counts above
+    // are copied; sharing the closure would need an `Arc<Mutex<...>>`.
     new_thread.reset_hook_count();
 
-    // macros.tsv: lua_getextraspace → state.extra_space_mut() → &mut [u8]
-    // TODO(port): LuaState.extra_space field not yet defined; Phase B
-
-    // macros.tsv: luai_userstatethread → (extension hook; drop)
+    // There is no `LuaState.extra_space` field, so `lua_getextraspace` (the
+    // C API for per-thread embedder-owned extra space) has no equivalent
+    // here.
 
     stack_init(&mut new_thread);
 
@@ -6008,24 +6006,6 @@ pub fn new_thread(state: &mut LuaState, initial_body: Option<LuaValue>) -> Resul
 /// Reset a thread to its base state, closing all to-be-closed variables.
 ///
 /// Returns the final status code as an `i32` (mirrors the C API).
-///
-///
-/// ```c
-///
-/// //   CallInfo *ci = L->ci = &L->base_ci;
-/// //   setnilvalue(s2v(L->stack.p));
-/// //   ci->func.p = L->stack.p;
-/// //   ci->callstatus = CIST_C;
-/// //   if (status == LUA_YIELD) status = LUA_OK;
-/// //   L->status = LUA_OK;  /* so it can run __close metamethods */
-/// //   status = luaD_closeprotected(L, 1, status);
-/// //   if (status != LUA_OK) luaD_seterrorobj(L, status, L->stack.p + 1);
-/// //   else L->top.p = L->stack.p + 1;
-/// //   ci->top.p = L->top.p + LUA_MINSTACK;
-/// //   luaD_reallocstack(L, cast_int(ci->top.p - L->stack.p), 0);
-/// //   return status;
-/// // }
-/// ```
 pub fn reset_thread(state: &mut LuaState, status: i32) -> i32 {
     // Public low-level entry point: the __close error path under
     // close_protected() materializes error messages, which requires an
@@ -6037,7 +6017,6 @@ pub fn reset_thread(state: &mut LuaState, status: i32) -> i32 {
     state.ci = CallInfoIdx(0);
     let ci_idx = 0usize;
 
-    // macros.tsv: setnilvalue → *o = LuaValue::Nil; s2v → state.stack_at(idx)
     if !state.stack.is_empty() {
         state.stack[0].val = LuaValue::Nil;
     }
@@ -6066,8 +6045,9 @@ pub fn reset_thread(state: &mut LuaState, status: i32) -> i32 {
     let new_ci_top = StackIdx(state.top.0 + LUA_MINSTACK as u32);
     state.call_info[ci_idx].top = new_ci_top;
 
-    // TODO(port): crate::do_::realloc_stack(state, new_ci_top.0 as i32, 0) — ldo.c → do_.rs
-    // For Phase A, grow the stack if needed to at least new_ci_top slots.
+    // Grows the stack directly with `resize` rather than going through
+    // `crate::do_::realloc_stack`, which additionally stops emergency GC
+    // during the grow, propagates OOM, and updates `stack_last`.
     let needed = new_ci_top.0 as usize;
     if state.stack.len() < needed {
         state.stack.resize(needed, StackValue::default());
@@ -6077,20 +6057,7 @@ pub fn reset_thread(state: &mut LuaState, status: i32) -> i32 {
 }
 
 /// Close a coroutine thread from the perspective of another thread.
-///
-///
-/// ```c
-///
-/// //   int status;
-/// //   lua_lock(L);
-/// //   L->n_ccalls = (from) ? getCcalls(from) : 0;
-/// //   status = luaE_resetthread(L, L->status);
-/// //   lua_unlock(L);
-/// //   return status;
-/// // }
-/// ```
 pub fn close_thread(state: &mut LuaState, from: Option<&LuaState>) -> i32 {
-    // macros.tsv: getCcalls → state.c_calls()
     state.n_ccalls = match from {
         Some(f) => f.c_calls(),
         None => 0,
@@ -6101,52 +6068,15 @@ pub fn close_thread(state: &mut LuaState, from: Option<&LuaState>) -> i32 {
 }
 
 /// Deprecated wrapper for `close_thread(L, NULL)`.
-///
-///
-/// ```c
-///
-/// //   return lua_closethread(L, NULL);
-/// // }
-/// ```
 pub fn reset_thread_api(state: &mut LuaState) -> i32 {
     close_thread(state, None)
 }
 
 /// Create a new independent Lua state.  Returns `None` only on OOM.
 ///
-///
-/// PORT NOTE: The C API takes a custom allocator `(f, ud)`.  The Rust-native API
-/// uses the global Rust allocator; those parameters are dropped.  Equivalent to
-/// `LuaState::new()` at the call site.
-///
-/// ```c
-///
-/// //   int i;
-/// //   lua_State *L;
-/// //   global_State *g;
-/// //   LG *l = cast(LG *, (*f)(ud, NULL, LUA_TTHREAD, sizeof(LG)));
-/// //   if (l == NULL) return NULL;
-/// //   L = &l->l.l; g = &l->g;
-/// //   L->tt = LUA_VTHREAD;
-/// //   g->currentwhite = bitmask(WHITE0BIT);
-/// //   L->marked = luaC_white(g);
-/// //   preinit_thread(L, g);
-/// //   g->allgc = obj2gco(L);
-/// //   L->next = NULL;
-/// //   incnny(L);
-/// //   g->frealloc = f; g->ud = ud; g->warnf = NULL; g->ud_warn = NULL;
-/// //   g->mainthread = L; g->seed = luai_makeseed(L);
-/// //   g->gcstp = GCSTPGC;
-/// //   ... (zero-init all GC list pointers and tunables) ...
-/// //   setivalue(&g->nilvalue, 0);  /* signal: state not yet built */
-/// //   ... (setgcparam tunables) ...
-/// //   for (i=0; i < LUA_NUMTAGS; i++) g->mt[i] = NULL;
-/// //   if (luaD_rawrunprotected(L, f_luaopen, NULL) != LUA_OK) {
-/// //     close_state(L); L = NULL;
-/// //   }
-/// //   return L;
-/// // }
-/// ```
+/// The C API takes a custom allocator `(f, ud)`; the Rust-native API uses
+/// the global Rust allocator instead, so those parameters are dropped.
+/// Equivalent to `LuaState::new()` at the call site.
 pub fn new_state() -> Option<LuaState> {
     // In Rust, allocation failure panics by default; we use Result internally.
 
@@ -6165,11 +6095,9 @@ pub fn new_state() -> Option<LuaState> {
     let placeholder_str = GcRef(heap.allocate_uncollected(LuaString::placeholder()));
     let main_thread_value = GcRef(heap.allocate_uncollected(lua_types::value::LuaThread::new(0)));
 
-    // macros.tsv: bitmask → (1u32 << b); WHITE0BIT = 0 → 1u8
     let initial_white = 1u8 << WHITE0BIT;
 
-    // macros.tsv: setivalue → *o = LuaValue::Int(x)
-    // PORT NOTE: non-nil nilvalue signals "state not yet complete"; see is_complete().
+    // A non-nil nilvalue signals "state not yet complete"; see is_complete().
 
     let global = GlobalState {
         parser_hook: None,
@@ -6207,11 +6135,9 @@ pub fn new_state() -> Option<LuaState> {
         seed: make_seed(),
         currentwhite: initial_white,
         gcstate: GCS_PAUSE,
-        // macros.tsv: KGC_INC → GcKind::Incremental
         gckind: GcKind::Incremental as u8,
         gcstopem: false,
         genminormul: LUAI_GENMINORMUL,
-        // macros.tsv: setgcparam → p = v / 4
         genmajormul: (LUAI_GENMAJORMUL / 4) as u8,
         gcstp: GCSTPGC,
         gcemergency: false,
@@ -6278,7 +6204,6 @@ pub fn new_state() -> Option<LuaState> {
     let _bootstrap_scope = global_rc.borrow().heap.bootstrap_scope();
     let _bootstrap_guard = lua_gc::HeapGuard::push(&global_rc.borrow().heap);
 
-    // macros.tsv: luaC_white → g.current_white()
     let initial_marked = initial_white;
 
     let mut main_thread = LuaState {
@@ -6308,18 +6233,14 @@ pub fn new_state() -> Option<LuaState> {
 
     preinit_thread(&mut main_thread, global_rc.clone());
 
-    // macros.tsv: incnny → state.inc_nny() → L->n_ccalls += 0x10000
     main_thread.inc_nny();
 
-    // TODO(port): self-referential Rc cycle; Phase D GC handles cycles.
-    // For Phase A: skip setting mainthread to avoid the cycle.
+    // `mainthread` is left `None` here — see its field doc on `GlobalState`.
 
-    // TODO(port): Phase D — register main_thread in allgc as a GcRef
-
-    //      close_state(L); L = NULL; }
-    // error_sites.tsv: luaD_rawrunprotected → state.run_protected(|s| f(s, ud))
-    // PORT NOTE: We call lua_open directly since we're not using the protected-call
-    // machinery yet (ldo.c is not ported). Errors from lua_open propagate as Err.
+    // `lua_open` returns a `Result`, which already gives the same protection
+    // C gets from wrapping `f_luaopen` in `luaD_rawrunprotected` (a setjmp/
+    // longjmp catch point); calling it directly and matching the result is
+    // the Rust-native equivalent, not a missing wrapper.
     match lua_open(&mut main_thread) {
         Ok(()) => {}
         Err(_) => {
