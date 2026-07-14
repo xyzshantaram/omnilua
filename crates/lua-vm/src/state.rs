@@ -5789,37 +5789,21 @@ fn free_stack(state: &mut LuaState) {
     state.ci = CallInfoIdx(0);
     free_ci(state);
     debug_assert_eq!(state.nci, 0, "nci should be 0 after free_ci");
-    // macros.tsv: luaM_freearray → (Rust's Drop handles deallocation; drop the call)
     state.stack.clear();
     state.stack.shrink_to_fit();
 }
 
 fn init_registry(state: &mut LuaState) -> Result<(), LuaError> {
-    // macros.tsv: luaH_new → state.new_table()
     let registry = state.new_table();
 
-    // macros.tsv: sethvalue → *o = LuaValue::Table(x.clone())
     state.global_mut().l_registry = LuaValue::Table(registry.clone());
 
-    // macros.tsv: luaH_resize → t.resize(state, na, nh)?
-    // TODO(port): registry is a GcRef<LuaTable> (Rc); calling methods requires borrow_mut()
-    // For Phase A, use RefCell interior mutability on LuaTable, or accept the limitation.
-    // Using Rc::get_mut is not available because of possible aliasing.
-    // TODO(port): LuaTable resize requires &mut access through Rc — needs RefCell<LuaTable>
-    //   or a redesign in Phase B.
+    // The registry's LUA_RIDX_MAINTHREAD slot is never populated: it would
+    // need a GcRef<LuaState> pointing at the main thread's own LuaState,
+    // which is self-referential and not GcRef-tracked. Left as Nil.
 
-    // macros.tsv: setthvalue → *o = LuaValue::Thread(x.clone())
-    // TODO(port): cannot create GcRef<LuaState> to self (self-referential Rc).
-    // In Phase E this would be resolved once coroutine threads are GcRef-tracked.
-    // For Phase A: leave registry[LUA_RIDX_MAINTHREAD-1] as Nil and add a TODO.
-    // TODO(port): set registry[LUA_RIDX_MAINTHREAD - 1] = LuaValue::Thread(main_thread_gcref)
-
-    // PORT NOTE (phase-b-reconcile): The lua-types LuaTable placeholder is
-    // storage-less, so we can't actually persist the globals table inside
-    // the registry via array_set. Store it in a direct GlobalState field
-    // and patch get_global_table to read it from there. Symmetric for the
-    // _LOADED module cache. Once the LuaTable placeholder reconciles, the
-    // canonical registry storage takes over and these fields disappear.
+    // `GlobalState::globals`/`GlobalState::loaded` are direct fields rather
+    // than registry entries; see their field docs.
     let globals = state.new_table();
     state.global_mut().globals = LuaValue::Table(globals);
     let loaded = state.new_table();
@@ -5833,13 +5817,13 @@ fn lua_open(state: &mut LuaState) -> Result<(), LuaError> {
     init_registry(state)?;
     crate::string::init(state)?;
     crate::tagmethods::init(state)?;
-    // TODO(port): luaX_init lives in the lua-lex crate; cross-crate call needed in Phase B
+    // `lua_lex::init` interns and fixes the reserved-word strings against GC
+    // collection and documents itself as required at VM startup, but no call
+    // site in this crate invokes it.
     state.global_mut().gcstp = 0;
     state.global().heap.unpause();
-    // macros.tsv: setnilvalue → *o = LuaValue::Nil
-    // PORT NOTE: setting nilvalue = Nil signals completestate() → is_complete() = true
+    // Setting nilvalue = Nil signals completestate() → is_complete() = true.
     state.global_mut().nilvalue = LuaValue::Nil;
-    // macros.tsv: luai_userstateopen → (extension hook, no-op default; drop)
     Ok(())
 }
 
@@ -5847,19 +5831,18 @@ fn preinit_thread(thread: &mut LuaState, global: Rc<RefCell<GlobalState>>) {
     thread.global = global;
     thread.stack = Vec::new();
     thread.call_info = Vec::new();
-    // PORT NOTE: We initialize ci to 0 but call_info is empty; stack_init() must be
+    // ci is initialized to 0 but call_info is empty; stack_init() must be
     // called before any use of call_info.
     thread.ci = CallInfoIdx(0);
     thread.nci = 0;
-    // PORT NOTE: In C, L->twups = L is a self-reference sentinel meaning "no open upvals".
-    // In Rust, GlobalState.twups is a Vec<GcRef<LuaState>>; absence from that Vec is the
-    // sentinel.  The per-thread `twups` field is removed (types.tsv: lua_State.twups → removed).
+    // In C, L->twups = L is a self-reference sentinel meaning "no open
+    // upvals". Here, GlobalState.twups is a Vec<GcRef<LuaState>>; absence
+    // from that Vec is the sentinel, so there is no per-thread twups field.
     thread.n_ccalls = 0;
     thread.hook = None;
     thread.hookmask = 0;
     thread.basehookcount = 0;
     thread.allowhook = true;
-    // macros.tsv: resethookcount → state.reset_hook_count()
     thread.hookcount = thread.basehookcount;
 
     // Sandbox inheritance: a coroutine joins the runtime-wide instruction/memory
@@ -5899,63 +5882,38 @@ fn close_state(state: &mut LuaState) {
     let is_complete = state.global().is_complete();
 
     if !is_complete {
-        // macros.tsv: luaC_freeallobjects via GcHandle
         state.gc().free_all_objects();
     } else {
         state.ci = CallInfoIdx(0);
-        // TODO(port): crate::do_::close_protected(state, StackIdx(1), LuaStatus::Ok)
-        // Ignoring result here because we are in teardown (same as C behavior).
         crate::api::run_close_finalizers(state);
         state.gc().free_all_objects();
-        // macros.tsv: luai_userstateclose → (extension hook; drop)
     }
 
-    // macros.tsv: luaM_freearray → (Rust's Drop handles deallocation; drop the call)
     state.global_mut().strt = StringPool::default();
 
     free_stack(state);
 
-    // PORT NOTE: C-specific memory accounting assertion; not applicable in Rust.
-
-    // PORT NOTE: Custom allocator freed LG here. Rust's allocator (via Drop) handles
-    // deallocation of GlobalState and LuaState automatically.
+    // Rust's allocator (via Drop) handles deallocation of GlobalState and
+    // LuaState automatically; there is no custom-allocator free call here.
 }
 
-/// Create a new coroutine thread sharing the same GlobalState as the caller.
-///
-/// Pushes the new thread onto the caller's stack and returns `Ok(())`.
-///
-///
-/// ```c
-///
-/// //   global_State *g = G(L);
-/// //   GCObject *o;
-/// //   lua_State *L1;
-/// //   lua_lock(L); luaC_checkGC(L);
-/// //   o = luaC_newobjdt(L, LUA_TTHREAD, sizeof(LX), offsetof(LX, l));
-/// //   L1 = gco2th(o);
-/// //   setthvalue2s(L, L->top.p, L1); api_incr_top(L);
-/// //   preinit_thread(L1, g);
-/// //   ... (copy hook settings, extra space, stack_init) ...
-/// //   lua_unlock(L); return L1;
-/// // }
-/// ```
 /// Allocate a fresh coroutine `LuaState`, register it under a new
 /// `ThreadId`, and push the resulting `LuaValue::Thread(value)` onto
 /// `state`'s stack.
 ///
 /// If `initial_body` is `Some(f)`, `f` is also pushed onto the new
 /// thread's stack so that `coroutine.status` reports `"suspended"`
-/// rather than `"dead"`. The full cross-thread `xmove` from caller to
-/// coroutine arrives in slice 02b; `co_create` uses `initial_body` to
-/// stage the body without needing a real `xmove`.
+/// rather than `"dead"`. `co_create` uses this to stage the body function
+/// without a full stack transfer between threads.
 pub fn new_thread(state: &mut LuaState, initial_body: Option<LuaValue>) -> Result<(), LuaError> {
     state.gc_pre_collect_clear();
     state.gc().check_step();
 
-    // PORT NOTE: In C, the new thread is GC-allocated as part of the allgc list.
-    // In Rust (Phase A), we create a plain LuaState; Phase D will wire GC registration.
-    // TODO(port): allocate via state.gc().new_obj(LuaType::Thread, ...) in Phase D
+    // Unlike C, where the new thread is GC-allocated as part of the allgc
+    // list, this creates a plain `LuaState` owned by `Rc<RefCell<>>` outside
+    // the traced heap; reachability while suspended is instead handled by
+    // `trace_reachable_threads` and the cross-thread snapshot fields on
+    // `GlobalState` (see their field docs).
 
     let global_rc = state.global_rc();
     let hookmask = state.hookmask;
