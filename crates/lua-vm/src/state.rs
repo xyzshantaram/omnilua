@@ -6195,7 +6195,7 @@ pub fn new_state() -> Option<LuaState> {
     // tracing yet, and lua_open() clears `paused` partway through, so an
     // allocation-triggered step during setup must not sweep these objects.
     // Heap::drop_all() still frees them when the Lua instance drops — they
-    // just never leak past that, unlike the pre-D-1c `Gc::new_uncollected`
+    // just never leak past that, unlike the previous `Gc::new_uncollected`
     // fallback. RAII scope: the lua_open error return below cannot leave the
     // heap stuck in bootstrap mode. Callers that continue bootstrapping
     // (stdlib install) open a nested window of their own; callers that use
@@ -6254,36 +6254,16 @@ pub fn new_state() -> Option<LuaState> {
 
 /// Close the Lua state and free all resources.
 ///
-///
-/// PORT NOTE: In C, `lua_close` gets the main thread via `G(L)->mainthread`
-/// and closes that regardless of which thread is passed.  In Rust, the caller
-/// should hold the main `LuaState` and drop it (which triggers `close_state`
-/// via this function or `Drop`).
-///
-/// ```c
-///
-/// //   lua_lock(L);
-/// //   L = G(L)->mainthread;  /* only the main thread can be closed */
-/// //   close_state(L);
-/// // }
-/// ```
+/// In C, `lua_close` gets the main thread via `G(L)->mainthread` and closes
+/// that regardless of which thread is passed. Here, callers must pass the
+/// main `LuaState` directly; this does not traverse to the main thread —
+/// the caller owns the root state — and does not assert that `state` is
+/// indeed the main thread before closing it.
 pub fn close(mut state: LuaState) {
-    // PORT NOTE: In Rust, callers must pass the main LuaState directly (or obtain it
-    // from GlobalState.mainthread).  We do not traverse to the main thread here;
-    // the caller owns the root state.
-    // TODO(port): assert that `state` is indeed the main thread before closing
     close_state(&mut state);
 }
 
 /// Forward a warning message through the configured warning sink.
-///
-///
-/// ```c
-///
-/// //   lua_WarnFunction wf = G(L)->warnf;
-/// //   if (wf != NULL) wf(G(L)->ud_warn, msg, tocont);
-/// // }
-/// ```
 pub(crate) fn warning(state: &mut LuaState, msg: &[u8], to_cont: bool) {
     let test_warn_enabled = state.global().test_warn_enabled;
     if test_warn_enabled {
@@ -6291,14 +6271,9 @@ pub(crate) fn warning(state: &mut LuaState, msg: &[u8], to_cont: bool) {
         return;
     }
 
-    // types.tsv: global_State.warnf → Option<Box<dyn FnMut(&[u8], bool)>>
-    // types.tsv: global_State.ud_warn → (removed; folded into the closure)
-    // PORT NOTE: We must drop the RefMut borrow before calling the closure to avoid
-    // a potential re-entrant borrow_mut() if the closure calls back into Lua.
-    // We check for the presence of warnf while holding a borrow, then call it.
-    // TODO(port): if the warning function needs to call back into state (e.g. to push
-    // a Lua error), this will panic at runtime due to RefCell re-entry. Phase B should
-    // design a safe re-entrance pattern (e.g. take + restore the warnf closure).
+    // The warnf closure is taken out of GlobalState (and restored after the
+    // call) rather than invoked while holding a borrow, so a closure that
+    // calls back into Lua does not hit a re-entrant borrow_mut() panic.
     let has_warnf = state.global().warnf.is_some();
     if has_warnf {
         // Take the warnf closure out to avoid re-entrant borrow.
