@@ -195,11 +195,8 @@ pub fn arith(
     p2: &LuaValue,
     res: StackIdx,
 ) -> Result<(), LuaError> {
-    //        luaT_trybinTM(L, p1, p2, res, cast(TMS, (op - LUA_OPADD) + TM_ADD)); }
-    //
-    // PORT NOTE: raw_arith writes to a local `temp` first; we then set the stack
-    // slot.  This avoids holding a &mut borrow into the stack across try_bin_tm,
-    // which would violate the StackIdx rule (PORTING.md §2 #5).
+    // raw_arith writes to a local `temp` first, and only then sets the stack
+    // slot, avoiding a &mut borrow into the stack held across try_bin_tm.
     let mut temp = LuaValue::Nil;
     if raw_arith(state, op, p1, p2, &mut temp)? {
         state.set_at(res, temp);
@@ -236,8 +233,6 @@ pub fn hex_value(c: u8) -> u8 {
 /// at `*idx`.  Returns `true` if a minus sign was consumed.
 ///
 fn is_neg(s: &[u8], idx: &mut usize) -> bool {
-    //    else if (**s == '+') (*s)++;
-    //    return 0;
     if *idx < s.len() && s[*idx] == b'-' {
         *idx += 1;
         return true;
@@ -272,8 +267,8 @@ fn str_x2number(s: &[u8]) -> Option<(f64, usize)> {
     let mut e: i32 = 0;
     let mut hasdot = false;
 
-    // PORT NOTE: `lua_getlocaledecpoint()` returns the locale decimal separator.
-    // Rust has no locale; we always treat '.' as the separator here.
+    // C's `lua_getlocaledecpoint()` returns the locale decimal separator;
+    // there is no locale support here, so '.' is always the separator.
     let dot = b'.';
 
     loop {
@@ -287,9 +282,6 @@ fn str_x2number(s: &[u8]) -> Option<(f64, usize)> {
             }
             hasdot = true;
         } else if ch.is_ascii_hexdigit() {
-            //    else if (++sigdig <= MAXSIGDIG) r = (r * 16.0) + luaO_hexavalue(*s);
-            //    else e++;
-            //    if (hasdot) e--;
             if sigdig == 0 && ch == b'0' {
                 nosigdig += 1;
             } else if {
@@ -346,10 +338,10 @@ fn str2dloc(s: &[u8], mode: u8) -> Option<(f64, usize)> {
     let (result, end) = if mode == b'x' {
         str_x2number(s)?
     } else {
-        // PORT NOTE: from_utf8 used here because numeric string literals are
-        // guaranteed to be ASCII (a strict subset of UTF-8).
-        // TODO(port): replace with a bytes-native float parser in Phase B
-        // (e.g., the `fast-float` crate) to satisfy the from_utf8 ban fully.
+        // Numeric string literals are ASCII (a strict subset of UTF-8), so
+        // parsing through from_utf8 + str::parse is safe; a bytes-native
+        // float parser (e.g. the `fast-float` crate) would avoid the
+        // from_utf8 conversion entirely.
         let text = core::str::from_utf8(s).ok()?;
         let trimmed = text.trim();
         // Reject "inf", "infinity", "nan" — Lua does not accept these.
@@ -392,9 +384,9 @@ fn str2d(s: &[u8]) -> Option<(f64, usize)> {
         return Some(result);
     }
 
-    // PORT NOTE: Lua retries by replacing '.' with the locale decimal separator.
-    // Rust has no locale support; we skip this retry path and always use '.'.
-    // TODO(port): add locale retry if locale-aware float parsing is needed.
+    // C-Lua retries by replacing '.' with the locale decimal separator; there
+    // is no locale support here, so this retry path is skipped and '.' is
+    // always used.
 
     None
 }
@@ -525,7 +517,7 @@ pub fn utf8_esc(buff: &mut [u8; UTF8_BUF_SZ], x: u32) -> usize {
 
 /// Formats `f` as C's `printf("%.*g", precision, f)` would, returning the bytes.
 ///
-/// PORT NOTE: Rust has no built-in `%g` format. This replicates the C99
+/// Rust has no built-in `%g` format. This replicates the C99
 /// `%g` algorithm: pick scientific or fixed-point based on the value's
 /// exponent, strip trailing zeros, normalize the exponent to `e[+-]NN` with at
 /// least two digits (matching C's output). The precision is the float
@@ -624,9 +616,8 @@ pub(crate) fn number_to_str_buf(val: &LuaValue, version: lua_types::LuaVersion) 
 
     match val {
         LuaValue::Int(i) => {
-            // lua_integer2str → l_sprintf with LUA_INTEGER_FMT ("%lld")
-            // PORT NOTE: using Rust's default i64 Display formatting, which
-            // matches C's `%lld` for all values in [i64::MIN, i64::MAX].
+            // Rust's default i64 Display formatting matches C's
+            // lua_integer2str (`%lld`) for all values in [i64::MIN, i64::MAX].
             let s = format!("{}", i);
             s.into_bytes()
         }
@@ -705,10 +696,10 @@ pub fn num_to_string(state: &mut LuaState, val: &LuaValue) -> Result<GcRef<LuaSt
 
 /// Typed format argument for `push_vfstring`.
 ///
-/// PORT NOTE: replaces the C `va_list` variadic interface.  C callers of
-/// `luaO_pushfstring(L, fmt, ...)` must be updated to pass structured
-/// `FmtArg` slices.  The format-string scanning logic is preserved in
-/// `push_vfstring`; only the argument-list type changes.
+/// Replaces C's `va_list` variadic interface: callers pass a structured
+/// `FmtArg` slice instead of `luaO_pushfstring(L, fmt, ...)` varargs. The
+/// format-string scanning logic is preserved in `push_vfstring`; only the
+/// argument-list type changes.
 pub enum FmtArg<'a> {
     /// `%s` — a byte string (replaces `const char *` from va_list).
     Str(&'a [u8]),
@@ -726,9 +717,8 @@ pub enum FmtArg<'a> {
 
 /// Internal accumulator for `push_vfstring`.
 ///
-///
-/// PORT NOTE: `space` is a `Vec<u8>` rather than a fixed-size array; the
-/// BUF_VFS threshold is still respected for flushing behaviour.
+/// `space` is a `Vec<u8>` rather than a fixed-size array; the BUF_VFS
+/// threshold is still respected for flushing behaviour.
 struct BufFs {
     /// Whether at least one partial result has been pushed onto the stack.
     pushed: bool,
@@ -749,9 +739,6 @@ impl BufFs {
 /// any prior partial result.
 ///
 fn pushstr(buf: &mut BufFs, state: &mut LuaState, str_bytes: &[u8]) -> Result<(), LuaError> {
-    //    L->top.p++;
-    //    if (!buff->pushed) buff->pushed = 1;
-    //    else luaV_concat(L, 2);
     let s = state.intern_str(str_bytes)?;
     state.push(LuaValue::Str(s));
     if !buf.pushed {
@@ -772,7 +759,6 @@ fn clearbuff(buf: &mut BufFs, state: &mut LuaState) -> Result<(), LuaError> {
 /// Adds `str_bytes` to the internal buffer, flushing first if it won't fit.
 ///
 fn addstr2buff(buf: &mut BufFs, state: &mut LuaState, str_bytes: &[u8]) -> Result<(), LuaError> {
-    //    else { clearbuff; pushstr directly; }
     if str_bytes.len() <= BUF_VFS {
         if str_bytes.len() > BUF_VFS - buf.space.len() {
             clearbuff(buf, state)?;
@@ -788,8 +774,6 @@ fn addstr2buff(buf: &mut BufFs, state: &mut LuaState, str_bytes: &[u8]) -> Resul
 /// Formats the numeric value `num` and appends it to the buffer.
 ///
 fn addnum2buff(buf: &mut BufFs, state: &mut LuaState, num: &LuaValue) -> Result<(), LuaError> {
-    //    int len = tostringbuff(num, numbuff);
-    //    addsize(buff, len);
     let version = state.global().lua_version;
     let bytes = number_to_str_buf(num, version);
     addstr2buff(buf, state, &bytes)
@@ -806,9 +790,8 @@ fn addnum2buff(buf: &mut BufFs, state: &mut LuaState, num: &LuaValue) -> Result<
 /// `%s`, `%c`, `%d`, `%I`, `%f`, `%U`, `%%`.
 /// `%p` is **not** supported; see [`FmtArg`] documentation.
 ///
-///
-/// PORT NOTE: `va_list` replaced by `&[FmtArg]`.  Call sites that previously
-/// passed variadic arguments must be updated to build a `&[FmtArg]` slice.
+/// `va_list` replaced by `&[FmtArg]`: callers build a `&[FmtArg]` slice
+/// instead of passing variadic arguments.
 pub fn push_vfstring<'a>(
     state: &mut LuaState,
     fmt: &[u8],
@@ -825,7 +808,6 @@ pub fn push_vfstring<'a>(
         let spec = if e + 1 < fmt.len() { fmt[e + 1] } else { 0 };
         match spec {
             b's' => {
-                //    addstr2buff(&buff, s, strlen(s));
                 let s = match args.get(arg_idx) {
                     Some(FmtArg::Str(b)) => *b,
                     None => b"(null)",
@@ -835,7 +817,6 @@ pub fn push_vfstring<'a>(
                 addstr2buff(&mut buf, state, s)?;
             }
             b'c' => {
-                //    addstr2buff(&buff, &c, sizeof(char));
                 let c = match args.get(arg_idx) {
                     Some(FmtArg::Char(b)) => *b,
                     _ => b'?',
@@ -852,7 +833,6 @@ pub fn push_vfstring<'a>(
                 addnum2buff(&mut buf, state, &LuaValue::Int(n))?;
             }
             b'I' => {
-                //    addnum2buff(&buff, &num);
                 let n = match args.get(arg_idx) {
                     Some(FmtArg::LuaInt(i)) => *i,
                     _ => 0,
@@ -861,7 +841,6 @@ pub fn push_vfstring<'a>(
                 addnum2buff(&mut buf, state, &LuaValue::Int(n))?;
             }
             b'f' => {
-                //    addnum2buff(&buff, &num);
                 let f = match args.get(arg_idx) {
                     Some(FmtArg::Float(f)) => *f,
                     _ => 0.0,
@@ -870,13 +849,12 @@ pub fn push_vfstring<'a>(
                 addnum2buff(&mut buf, state, &LuaValue::Float(f))?;
             }
             b'p' => {
-                // TODO(port): %p pointer formatting not implemented in safe Rust;
-                // callers that need it should pre-format the pointer and pass FmtArg::Str.
+                // %p pointer formatting has no safe-Rust equivalent; callers
+                // that need it pre-format the pointer and pass FmtArg::Str.
                 arg_idx += 1; // consume the argument slot
                 addstr2buff(&mut buf, state, b"<ptr>")?;
             }
             b'U' => {
-                //    addstr2buff(&buff, bf + UTF8BUFFSZ - len, len);
                 let cp = match args.get(arg_idx) {
                     Some(FmtArg::Utf8Codepoint(u)) => *u,
                     _ => b'?' as u32,
@@ -903,18 +881,16 @@ pub fn push_vfstring<'a>(
     clearbuff(&mut buf, state)?;
     debug_assert!(buf.pushed, "push_vfstring: no string was pushed");
 
-    // Return the interned string at the top of the stack.
-    // PORT NOTE: in C this returns a `const char *` into the TString; in Rust
-    // we return the GcRef<LuaString> directly.
+    // Return the interned string at the top of the stack. C returns a
+    // `const char *` into the TString; here the GcRef<LuaString> is returned
+    // directly.
     Ok(state.peek_string_at_top())
 }
 
 /// Variadic entry point; delegates to `push_vfstring`.
 ///
-///
-/// PORT NOTE: callers that previously used `luaO_pushfstring` for error
-/// messages should collapse the call into `LuaError::runtime(format_args!(...))`;
-/// see PORTING.md §4.2 and error_sites.tsv.
+/// Callers building an error message should prefer collapsing the call into
+/// `LuaError::runtime(format_args!(...))` instead.
 pub fn push_fstring<'a>(
     state: &mut LuaState,
     fmt: &[u8],
