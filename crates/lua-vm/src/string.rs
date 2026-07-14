@@ -1,23 +1,13 @@
-//! String table and interned-string operations — port of `lstring.c` + `lstring.h`.
+//! Bootstrap string table used only to construct the pre-allocated
+//! out-of-memory message during VM startup.
 //!
-//! Provides two key abstractions:
-//!
-//! - [`LuaStringImpl`]: the Lua string value, stored as a reference-counted byte slice.
-//!   Short strings (`<= MAX_SHORT_LEN` bytes) are interned in the process-global
-//!   [`StringPool`]; long strings are heap-allocated on each creation and never
-//!   interned.
-//!
-//! - [`StringPool`]: the intern table for short strings, stored on `GlobalState`.
-//!   Replaces the C `stringtable` struct, which used an open-addressing hash table
-//!   with intrusive chaining through `TString.u.hnext`.  In Rust the intrusive
-//!   chain is dropped; a `HashMap` provides O(1) lookup and automatic rehashing.
-//!   See PORT NOTE on [`StringPool`] for the full rationale.
-//!
-//! The `lstring.h` header is merged into this module per PORTING.md §1.
-//!
-//! # C source files
-//! - `reference/lua-5.4.7/src/lstring.c`  (275 lines, 15 functions)
-//! - `reference/lua-5.4.7/src/lstring.h`  (57 lines; merged here)
+//! [`LuaStringImpl`]/[`StringPool`] mirror C's `TString`/`stringtable`
+//! (`lstring.c`/`lstring.h`), but nothing outside this module ever calls
+//! [`new_lstr`] again after [`init`] runs once at startup: general Lua
+//! string values and their interning go through `lua_types::LuaString` and
+//! `GlobalState::interned_lt` (see `state.rs`). `GlobalState::strt` — the
+//! [`StringPool`] this module maintains — ends up holding exactly one entry,
+//! the memory-error message, for the life of the process.
 
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -25,73 +15,41 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-// TODO(port): these import paths will resolve once Phase B wires the crate graph.
-// `LuaState` and `GlobalState` live in crate::state (src/state.rs, from lstate.c).
-// `LuaValue` and `LuaError` live in lua_types (crates/lua-types/src/).
 use crate::state::LuaState;
 
-// PORT NOTE: `GcRef<T>` is the lua-types newtype around `Rc<T>` per PORT_STRATEGY §3.4.
-// Re-imported here so all string-pool entries share identity with state.rs / api.rs.
 use lua_types::GcRef;
-/// Phase-B bridge: converts a lua-vm rich `LuaStringImpl` into a `lua_types::LuaString`.
-/// The two types track different metadata (short/long flag, extra byte) and a real
-/// merge belongs in Phase B once `lua-types::LuaString` grows the needed fields.
+
+/// Converts the local `LuaStringImpl` into the canonical `lua_types::LuaString`
+/// used everywhere else in the VM. Only called once, on the bootstrap OOM
+/// message in [`init`].
 fn impl_to_lt(s: &GcRef<LuaStringImpl>) -> GcRef<lua_types::LuaString> {
-    // TODO(D-1c-bridge): allocation outside state context (free fn)
     GcRef::new(lua_types::LuaString::from_bytes(s.as_bytes().to_vec()))
 }
 
-// ── Constants (lstring.h macros → macros.tsv) ─────────────────────────────────
+// ── Constants ─────────────────────────────────────────────────────────────────
 
-// macros.tsv: MEMERRMSG → const MEMERR_MSG: &[u8] = b"not enough memory"
 /// Pre-allocated OOM error message.  Must be created before the allocator
 /// can fail so that the GC can always hand back a valid error string.
 pub(crate) const MEMERR_MSG: &[u8] = b"not enough memory";
 
-// macros.tsv: MINSTRTABSIZE → const MIN_STR_TAB_SIZE: usize = 128
 const MIN_STR_TAB_SIZE: usize = 128;
 
-// macros.tsv: STRCACHE_N → const STRCACHE_N: usize = 53
 const STRCACHE_N: usize = 53;
 
-// macros.tsv: STRCACHE_M → const STRCACHE_M: usize = 2
 const STRCACHE_M: usize = 2;
 
-// macros.tsv: LUAI_MAXSHORTLEN → const MAX_SHORT_LEN: usize = 40
 pub(crate) const MAX_SHORT_LEN: usize = 40;
 
-// macros.tsv: MAX_SIZE → const MAX_SIZE: usize = if size_of::<usize>() < size_of::<i64>() { usize::MAX } else { i64::MAX as usize }
 const MAX_SIZE: usize = if std::mem::size_of::<usize>() < std::mem::size_of::<i64>() {
     usize::MAX
 } else {
     i64::MAX as usize
 };
 
-// macros.tsv: luaM_limitN → std::cmp::min(n, usize::MAX / std::mem::size_of::<T>())
-//             cast_int → x as i32
-// Rust: upper bound on the number of hash buckets; derived from MAX_INT / pointer size.
+/// Upper bound on the number of hash buckets; derived from `i32::MAX` / pointer size.
 const MAX_STR_TAB: usize = i32::MAX as usize / std::mem::size_of::<usize>();
 
-// macros.tsv: sizelstring → drop — Rust allocates via Box<[u8]> / Rc<[u8]>
-// PORT NOTE: dropped entirely; Rust uses Rc<[u8]> which carries its own length.
-
-// macros.tsv: luaS_newliteral → state.intern_str(b"...")
-// PORT NOTE: translated at call sites as `new_lstr(state, b"literal")`.
-
-// macros.tsv: isreserved → ts.is_reserved_word()
-// PORT NOTE: translated at call sites as the `LuaStringImpl::is_reserved_word()` method.
-
-// macros.tsv: eqshrstr → Rc::ptr_eq(a, b)
-// PORT NOTE: short strings are interned so pointer equality suffices.
-// Translated at call sites as `Rc::ptr_eq(a, b)`.
-
-// ── LuaStringImpl (was TString in lobject.h) ─────────────────────────────────────
-
-// PORT NOTE: `LuaStringImpl` corresponds to `TString` from `lobject.h`, which maps to
-// `src/object.rs` per file_deps.txt.  It is defined here (in `string.rs`) because
-// `lstring.c` owns the string-table internals and most of the type's behaviour.
-// Phase B should reconcile: either keep it here and re-export from `object.rs`,
-// or move it there and import it from `string.rs`.
+// ── LuaStringImpl ────────────────────────────────────────────────────────────
 
 /// Whether a Lua string is short (interned) or long (not interned).
 ///
@@ -108,26 +66,17 @@ pub enum StringKind {
     Long,
 }
 
-/// A Lua string: an immutable, reference-counted byte sequence.
+/// A Lua string: an immutable, reference-counted byte sequence. Corresponds
+/// to C's `TString`.
 ///
 /// Short strings (`<= MAX_SHORT_LEN = 40` bytes) are interned in the
 /// [`StringPool`] on `GlobalState`; two short strings with the same bytes
 /// are guaranteed to be the same `GcRef` (pointer equality via `Rc::ptr_eq`).
+/// In practice the only `LuaStringImpl` ever created is the bootstrap OOM
+/// message — see the module doc.
 ///
-/// Long strings are heap-allocated independently and never interned.  Their
-/// hash is computed lazily on first call to [`hash_long_str`] and cached via
-/// interior mutability (`Cell<u32>`).
-///
-/// # C mapping (types.tsv)
-/// ```text
-/// TString             → LuaStringImpl
-/// TString.extra       → extra: Cell<u8>   (reserved-word idx for Short; hash-ready flag for Long)
-/// TString.shrlen      → kind: StringKind   (0xFF sentinel replaced by enum variant)
-/// TString.hash        → hash: Cell<u32>
-/// TString.u.lnglen    → bytes.len()        (length implicit in Rc<[u8]>)
-/// TString.u.hnext     → (removed)          (intrusive chain gone; StringPool uses HashMap)
-/// TString.contents    → bytes: Rc<[u8]>
-/// ```
+/// Long strings are heap-allocated independently and never interned. `hash`
+/// is set once at construction in [`create_str_obj`], not computed lazily.
 pub struct LuaStringImpl {
     bytes: Rc<[u8]>,
 
@@ -146,16 +95,11 @@ pub struct LuaStringImpl {
 
 impl LuaStringImpl {
     /// Returns the string's bytes.
-    ///
-    /// macros.tsv: `getstr` / `getlngstr` / `getshrstr` → `ts.as_bytes()`
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
 
     /// Returns the byte length of the string.
-    ///
-    /// for Long.  In Rust both cases are `bytes.len()`.
-    /// macros.tsv: `tsslen` → `ts.len()`
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
@@ -171,32 +115,20 @@ impl LuaStringImpl {
     }
 
     /// Returns `true` if this short string is a Lua reserved word.
-    ///
-    /// macros.tsv: `isreserved` → `ts.is_reserved_word()`
     pub fn is_reserved_word(&self) -> bool {
         self.kind == StringKind::Short && self.extra.get() > 0
     }
 
-    /// GC color predicate.  Returns `true` if this object is "white" (unreachable)
-    /// in the GC's current wave.
-    ///
-    /// macros.tsv: `iswhite` → `obj.is_white()`
-    ///
-    /// PORT NOTE: GC color management is deferred to Phase D.  In Phases A–C all
-    /// objects are reachable via `Rc` reference counts and this always returns
-    /// `false` (nothing is white / unreachable).
+    /// GC color predicate. `LuaStringImpl` values are never registered with
+    /// the tracing collector (see the module doc), so this always returns
+    /// `false`.
     pub fn is_white(&self) -> bool {
-        // TODO(port): Phase D — check the GC marked byte; stub returns false (all live)
         false
     }
 
-    /// Flip GC color from white to the current non-white (resurrect a dead object).
-    ///
-    /// macros.tsv: `changewhite` → `obj.flip_white()`
-    ///
-    /// PORT NOTE: GC color management deferred to Phase D; no-op in Phases A–C.
+    /// Flip GC color from white to the current non-white (resurrect a dead
+    /// object). No-op; see [`Self::is_white`].
     pub fn flip_white(&self) {
-        // TODO(port): Phase D — update the GC marked byte
     }
 }
 
@@ -217,35 +149,23 @@ impl PartialEq for LuaStringImpl {
 
 impl Eq for LuaStringImpl {}
 
-// ── StringPool (was stringtable in lstate.h) ──────────────────────────────────
-
-// PORT NOTE: `StringPool` corresponds to `stringtable` from `lstate.h`, which maps
-// to `src/state.rs` per file_deps.txt.  It is defined here because `lstring.c`
-// owns all of the pool's mutation logic.  Phase B should reconcile placement.
+// ── StringPool ───────────────────────────────────────────────────────────────
 //
-// The C `stringtable` used an open-addressing hash table where each bucket was
-// the head of an intrusive singly-linked list threaded through `TString.u.hnext`.
-// In Rust, `TString.u.hnext` is removed per types.tsv.  The `HashMap` replaces
-// both the bucket array and the chain: it provides O(1) average-case lookup,
-// automatic rehashing, and eliminates the need for `tablerehash`.
+// Corresponds to C's `stringtable`, which used an open-addressing hash table
+// where each bucket was the head of an intrusive singly-linked list threaded
+// through `TString.u.hnext`. The `HashMap` here replaces both the bucket
+// array and the chain: it provides O(1) average-case lookup, automatic
+// rehashing, and eliminates the need for `tablerehash`.
 //
-// `nuse` and `size` are retained for parity with the C invariants that other
-// code may check (e.g. `growstrtab` tests `nuse >= size`).
+// `nuse` is redundant with `map.len()`; kept for parity with the C
+// invariants that other code in this module checks (e.g. `growstrtab` tests
+// `nuse >= size`).
 
 /// Intern table for short Lua strings.  Lives on `GlobalState`.
-///
-/// # C mapping (types.tsv)
-/// ```text
-/// stringtable        → StringPool
-/// stringtable.hash   → map: HashMap<Box<[u8]>, GcRef<LuaStringImpl>>
-/// stringtable.nuse   → nuse: usize
-/// stringtable.size   → size: usize
-/// ```
 pub struct StringPool {
-    // PORT NOTE: keyed by owned byte slice; lookup by `&[u8]` via Borrow<[u8]>.
+    // Keyed by owned byte slice; lookup by `&[u8]` via Borrow<[u8]>.
     map: HashMap<Box<[u8]>, GcRef<LuaStringImpl>>,
 
-    // PERF(port): redundant with map.len() in Rust — keep for C-parity; remove in Phase B
     nuse: usize,
 
     // In Rust, HashMap manages its own capacity; this tracks the last requested size.
@@ -254,8 +174,6 @@ pub struct StringPool {
 
 impl StringPool {
     /// Create an empty pool with `MIN_STR_TAB_SIZE` preallocated capacity.
-    ///
-    ///    `tablerehash(tb->hash, 0, MINSTRTABSIZE)` sequence in `luaS_init`.
     pub fn new() -> Self {
         StringPool {
             map: HashMap::with_capacity(MIN_STR_TAB_SIZE),
@@ -271,35 +189,22 @@ impl Default for StringPool {
     }
 }
 
-// ── LuaUserData (was Udata in lobject.h) ──────────────────────────────────────
+// ── LuaUserData ──────────────────────────────────────────────────────────────
 
-// PORT NOTE: `LuaUserData` corresponds to `Udata` from `lobject.h`, which maps to
-// `src/object.rs` per file_deps.txt.  Defined here because `luaS_newudata` lives
-// in `lstring.c`.  Phase B should reconcile placement.
-
-/// Full userdata: a GC-tracked object carrying a raw byte payload plus optional
-/// Lua user values and an optional metatable.
+/// Corresponds to C's `Udata`: a GC-tracked object carrying a raw byte
+/// payload plus optional Lua user values and an optional metatable.
 ///
-/// # C mapping (types.tsv)
-/// ```text
-/// Udata           → LuaUserData
-/// Udata.len       → len: usize
-/// Udata.nuvalue   → nuvalue: u16  (covered by uv.len() but kept for parity)
-/// Udata.metatable → metatable: Option<GcRef<LuaTable>>
-/// Udata.uv        → uv: Vec<LuaValue>
-/// (no direct C field) data: Box<[u8]>  — the raw byte payload; C used a flexible
-///                          array member laid out past the Udata header via
-///                          `udatamemoffset` alignment math.
-/// ```
+/// Never constructed: `metatable`/`uv` are still placeholder `()` types
+/// rather than `GcRef<LuaTable>`/`LuaValue`, and no call site builds a
+/// `LuaUserDataImpl`. The userdata type actually used throughout the VM is
+/// `lua_types::userdata::LuaUserData`.
 pub struct LuaUserDataImpl {
     pub len: usize,
     pub nuvalue: u16,
-    // TODO(port): GcRef<LuaTable> — LuaTable not yet defined; Phase B
     pub metatable: Option<()>,
-    // macros.tsv: setnilvalue → *o = LuaValue::Nil
-    // TODO(port): Vec<LuaValue> — LuaValue not yet defined; Phase B
     pub uv: Vec<()>,
-    // Port of the raw byte payload that C accessed via udatamemoffset arithmetic.
+    // The raw byte payload; C accessed the equivalent via udatamemoffset
+    // pointer arithmetic on a flexible array member.
     pub data: Box<[u8]>,
 }
 
