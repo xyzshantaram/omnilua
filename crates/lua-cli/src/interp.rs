@@ -1,15 +1,14 @@
-//! Faithful Rust port of `reference/lua-5.4.7/src/lua.c` — the standalone
-//! interpreter's option handling and chunk-running logic.
+//! The standalone interpreter's option handling and chunk-running logic.
 //!
 //! The read-eval-print loop (`doREPL` and friends) lives in [`crate::repl`].
 //! Platform hooks (file/io/dynlib/popen) and the `main` entry point live in
 //! `main.rs`; this module owns everything between argument collection and the
 //! decision to enter the REPL.
 //!
-//! Structure mirrors `lua.c` section-for-section: `collectargs`, `runargs`,
-//! `createargtable`, `handle_script`, `dolibrary`, `handle_luainit`, the
-//! `docall`/`msghandler`/`report` error path, and the `pmain` orchestrator
-//! ([`run`]).
+//! Structure mirrors `reference/lua-5.4.7/src/lua.c` section-for-section:
+//! `collectargs`, `runargs`, `createargtable`, `handle_script`, `dolibrary`,
+//! `handle_luainit`, the `docall`/`msghandler`/`report` error path, and the
+//! `pmain` orchestrator ([`run`]).
 
 use std::io::{IsTerminal, Read, Write};
 
@@ -132,10 +131,10 @@ fn stdin_is_tty() -> bool {
 /// leading `#...` line so executable scripts with a shebang load. A newline is
 /// preserved in place of the stripped line to keep reported line numbers
 /// aligned with the source file.
-//
-// PORT NOTE: C's luaL_loadfilex skips the shebang char-by-char in the reader;
-// we strip it from the buffer before `load_buffer`, keeping the terminating
-// newline so line counts match.
+///
+/// C's `luaL_loadfilex` skips the shebang char-by-char in the reader; this
+/// strips it from the buffer before `load_buffer` instead, keeping the
+/// terminating newline so line counts match.
 fn strip_shebang(mut data: Vec<u8>) -> Vec<u8> {
     if data.starts_with(b"\xEF\xBB\xBF") {
         data.drain(0..3);

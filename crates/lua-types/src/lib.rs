@@ -1,10 +1,5 @@
 //! Lua value types, error types, and shared newtypes.
 //!
-//! Phase B foundation: this crate defines the types referenced by all Phase A
-//! files. Implementations are stubs (`todo!()`) where they exist; the goal is
-//! that `use lua_types::...` imports resolve so `cargo check` can surface real
-//! errors instead of name-resolution noise.
-//!
 //! See `PORT_STRATEGY.md` §3 for the design decisions encoded here.
 
 pub mod arith;

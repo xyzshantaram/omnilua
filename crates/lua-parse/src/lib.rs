@@ -2250,6 +2250,7 @@ fn cg_discharge_vars(fs: &mut FuncState, line: i32, e: &mut ExprDesc) -> Result<
     Ok(())
 }
 
+/// Fixes up `e` (a `Call` or `VarArg` expression) to yield exactly one
 /// result. For a Call this leaves the already-emitted instruction alone (it
 /// was emitted with `ARG_C = 2`, i.e. exactly one result) and reclassifies
 /// `e` as `NonReloc` pointing at the result register (the Call's `ARG_A`).
@@ -2271,8 +2272,9 @@ fn cg_set_one_ret(fs: &mut FuncState, e: &mut ExprDesc) {
     }
 }
 
-/// by `var`. Handles VLocal (move into register), VUpVal (OP_SETUPVAL),
-/// VIndexUp (OP_SETTABUP), VIndexI/IndexStr/Indexed (OP_SETI/SETFIELD/SETTABLE).
+/// Stores the value in `ex` into the variable described by `var`. Handles
+/// VLocal (move into register), VUpVal (OP_SETUPVAL), VIndexUp
+/// (OP_SETTABUP), VIndexI/IndexStr/Indexed (OP_SETI/SETFIELD/SETTABLE).
 fn cg_storevar(
     fs: &mut FuncState,
     line: i32,
@@ -2664,7 +2666,8 @@ fn cg_exp_to_next_reg(fs: &mut FuncState, line: i32, e: &mut ExprDesc) -> Result
     cg_exp_to_reg(fs, line, e, reg)
 }
 
-/// it produces `nresults` values (or LUA_MULTRET when `nresults == -1`).
+/// Patches the Call or VarArg instruction in `e` so that it produces
+/// `nresults` values (or LUA_MULTRET when `nresults == -1`).
 fn cg_set_returns(fs: &mut FuncState, e: &mut ExprDesc, nresults: i32) {
     let pc_idx = e.u.info as usize;
     let mut lc = lua_code::opcodes::Instruction(fs.f.code[pc_idx].0);
@@ -2743,6 +2746,7 @@ fn cg_finish(fs: &mut FuncState) {
     }
 }
 
+/// Emits a return instruction, choosing the most specific opcode available
 /// based on `nret`. `first` is the first result register; `nret` is the
 /// number of values to return (`LUA_MULTRET` for "all values on top").
 fn cg_emit_return(
@@ -3038,7 +3042,7 @@ fn adjust_local_vars(ls: &mut LexState, state: &mut LuaState, nvars: i32) -> Res
             let pidx = pidx_result?;
             ls.dyd.actvar[(first_local + vidx) as usize].pidx = pidx as i16;
         } else {
-            // TODO(port): variable has no name — shouldn't happen in valid source
+            // No variable name: not expected in valid source.
         }
     }
     Ok(())
@@ -4083,9 +4087,11 @@ fn enter_block(ls: &mut LexState, isloop: bool) {
         saved_scope_barriers,
     });
     fs.bl = Some(new_bl);
+    // This assertion is a tautology: the real check would call
+    // `nvarstack(ls, fs)`, but doing so here hits a circular borrow, so it
+    // currently verifies nothing.
     debug_assert!(
         fs.freereg as i32 == {
-            // TODO(port): nvarstack(ls, fs) -- circular borrow
             fs.freereg as i32 // placeholder assertion
         }
     );
@@ -4221,7 +4227,6 @@ fn leave_block(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> 
 /// Returns a mutable reference to the new prototype.
 fn add_prototype(ls: &mut LexState, _state: &mut LuaState) -> Result<Box<LuaProto>, LuaError> {
     let np = ls.fs.as_ref().unwrap().np as usize;
-    // TODO(port): allocate via state.gc().new_proto() in Phase B
     let new_proto = Box::new(LuaProto::placeholder());
     while ls.fs.as_ref().unwrap().f.p.len() <= np {
         ls.fs
@@ -4375,7 +4380,7 @@ fn fieldsel(ls: &mut LexState, state: &mut LuaState, v: &mut ExprDesc) -> Result
 }
 
 /// Handles '[' expr ']' indexing.
-/// Port of `luaK_exp2val` (`lcode.c`): if the expression carries a pending jump
+/// Corresponds to `luaK_exp2val` (`lcode.c`): if the expression carries a pending jump
 /// list (a relational/boolean result), force it into a real register so its
 /// boolean materialization is emitted before any later instruction; otherwise
 /// just discharge its variable form. Used by `yindex` so an upvalue indexed by
@@ -4852,8 +4857,9 @@ fn funcargs(
     debug_assert!(f.k == ExprKind::NonReloc);
     let base = f.u.info;
     let nparams: i32 = if args.k.has_mult_ret() {
-        // TODO(port): luaK_setmultret for VVarArg / VCall args; only single
-        // non-multret args are supported by the bootstrap codegen.
+        // luaK_setmultret's patching for VVarArg / VCall args is not
+        // replicated here; only single non-multret args are fully
+        // supported by this codegen path.
         LUA_MULTRET
     } else {
         if args.k != ExprKind::Void {
@@ -5606,7 +5612,6 @@ fn forlist(
     adjust_assign(ls, state, 4, nexps, &mut e)?;
     adjust_local_vars(ls, state, if is_v55 { 3 } else { 4 })?;
     marktobeclosed(ls.fs.as_mut().unwrap()); // last active internal var must be closed
-                                             // TODO(port): lua_code::check_stack(ls.fs.as_mut().unwrap(), 3)?;
     let internal_vars = if is_v55 { 3 } else { 4 };
     forbody(ls, state, base, line, nvars - internal_vars, true)?;
     Ok(())
@@ -5708,7 +5713,6 @@ fn localfunc(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
     let line = ls.lastline;
     body(ls, state, &mut b, false, line)?;
     let _pc = ls.fs.as_ref().unwrap().pc;
-    // TODO(port): local_debug_info(ls, ls.fs.as_mut().unwrap(), fvar).map(|lv| lv.startpc = pc);
     Ok(())
 }
 
@@ -6037,7 +6041,6 @@ fn localstat(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
     let first_local = ls.fs.as_ref().unwrap().firstlocal;
     let last_vd_kind = ls.dyd.actvar[(first_local + vidx) as usize].kind;
     if nvars == nexps && last_vd_kind == VarKind::Const {
-        // TODO(port): let is_const = lua_code::exp_to_const(ls.fs.as_mut().unwrap(), &mut e, &mut var_k)?;
         let is_const = false; // placeholder
         if is_const {
             ls.dyd.actvar[(first_local + vidx) as usize].kind = VarKind::CompileTimeConst;
@@ -6079,7 +6082,6 @@ fn funcstat(ls: &mut LexState, state: &mut LuaState, line: i32) -> Result<(), Lu
     check_readonly(ls, state, &v.clone())?;
     let fs = ls.fs.as_mut().unwrap();
     cg_storevar(fs, line, &v, &mut b)?;
-    // TODO(port): lua_code::fix_line(ls.fs.as_mut().unwrap(), line);
     Ok(())
 }
 

@@ -1,4 +1,4 @@
-//! Rust-native port of the LuaFileSystem (lfs) module — Phase G-1.
+//! Rust-native implementation of the LuaFileSystem (lfs) module.
 //!
 //! Provides the lfs functions LuaRocks actually uses:
 //!
@@ -684,8 +684,9 @@ fn lfs_dir(state: &mut LuaState) -> Result<usize, LuaError> {
 // ─── Module entry point ────────────────────────────────────────────────────
 
 /// `lua_upvalueindex(i)` macro from `lua.h`. The duplicate in `lua-stdlib`'s
-/// state stub is module-private, so we keep an in-crate copy here. Phase F
-/// or G can de-duplicate by exposing one canonical constant from `lua-vm`.
+/// state stub is module-private, so this crate keeps its own copy; a
+/// future cleanup could de-duplicate by exposing one canonical constant
+/// from `lua-vm`.
 fn upvalue_index(i: i32) -> i32 {
     -1_001_000 - i
 }

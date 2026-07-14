@@ -1,19 +1,15 @@
-//! Phase-B reconcile shim: re-exports the canonical `LuaState` from
-//! `lua-vm` and provides an extension trait holding every method the
-//! Phase-A stdlib translation used to call on the Phase-A stub.
+//! Compatibility shim: re-exports the canonical `LuaState` from `lua-vm`
+//! and provides an extension trait holding every method the stdlib's
+//! original translation called on an earlier stub `LuaState`.
 //!
-//! TODO_ARCH(phase-b-reconcile): all extension-trait method bodies are
-//! `todo!("phase-b-reconcile: <name>")`. They must move to real
-//! implementations on `lua_vm::state::LuaState` itself; that work lives in
-//! `lua-vm`, not here. The shim exists only so stdlib code keeps compiling
-//! while the canonical `LuaState` API stabilises.
-//!
-//! Where a trait method's name collides with an inherent method on the
-//! canonical `LuaState`, Rust resolves to the inherent method. Most
-//! Phase-A call sites compile through the inherent method unchanged; the
-//! handful that depend on a different return shape (e.g. `state.push(...)?`
-//! against the canonical `pub fn push(&mut self, val: LuaValue)`) are
-//! patched at the call site.
+//! Every extension-trait method body is `todo!("phase-b-reconcile: <name>")`
+//! and is not meant to run: where a trait method's name collides with an
+//! inherent method on the canonical `LuaState`, Rust resolves to the
+//! inherent method, so the trait only supplies whichever methods the
+//! canonical type is still missing. Call sites whose shape no longer
+//! matches the inherent signature (e.g. `state.push(...)?` against the
+//! canonical `pub fn push(&mut self, val: LuaValue)`) are patched directly
+//! at the call site instead.
 
 #![allow(dead_code, unused_variables, clippy::too_many_arguments)]
 
@@ -102,13 +98,14 @@ impl LuaDebug {
     }
 }
 
-/// Extension trait wiring every Phase-A stub method onto the canonical
-/// `LuaState`. Bodies are `todo!("phase-b-reconcile: …")`. When the
-/// canonical type already defines a method with the same name, Rust's
-/// inherent-first resolution makes this trait method unreachable (the
-/// inherent one wins) — the trait is then only providing the *missing*
-/// methods. Conflicting call-sites whose shape no longer matches the
-/// inherent signature are patched in their respective stdlib modules.
+/// Extension trait wiring every stdlib-stub method onto the canonical
+/// `LuaState`. Bodies are `todo!("phase-b-reconcile: …")` and unreachable in
+/// practice: when the canonical type already defines a method with the same
+/// name, Rust's inherent-first resolution makes this trait method
+/// unreachable (the inherent one wins) — the trait is then only providing
+/// the *missing* methods. Conflicting call-sites whose shape no longer
+/// matches the inherent signature are patched in their respective stdlib
+/// modules.
 pub trait LuaStateStubExt {
     fn push_value(&mut self, idx: i32) -> Result<(), LuaError> {
         todo!("phase-b-reconcile: push_value")
@@ -1847,11 +1844,10 @@ impl LuaStateStubExt for LuaState {
         let _ = self;
     }
 
-    /// Install (or clear) a debug hook on this thread.
-    ///
+    /// Install (or clear) a debug hook on this thread. C: `lua_sethook`
     /// (`ldebug.c`).
     ///
-    /// The Phase-B `LuaStateStubExt` signature uses `lua_CFunction` (the
+    /// The `LuaStateStubExt` signature uses `lua_CFunction` (the
     /// stdlib C-function shape: `fn(&mut LuaState) -> Result<usize, LuaError>`)
     /// for `f`, whereas the canonical `lua_vm::debug::set_hook` takes a
     /// `Box<dyn FnMut(&mut LuaState, &LuaDebug)>` (a true Lua hook, which has
@@ -1875,9 +1871,8 @@ impl LuaStateStubExt for LuaState {
         Ok(())
     }
 
-    /// Write `msg` to the host's standard output stream.
-    ///
-    /// `fwrite(s, 1, l, stdout)`).
+    /// Write `msg` to the host's standard output stream. C: `lua_writestring`
+    /// (`fwrite(s, 1, l, stdout)`).
     ///
     /// Delegates to the canonical inherent `LuaState::write_output`. UFCS is
     /// used to disambiguate from the trait method (this method) which would
@@ -1911,7 +1906,7 @@ impl LuaStateStubExt for LuaState {
 }
 
 /// Copy populated fields from the canonical `lua_vm::debug::LuaDebug` into
-/// the Phase-B stub `LuaDebug`. The two structs diverge on a few field types
+/// the stub `LuaDebug`. The two structs diverge on a few field types
 /// (e.g. `what` is a single byte tag in the stub vs. `Option<&'static [u8]>`
 /// in the canonical struct, `short_src` is `Vec<u8>` vs. fixed array).
 /// Copy only the fields that `lua_getinfo`'s `what` string actually populates

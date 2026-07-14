@@ -1,5 +1,5 @@
-//! Faithful port of `lua.c`'s read-eval-print loop (`doREPL`, `loadline`,
-//! `addreturn`, `multiline`, `incomplete`, `l_print`, `get_prompt`), with the
+//! The read-eval-print loop, structured after `lua.c`'s `doREPL`/`loadline`/
+//! `addreturn`/`multiline`/`incomplete`/`l_print`/`get_prompt`, with the
 //! line-editing layer delegated to `rustyline` (Tier 3: history, key bindings,
 //! syntax highlighting, and `_G`/field completion).
 //!

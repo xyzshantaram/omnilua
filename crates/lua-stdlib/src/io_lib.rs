@@ -1,5 +1,6 @@
-//! Standard I/O library — `io.*` functions and `file:*` methods (port of
-//! `liolib.c`).
+//! Standard I/O library — `io.*` functions and `file:*` methods.
+//!
+//! C source: `reference/lua-5.4.7/src/liolib.c`.
 //!
 //! **Impurity is host-provided and load-bearing.** Filesystem and process
 //! access reach the host only through hooks: regular files via

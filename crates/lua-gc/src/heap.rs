@@ -1,9 +1,10 @@
-//! Phase D mark-and-sweep garbage collector.
+//! Mark-and-sweep garbage collector.
 //!
-//! This module is the production GC for the Lua runtime, replacing the
-//! `Rc<T>`-backed `GcRef<T>` placeholder used through Phase B/C. It is a
-//! single-threaded precise tracing collector with incremental and
-//! generational paths plus forward/backward write barriers.
+//! This module is the production GC for the Lua runtime — a single-threaded
+//! precise tracing collector with incremental and generational paths plus
+//! forward/backward write barriers. `GcRef<T>` (in `lua-types`) is a type
+//! alias for this crate's `Gc<T>`; an earlier revision backed `GcRef<T>`
+//! with a plain `Rc<T>` instead.
 //!
 //! # Vocabulary
 //!
@@ -30,13 +31,14 @@
 //! 3. After `Heap::full_collect(roots)`, every `Gc<T>` reachable from `roots`
 //!    is still valid; unreachable boxes are dropped and deallocated.
 //!
-//! # Migration shape
+//! # Allocation paths
 //!
-//! Existing code holds `GcRef<T>` (which after Phase D is a type alias for
-//! `Gc<T>`). Legacy call sites like `GcRef::new(value)` route through
-//! `Gc::new_uncollected` which allocates a `GcBox` but does NOT register it
-//! in any heap. Phase D-1b agent work converts these to
-//! `state.heap().allocate(value)` so the new box joins the heap owner lists.
+//! `GcRef::new(value)` (in `lua-types`) allocates through
+//! `state.heap().allocate(value)`, joining the active heap's owner lists; a
+//! guard-less call panics rather than silently falling back to an
+//! untracked allocation (issue #249). `Gc::new_uncollected` remains a
+//! separate, explicit escape hatch for the rare detached/process-lifetime
+//! case — it allocates a `GcBox` but does not register it in any heap.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -85,7 +87,7 @@ type IdentityHashSet = HashSet<usize, IdentityBuildHasher>;
 type IdentityHashMap<V> = HashMap<usize, V, IdentityBuildHasher>;
 
 // ──────────────────────────────────────────────────────────────────────────
-// Phase D-1c — scoped thread-local HeapGuard
+// Scoped thread-local HeapGuard
 //
 // Lua's C API supports multiple `lua_State`s on one OS thread (sandbox-per-
 // state is a real embedding pattern). We honor that by stacking the
@@ -872,8 +874,8 @@ impl<T: ?Sized> std::fmt::Debug for Gc<T> {
 }
 
 impl<T: Trace + 'static> Gc<T> {
-    /// Allocate a `GcBox<T>` outside any heap registry. Used by legacy
-    /// `GcRef::new` call sites until Phase D-1b migrates them. The returned
+    /// Allocate a `GcBox<T>` outside any heap registry: a deliberate escape
+    /// hatch for the rare detached/process-lifetime case. The returned
     /// `Gc<T>` is reachable only through the caller's own retention path;
     /// without joining a heap owner list, it will never be swept (so
     /// effectively leaks until process exit — same as Rc behavior).
@@ -1274,10 +1276,12 @@ impl Marker {
         }
     }
 
-    /// Record that an Rc-backed object (`GcRef<T>` in Phase A-D-0) has been
-    /// visited and return whether this is the first visit. Used by recursive
-    /// `Trace` impls to break cycles while the real `Gc<T>` gray-queue path is
-    /// not yet wired (e.g. `_G._G == _G` would otherwise infinitely recurse).
+    /// Record that an object has been visited and return whether this is the
+    /// first visit. Predates the real `Gc<T>` gray-queue path (`Color::Gray`
+    /// via `Marker::mark`), which now handles cycles natively (e.g. `_G._G
+    /// == _G`) without this bookkeeping; this method's only caller
+    /// (`GcRef::trace_obj`) itself has no remaining call sites, so both look
+    /// like dead code.
     pub fn try_visit(&mut self, addr: usize) -> bool {
         self.visited.insert(addr)
     }

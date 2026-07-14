@@ -1,20 +1,18 @@
 //! Auxiliary library: helper functions for building Lua libraries.
 //!
-//! C source: `reference/lua-5.4.7/src/lauxlib.c` (1127 lines, ~50 functions)
-//! Target crate: `lua-stdlib`
+//! C source: `reference/lua-5.4.7/src/lauxlib.c`.
 //!
 //! This module provides the high-level `luaL_*` API layer that sits on top of
 //! the raw `lua_*` C API. In Rust we translate each `luaL_*` function as a
 //! free function receiving `&mut LuaState` rather than a method, matching the
 //! structure of the other stdlib modules.
 //!
-//! PORT NOTE: The C buffer system (`luaL_Buffer`) uses a small inline initial
-//! buffer backed by a Lua-stack userdata box on overflow. In Rust we replace
-//! this with a plain `Vec<u8>` (`LuaBuffer`), dropping all the C-internal
-//! `UBox` / `resizebox` / `boxgc` / `boxmt` / `newbox` / `buffonstack`
-//! machinery. The public interface remains compatible.
+//! The buffer system (`LuaBuffer`) is a plain `Vec<u8>` rather than C's
+//! small-inline-buffer-plus-userdata-box scheme (`UBox` / `resizebox` /
+//! `boxgc` / `boxmt` / `newbox` / `buffonstack`); the public interface
+//! remains compatible.
 //!
-//! PORT NOTE: File-loading functions (`load_filex`) use the embedder-installed
+//! File-loading functions (`load_filex`) use the embedder-installed
 //! `GlobalState::file_loader_hook`; concrete filesystem access belongs in
 //! `lua-cli` or another host backend.
 
@@ -92,13 +90,9 @@ pub struct LuaBuffer {
 /// File-stream handle used by the IO library.
 ///
 ///
-/// `closef` in C is a `lua_CFunction`. In Rust we store an optional closer.
-// TODO(port): file I/O belongs in lua-stdlib/src/io_lib.rs; this definition
-// may move there. Keeping here to mirror the C header.
+/// `closef` in C is a `lua_CFunction`.
 pub struct LuaStream {
     /// The underlying file handle. `None` for incompletely opened or closed streams.
-    // TODO(port): this legacy auxlib stream placeholder should converge with the
-    // host-provided LuaFileHandle abstraction used by io_lib.
     pub f: Option<Box<dyn std::io::Read>>,
     /// Optional close function (None for already-closed streams).
     pub closef: Option<fn(&mut LuaState) -> Result<usize, LuaError>>,
@@ -545,9 +539,8 @@ pub fn push_where(state: &mut LuaState, level: i32) -> Result<(), LuaError> {
 /// Format a runtime error with source location and raise it.
 /// Always returns `Err`.
 ///
-///
-/// PORT NOTE: C uses varargs + `lua_pushvfstring`. Rust callers pass a
-/// pre-formatted `&[u8]` message; use `format_args!` at the call site.
+/// Callers pass a pre-formatted `&[u8]` message; use `format_args!` at the
+/// call site rather than varargs.
 pub fn lua_error(state: &mut LuaState, msg: &[u8]) -> Result<usize, LuaError> {
     push_where(state, 1)?;
     let where_str = state.pop_bytes();
@@ -569,7 +562,6 @@ pub fn file_result(
         Ok(1)
     } else {
         state.push(LuaValue::Nil);
-        // TODO(port): use std::io::Error::last_os_error() for errno-style message.
         let errmsg = b"(errno unavailable in Rust port)".to_vec();
         if let Some(name) = fname {
             let full = [name, b": ".as_slice(), &errmsg].concat();
@@ -577,7 +569,6 @@ pub fn file_result(
         } else {
             state.push_bytes(&errmsg)?;
         }
-        // TODO(port): push actual errno integer once os-error helpers are available.
         state.push(LuaValue::Int(0));
         Ok(3)
     }
@@ -585,8 +576,6 @@ pub fn file_result(
 
 /// Push the result of a process-exit status onto the stack.
 /// Returns 3 values: success-bool-or-nil, exit-kind string, status code.
-///
-// TODO(port): POSIX WIFEXITED / WIFSIGNALED inspection requires cfg(unix).
 pub fn exec_result(state: &mut LuaState, stat: i32) -> Result<usize, LuaError> {
     if stat != 0 {
         return file_result(state, false, None);
@@ -838,11 +827,7 @@ impl Default for LuaBuffer {
 /// compatibility with code that later calls `add_value` / `push_result`.
 ///
 pub fn buf_init(state: &mut LuaState, buf: &mut LuaBuffer) {
-    // PORT NOTE: C pushes a light-userdata placeholder onto the stack to hold
-    // the buffer's position. We still push nil as a stack slot placeholder so
-    // that add_value / push_result see the same stack layout.
     *buf = LuaBuffer::new();
-    // We push nil; Phase B can revisit if this matters for GC interaction.
     let _ = state.push(LuaValue::Nil);
 }
 
@@ -895,11 +880,10 @@ pub fn add_char(buf: &mut LuaBuffer, c: u8) {
 
 /// Append `sz` to the length counter (used after writing directly into the buffer).
 ///
+/// Currently a no-op: `Vec`'s length is implicit, so this only matters if a
+/// caller writes directly into the buffer's spare capacity, which is not yet
+/// supported (would need an `unsafe` `set_len` or a buffer redesign).
 pub fn add_size(_buf: &mut LuaBuffer, sz: usize) {
-    // PORT NOTE: In C this is a direct `n += sz` on the inline length field.
-    // With Vec, length is implicit; this is a no-op unless caller wrote past len.
-    // TODO(port): if direct-write into spare capacity is needed, switch to `unsafe`
-    // set_len or redesign; for Phase A this is a no-op.
     let _ = sz;
 }
 
@@ -1035,12 +1019,11 @@ fn make_string_reader(data: Vec<u8>) -> impl FnMut() -> Option<Vec<u8>> {
 
 /// Strip an optional UTF-8 BOM (EF BB BF) and any `#`-prefixed first line.
 ///
-/// PORT NOTE: C reads byte-by-byte with `getc`/`feof` and lazily reopens the
-/// file in binary mode if it looks like a binary chunk. Here we ask the
-/// embedder-installed file loader hook for raw bytes, strip the BOM, and let
-/// `lua_vm::api::load` dispatch text vs. binary by the first byte. The "binary
-/// chunk" branch in `luaL_loadfilex` exists in C because text mode does newline
-/// translation; the host loader is expected to provide raw bytes.
+/// The embedder-installed file loader hook supplies raw bytes; this strips
+/// the BOM and lets `lua_vm::api::load` dispatch text vs. binary by the
+/// first byte. (C's `luaL_loadfilex` instead reads byte-by-byte and lazily
+/// reopens in binary mode, because its text mode does newline translation —
+/// not a concern here since the host loader always returns raw bytes.)
 fn skip_bom_and_shebang(buf: &[u8]) -> Vec<u8> {
     let s = if buf.starts_with(b"\xEF\xBB\xBF") {
         &buf[3..]
@@ -1069,13 +1052,10 @@ fn skip_bom_and_shebang(buf: &[u8]) -> Vec<u8> {
 
 /// Load a file as a Lua chunk. Returns `LUA_OK` on success or an error code.
 ///
-///
-/// PORT NOTE: PORTING.md §1 bans `std::fs` outside `lua-cli`, but C-Lua's
-/// `luaL_loadfilex` is part of the auxiliary library (`lauxlib.c`) and is
-/// reachable from the base library (`loadfile`/`dofile`). Phase A's stub
-/// raised an error here, which broke `loadfile(missing)` returning `nil, err`.
-/// The real C semantics push an error string onto the stack and return a
-/// non-zero status, which `load_aux` then converts to `(nil, errmsg)`.
+/// PORTING.md §1 bans `std::fs` outside `lua-cli`, so this goes through the
+/// embedder-installed file loader hook instead. A load failure pushes an
+/// error string and returns a non-zero status, which `load_aux` converts to
+/// `(nil, errmsg)`.
 pub fn load_filex(
     state: &mut LuaState,
     filename: Option<&[u8]>,
@@ -1085,8 +1065,6 @@ pub fn load_filex(
     let fname = match filename {
         Some(f) => f,
         None => {
-            // TODO(port): stdin loading not yet supported in lua-stdlib; return
-            // an error string matching C's "cannot read stdin" shape.
             state.push_string(b"cannot read stdin: no filename given")?;
             return Ok(LUA_ERRFILE);
         }
@@ -1129,7 +1107,6 @@ pub fn load_bufferx(
     name: &[u8],
     mode: Option<&[u8]>,
 ) -> Result<i32, LuaError> {
-    // TODO(phase-b): state.load expects (chunk: &[u8], name, mode) in state_stub; the reader-based loader needs a load_with_reader API match.
     let _reader = make_string_reader(buff.to_vec());
     let ok = state.load(buff, name, mode)?;
     Ok(if ok { 0 } else { 1 })
@@ -1199,6 +1176,9 @@ pub fn lua_len(state: &mut LuaState, idx: i32) -> Result<i64, LuaError> {
 /// Convert the value at `idx` to a byte-string representation (using `__tostring`
 /// if available) and push it onto the stack.
 ///
+/// Tables/functions/userdata/threads print as `"kind: 0x?"` — a fixed
+/// placeholder rather than a real address, since this API surface does not
+/// yet expose a stable per-value identifier analogous to C's `lua_topointer`.
 pub fn to_lua_string(state: &mut LuaState, idx: i32) -> Result<Vec<u8>, LuaError> {
     let idx = state.abs_index(idx);
     if call_meta(state, idx, b"__tostring")? {
@@ -1239,8 +1219,6 @@ pub fn to_lua_string(state: &mut LuaState, idx: i32) -> Result<Vec<u8>, LuaError
                 } else {
                     state.type_name_at(idx).to_vec()
                 };
-                // TODO(port): lua_topointer gives a pointer address; in Rust use
-                // a hash or allocation address for a stable identifier.
                 state.push_fstring(format_args!("{}: 0x?", BStr(&kind)))?;
                 if tt != LuaType::Nil {
                     state.remove(-2)?;
@@ -1329,11 +1307,10 @@ pub fn get_metatable(state: &mut LuaState, tname: &[u8]) -> Result<LuaType, LuaE
 // ── State creation and version check ─────────────────────────────────────────
 
 /// Create a new `LuaState` with the default allocator, a panic handler, and
-/// warnings disabled.
+/// warnings disabled. Rust's allocator is used implicitly; no `l_alloc` hook
+/// is needed.
 ///
 pub fn new_state() -> Result<LuaState, LuaError> {
-    // PORT NOTE: Rust's allocator is used implicitly; no l_alloc hook needed.
-    // TODO(phase-b): LuaState::new() / set_panic_handler / set_warn_fn need a real LuaState constructor in lua-vm. Stub for Phase A.
     let _ = default_panic_handler;
     let _ = warn_off;
     todo!("phase-b: LuaState::new()")
@@ -1375,7 +1352,6 @@ fn warn_on(state: &mut LuaState, message: &[u8], tocont: bool) -> Result<(), Lua
 ///
 fn warn_cont(_state: &mut LuaState, message: &[u8], tocont: bool) -> Result<(), LuaError> {
     eprint!("{}", BStr(message));
-    // TODO(phase-b): set_warn_fn expects lua_CFunction in state_stub; warn_cont/warn_on take (msg, tocont). Wire after warn-fn API lands in lua-vm.
     if tocont {
         let _ = (warn_cont as fn(&mut LuaState, &[u8], bool) -> Result<(), LuaError>,);
     } else {
@@ -1393,7 +1369,6 @@ fn check_control(state: &mut LuaState, message: &[u8], tocont: bool) -> Result<b
         return Ok(false);
     }
     let cmd = &message[1..];
-    // TODO(phase-b): set_warn_fn expects lua_CFunction in state_stub; warn_off/warn_on take (msg, tocont). Wire after warn-fn API lands in lua-vm.
     let _ = state;
     if cmd == b"off" {
         let _ = warn_off as fn(&mut LuaState, &[u8], bool) -> Result<(), LuaError>;
@@ -1427,8 +1402,8 @@ pub fn check_version(state: &mut LuaState, ver: f64, sz: usize) -> Result<(), Lu
 /// Wrapper that implements `Display` for `&[u8]` as a lossy byte string.
 /// Used to embed byte slices in `format_args!` without allocating a `String`.
 ///
-/// PORT NOTE: not used for Lua string data; used only for error message
-/// formatting inside `format_args!` literals.
+/// Not used for Lua string data — only for error message formatting inside
+/// `format_args!` literals.
 struct BStr<'a>(&'a [u8]);
 
 impl<'a> std::fmt::Display for BStr<'a> {

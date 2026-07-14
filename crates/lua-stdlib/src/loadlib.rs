@@ -81,8 +81,6 @@ const LUA_CPATH_VAR: &[u8] = b"LUA_CPATH";
 
 // Matches C-Lua's luaconf.h defaults exactly: LUA_LDIR entries first, then
 // LUA_CDIR entries, then the local ./? fallback last.
-// TODO(port): These should come from a platform configuration crate, not be
-// hardcoded. Lua's build system inserts the actual install prefix here.
 #[cfg(not(target_os = "windows"))]
 const LUA_PATH_DEFAULT: &[u8] = b"/usr/local/share/lua/5.4/?.lua;/usr/local/share/lua/5.4/?/init.lua;/usr/local/lib/lua/5.4/?.lua;/usr/local/lib/lua/5.4/?/init.lua;./?.lua;./?/init.lua";
 #[cfg(target_os = "windows")]
@@ -94,7 +92,6 @@ const LUA_CPATH_DEFAULT: &[u8] =
 #[cfg(target_os = "windows")]
 const LUA_CPATH_DEFAULT: &[u8] = b"./?.dll";
 
-// TODO(port): Centralise version constants; this is duplicated from luaconf.h.
 const LUA_VERSUFFIX: &[u8] = b"_5_4";
 
 /// Build the `package.config` string for `version`.

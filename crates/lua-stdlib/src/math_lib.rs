@@ -28,10 +28,10 @@ type LuaCFunction = fn(&mut LuaState) -> Result<usize, LuaError>;
 /// State for the xoshiro256** PRNG.
 ///
 /// In C this is stored as raw `lua_newuserdatauv` memory and accessed by
-/// casting the userdata pointer. Until typed-userdata closure upvalues land
-/// in Phase B, we keep the PRNG state in a thread-local cell so that
+/// casting the userdata pointer. Until typed-userdata closure upvalues are
+/// available, the PRNG state instead lives in a thread-local cell so that
 /// `math.random` and `math.randomseed` are callable from Lua. This collapses
-/// per-lua_State PRNG isolation to per-thread, which is sufficient for the
+/// per-`LuaState` PRNG isolation to per-thread, which is sufficient for the
 /// 5.4 test corpus.
 struct RanState {
     s: [u64; 4],

@@ -1,9 +1,10 @@
 //! Lua table implementation (array + hash hybrid).
 //!
-//! Canonical port of `reference/lua-5.4.7/src/ltable.c`. Lives in
-//! `lua-types` because `LuaValue::Table(GcRef<LuaTable>)` is defined here
-//! and the table storage must be reachable without depending on
-//! `lua-vm`. The crate `lua_unsafe = "forbid"` lint is preserved.
+//! Closely mirrors `reference/lua-5.4.7/src/ltable.c`'s algorithms (see
+//! below). Lives in `lua-types` because `LuaValue::Table(GcRef<LuaTable>)`
+//! is defined here and the table storage must be reachable without
+//! depending on `lua-vm`. The crate `lua_unsafe = "forbid"` lint is
+//! preserved.
 //!
 //! # Interior mutability
 //!
