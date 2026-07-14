@@ -1158,7 +1158,6 @@ fn ipairs_step<const RAW: bool>(state: &mut LuaState) -> Result<usize, LuaError>
         LuaValue::Int(i) => i,
         _ => state.check_arg_integer(2)?,
     };
-    // luaL_intop(+, a, b) → wrapping integer addition (PORTING.md §9 / macros.tsv `intop`)
     let i = (i as u64).wrapping_add(1u64) as i64;
     state.push(LuaValue::Int(i));
     let t = if RAW {
