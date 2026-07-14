@@ -1,12 +1,11 @@
 //! `GcRef<T>` — the GC-managed reference handle.
 //!
-//! Phase A/B/C: thin newtype around `Rc<T>`.
-//! Phase D-1e (current): newtype around `lua_gc::Gc<T>` — Copy under the hood,
-//! tracks allocation in the active `Heap` (via `lua_gc::with_current_heap(...)`).
-//!
-//! Surface kept stable across the swap: `new`, `ptr_eq`, `identity`,
-//! `strong_count`, `weak_count`, `downgrade`. Existing code touching
-//! `gc.0` continues to work — `.0` is now `Gc<T>` instead of `Rc<T>`.
+//! Newtype around `lua_gc::Gc<T>` — Copy under the hood, tracks allocation
+//! in the active `Heap` (via `lua_gc::with_current_heap(...)`). An earlier
+//! revision was a thin `Rc<T>` newtype instead; the surface stayed stable
+//! across the swap (`new`, `ptr_eq`, `identity`, `strong_count`,
+//! `weak_count`, `downgrade`), and existing code touching `gc.0` continues
+//! to work — `.0` is now `Gc<T>` instead of `Rc<T>`.
 //!
 //! # Weak refs
 //!
@@ -47,13 +46,11 @@ impl<T: Trace + 'static> GcRef<T> {
         GcRef(gc)
     }
 
-    /// Cycle-aware trace dispatch.
-    ///
-    /// During D-0/D-1 (before a real Color::Gray flag is reachable from
-    /// inside Trace impls), `Marker::try_visit` records the underlying
-    /// allocation's identity and short-circuits a second recursion. Once
-    /// D-2 ships the in-header color flag, this helper collapses to
-    /// `m.mark(self.0)`.
+    /// Cycle-aware trace dispatch via `Marker::try_visit`'s identity
+    /// short-circuit, rather than the in-header color flag that
+    /// `Trace for GcRef<T>` (in `trace_impls.rs`) uses directly via
+    /// `m.mark(self.0)`. Nothing in this workspace currently calls
+    /// `trace_obj`.
     pub fn trace_obj(&self, m: &mut Marker) {
         if m.try_visit(self.identity()) {
             (**self).trace(m);

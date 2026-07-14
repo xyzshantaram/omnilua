@@ -1,12 +1,8 @@
-//! Phase-D `Trace` implementations for types defined in this crate.
+//! `Trace` implementations for types defined in this crate.
 //!
 //! Each impl enumerates the type's GC-bearing fields and either calls
 //! `field.trace(m)` (delegating to the field's own `Trace` impl) or
-//! `m.mark(field)` (when the field is a `Gc<T>` from `lua-gc`). During the
-//! Phase A/B/C/D-0 window `GcRef<T>` is still an `Rc<T>` newtype rather
-//! than the real `Gc<T>`, so the mark-queue path is not yet reachable —
-//! method resolution dispatches through `Deref` to each underlying type's
-//! own `trace` method.
+//! `m.mark(field)` (when the field is a `Gc<T>` from `lua-gc`).
 
 use crate::closure::{LuaCClosure, LuaClosure, LuaLClosure};
 use crate::gc::GcRef;
@@ -19,15 +15,15 @@ use crate::value::LuaThread;
 use crate::value::LuaValue;
 use lua_gc::{Marker, Trace};
 
-/// Forwarder for `GcRef<T>`. Now that `GcRef` wraps a real `lua_gc::Gc<T>`
-/// (D-1e), tracing must enqueue the box onto the gray queue via
-/// `Marker::mark` — that is what flips its header color from White to Gray
-/// and ultimately to Black during gray-queue drainage. The previous
-/// `try_visit` short-circuit was a Phase A-D-0 workaround for the
-/// `Rc`-backed handle (no header, no color), and produced a silent bug
-/// post-D-1e: every GC-tracked allocation stayed White and was freed in
-/// the sweep on the first `collectgarbage()`. Cycles are now handled
-/// natively by the heap's gray-queue (Color::Gray check in `mark` makes
+/// Forwarder for `GcRef<T>`. Since `GcRef` wraps a real `lua_gc::Gc<T>`,
+/// tracing must enqueue the box onto the gray queue via `Marker::mark` —
+/// that is what flips its header color from White to Gray and ultimately
+/// to Black during gray-queue drainage. An earlier `try_visit`
+/// short-circuit — left over from when `GcRef` was `Rc`-backed, with no
+/// header and no color — produced a silent bug once `GcRef` became a real
+/// `Gc<T>`: every GC-tracked allocation stayed White and was freed in the
+/// sweep on the first `collectgarbage()`. Cycles are now handled natively
+/// by the heap's gray-queue (the `Color::Gray` check in `mark` makes
 /// re-visits idempotent).
 impl<T: Trace + 'static> Trace for GcRef<T> {
     fn trace(&self, m: &mut Marker) {

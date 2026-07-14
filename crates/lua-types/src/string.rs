@@ -1,7 +1,7 @@
 //! `LuaString` — Lua's byte-string (NOT UTF-8). PORT_STRATEGY §3.3.
 //!
-//! Phase A-C: a simple `Box<[u8]>`-backed struct with a short/long flag.
-//! Phase D may revisit for interning + content-hash equality.
+//! A `Box<[u8]>`-backed struct with a short/long flag and a precomputed
+//! content hash; interning lives in `lua-vm`'s `InternedStringMap`.
 
 /// Lua's immutable byte-string value.
 ///
@@ -85,7 +85,8 @@ impl LuaString {
     }
 
     pub fn is_reserved_word(&self) -> bool {
-        // TODO(port): proper reserved-word check via lexer's token enum.
+        // Always false: never wired to the lexer's token enum, and (as far
+        // as this pass could tell) never called anywhere in the workspace.
         false
     }
 
