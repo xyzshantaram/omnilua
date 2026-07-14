@@ -203,6 +203,13 @@ the current surface:
 - **Metamethod coverage is the common set.** Bitwise (`__band`/`__bor`/`__bxor`/
   `__bnot`/`__shl`/`__shr`), `__idiv`, `__close`, and `__name` are not yet
   exposed through `MetaMethod`.
+- **No `LUA_EXTRASPACE` equivalent.** C's `lua_getextraspace` gives an
+  embedder a small fixed-size raw memory region attached to each `lua_State`,
+  addressable without a registry lookup. `LuaState` has no `extra_space`
+  field or accessor (issue #275 item 3) — this is a niche feature judged not
+  worth the state-layout churn to add; use a registry value
+  (`Lua::create_registry_value`/`set_named_registry_value`) or a side table
+  keyed by thread identity instead.
 - **Multi-version seam is partial.** Value marshaling between engines works
   (`marshal_from` + `LossyIntPolicy`), but the formal `enum Engine` / `Backend`
   trait / `Unsupported` divergence registry from

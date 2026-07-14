@@ -3865,6 +3865,7 @@ fn heap_guard(state: &LuaState) -> lua_gc::HeapGuard {
 fn bootstrap_state(hooks: HostHooks, version: LuaVersion) -> Result<LuaState> {
     let mut state = new_state().ok_or(LuaError::Memory)?;
     state.global_mut().lua_version = version;
+    lua_vm::state::set_versioned_registry_slots(&mut state)?;
     {
         let _bootstrap_scope = state.global().heap.bootstrap_scope();
         let _bootstrap_guard = heap_guard(&state);
