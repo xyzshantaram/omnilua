@@ -1,16 +1,8 @@
 //! Pre-compiled Lua chunk serializer.
 //!
-//! Translates `reference/lua-5.4.7/src/ldump.c` (230 lines, 9 functions + 1 public entry point).
-//! Writes a `LuaProto` to a byte sink in the standard Lua 5.4 bytecode format.
+//! Ported from `ldump.c`. Writes a `LuaProto` to a byte sink in the standard
+//! Lua 5.4 bytecode format.
 
-// TODO(port): Adjust import paths once crate boundaries stabilise in Phase B.
-// The types below are expected to resolve as follows:
-//   GcRef        — lua_types (or lua-gc Phase D)
-//   LuaError     — lua_types
-//   LuaProto     — lua-vm (this crate) or lua-types
-//   LuaString    — lua-vm / lua-types
-//   LuaValue     — lua_types
-//   LuaState     — lua-vm (this crate)
 #[allow(unused_imports)]
 use crate::prelude::*;
 use std::mem::size_of;
@@ -26,7 +18,7 @@ use lua_types::{GcRef, LuaError, LuaString, LuaValue, LuaVersion};
 // b"\x1bLua" is &[u8; 4] in Rust — no NUL — so direct use is correct.
 const LUA_SIGNATURE: &[u8] = b"\x1bLua";
 
-// With LUA_VERSION_NUM = 504 (macros.tsv):
+// With LUA_VERSION_NUM = 504:
 //   (504 / 100) * 16 + 504 % 100 = 5 * 16 + 4 = 84 = 0x54
 const LUA_VERSION_NUM_DUMP_54: i32 = 504;
 const LUAC_VERSION_54: u8 =
@@ -77,13 +69,12 @@ const LUA_NUMBER_SIZE: u8 = size_of::<f64>() as u8;
 
 /// Internal state threaded through every dump operation.
 ///
-///
-/// PORT NOTE: `lua_State *L` removed — it was used only for `lua_lock`/`lua_unlock`, which are
-/// no-ops in the default Lua build and dropped here (macros.tsv). `void *data` is folded into
+/// `lua_State *L` is removed — it was used only for `lua_lock`/`lua_unlock`, which are
+/// no-ops in the default Lua build and have no equivalent here. `void *data` is folded into
 /// the writer closure. `int status` is replaced by `Result<(), LuaError>` propagated with `?`.
 struct DumpState<'a> {
-    /// Byte-sink callback. C original: `lua_Writer writer` + `void *data` (combined).
-    /// lua_Writer type is TBD in types.tsv; for dump we use a bare byte-slice callback.
+    /// Byte-sink callback. C original: `lua_Writer writer` + `void *data` (combined)
+    /// into a bare byte-slice callback here.
     writer: &'a mut dyn FnMut(&[u8]) -> Result<(), LuaError>,
     /// When true, strip all debug information from the output.
     strip: bool,
@@ -95,10 +86,10 @@ impl<'a> DumpState<'a> {
 
     /// Write raw bytes to the output stream.
     ///
-    ///
-    /// PORT NOTE: C accumulates errors in `D->status` and skips subsequent writes once
-    /// non-zero; Rust returns `Result<(), LuaError>` and short-circuits via `?`.
-    /// `lua_lock`/`lua_unlock` are no-ops in the default build and are dropped (macros.tsv).
+    /// C accumulates errors in `D->status` and skips subsequent writes once
+    /// non-zero; here, `Result<(), LuaError>` short-circuits via `?` instead.
+    /// `lua_lock`/`lua_unlock` are no-ops in the default build and have no
+    /// equivalent here.
     fn dump_block(&mut self, data: &[u8]) -> Result<(), LuaError> {
         if !data.is_empty() {
             (self.writer)(data)?;
@@ -149,8 +140,7 @@ impl<'a> DumpState<'a> {
 
     /// Write an `int` as a variable-length size.
     ///
-    ///
-    /// PORT NOTE: C implicitly casts `int` → `size_t`. All call sites pass non-negative values
+    /// C implicitly casts `int` → `size_t`. All call sites pass non-negative values
     /// (line numbers, instruction counts, vector lengths); a debug assertion guards this.
     fn dump_int(&mut self, x: i32) -> Result<(), LuaError> {
         debug_assert!(
@@ -189,9 +179,7 @@ impl<'a> DumpState<'a> {
 
     /// Write an interned or long string, or a null sentinel (encoded size = 0).
     ///
-    ///
     /// Encoding: `dumpSize(len + 1)` followed by `len` raw bytes; size 0 means null/absent.
-    /// `tsslen(s)` → `s.len()` and `getstr(s)` → `s.as_bytes()` (macros.tsv).
     fn dump_string(&mut self, s: Option<&GcRef<LuaString>>) -> Result<(), LuaError> {
         match s {
             None => self.dump_size(0),
@@ -206,16 +194,12 @@ impl<'a> DumpState<'a> {
 
     /// Write the bytecode instruction array.
     ///
-    ///
-    /// PORT NOTE: `f->sizecode` is covered by `Vec::len()` (types.tsv).
+    /// `f->sizecode` has no counterpart here — `Vec::len()` covers it.
     fn dump_code(&mut self, proto: &LuaProto) -> Result<(), LuaError> {
         self.dump_int(proto.code.len() as i32)?;
 
         // dumpVector writes n * sizeof(Instruction) = n * 4 bytes in native byte order.
         for instr in &proto.code {
-            // TODO(port): `Instruction` is a u32 newtype (types.tsv). Accessing the inner u32
-            // via `.0` assumes a tuple-struct layout. If the Instruction API differs (e.g.,
-            // exposes `.raw()` or `u32::from(*instr)`), adjust accordingly in Phase B.
             self.dump_block(&instr.0.to_ne_bytes())?;
         }
         Ok(())
@@ -223,45 +207,39 @@ impl<'a> DumpState<'a> {
 
     /// Write the constant pool.
     ///
-    ///
     /// Each constant is written as: one tag byte (`ttypetag`), followed by the payload
     /// (float: 8 bytes; integer: 8 bytes; string: variable-length; nil/bool: nothing).
     ///
-    /// PORT NOTE: `f->sizek` is covered by `Vec::len()` (types.tsv).
+    /// `f->sizek` has no counterpart here — `Vec::len()` covers it.
     fn dump_constants(&mut self, proto: &LuaProto) -> Result<(), LuaError> {
         let n = proto.k.len();
         self.dump_int(n as i32)?;
 
         for constant in &proto.k {
-            // ttypetag(o) → o.full_type_tag() (macros.tsv)
             // Returns the C-side tag byte: bits 0-3 base type, bits 4-5 variant, bit 6 collectable.
             let tag = constant.full_type_tag();
             self.dump_byte(tag)?;
 
             match constant {
                 LuaValue::Float(f) => {
-                    // fltvalue(o) → o.as_float().expect("not float") or `if let` (macros.tsv)
                     self.dump_number(*f)?;
                 }
                 LuaValue::Int(i) => {
                     self.dump_integer(*i)?;
                 }
                 LuaValue::Str(s) => {
-                    // tsvalue(o) → o.as_string().expect("not string") (macros.tsv)
                     self.dump_string(Some(s))?;
                 }
                 LuaValue::Nil | LuaValue::Bool(_) => {
                     // Only the tag byte is written; nil and booleans carry no additional payload.
-                    // lua_assert → debug_assert! (macros.tsv)
                     debug_assert!(
                         matches!(constant, LuaValue::Nil | LuaValue::Bool(_)),
                         "dump_constants: default branch reached for unexpected variant"
                     );
                 }
                 _ => {
-                    // TODO(port): LuaValue variant not valid as a constant-pool entry.
-                    // In C the default branch asserts nil/false/true only. Any other variant
-                    // here indicates a malformed proto; flag for Phase B investigation.
+                    // In C the default branch asserts nil/false/true only. Any
+                    // other variant here indicates a malformed proto.
                     debug_assert!(
                         false,
                         "dump_constants: unexpected LuaValue variant in constant pool"
@@ -275,7 +253,7 @@ impl<'a> DumpState<'a> {
     /// Write nested function prototypes (sub-functions defined inside `proto`).
     ///
     ///
-    /// PORT NOTE: `f->sizep` is covered by `Vec::len()` (types.tsv).
+    /// `f->sizep` has no counterpart here — `Vec::len()` covers it.
     /// The parent's source string is passed down so that children with identical source
     /// origins can omit the redundant source name (see `dump_function`).
     fn dump_protos(&mut self, proto: &LuaProto) -> Result<(), LuaError> {
@@ -283,8 +261,8 @@ impl<'a> DumpState<'a> {
         self.dump_int(n as i32)?;
 
         for sub in &proto.p {
-            // sub: &GcRef<LuaProto>; deref coercion (&GcRef<LuaProto> → &LuaProto) expected
-            // when GcRef<T>: Deref<Target=T> (true for Rc<T> in Phase A).
+            // sub: &GcRef<LuaProto>; deref coercion (&GcRef<LuaProto> → &LuaProto)
+            // applies since GcRef<T>: Deref<Target=T>.
             self.dump_function(sub, proto.source.as_ref())?;
         }
         Ok(())
@@ -292,15 +270,13 @@ impl<'a> DumpState<'a> {
 
     /// Write upvalue descriptors (instack / idx / kind for each upvalue slot).
     ///
-    ///
-    /// PORT NOTE: `f->sizeupvalues` is covered by `Vec::len()` (types.tsv).
-    /// `Upvaldesc.instack` is `bool` in Rust (types.tsv); cast to `u8` for the wire format.
+    /// `f->sizeupvalues` has no counterpart here — `Vec::len()` covers it.
+    /// `Upvaldesc.instack` is `bool` here; cast to `u8` for the wire format.
     fn dump_upvalues(&mut self, proto: &LuaProto) -> Result<(), LuaError> {
         let n = proto.upvalues.len();
         self.dump_int(n as i32)?;
 
         for upval in &proto.upvalues {
-            // PORT NOTE: instack is bool in Rust (types.tsv); cast to u8: true→1, false→0.
             self.dump_byte(upval.instack as u8)?;
             self.dump_byte(upval.idx)?;
             self.dump_byte(upval.kind)?;
@@ -313,16 +289,13 @@ impl<'a> DumpState<'a> {
     ///
     /// All counts are written as zero when `self.strip` is true.
     ///
-    ///
-    /// PORT NOTE: all `f->size*` fields are covered by `Vec::len()` (types.tsv).
+    /// All `f->size*` fields have no counterpart here — `Vec::len()` covers them.
     fn dump_debug(&mut self, proto: &LuaProto) -> Result<(), LuaError> {
         let n_lineinfo = if self.strip { 0 } else { proto.lineinfo.len() };
         self.dump_int(n_lineinfo as i32)?;
 
-        // lineinfo is Vec<i8> (ls_byte per types.tsv). C writes them as raw bytes (sizeof(i8)=1).
+        // lineinfo is Vec<i8> (ls_byte in C). C writes them as raw bytes (sizeof(i8)=1).
         // Cast each i8 to u8 (same bit pattern) before writing.
-        // PERF(port): iterating one byte at a time vs. bulk write — profile in Phase B.
-        // (A bulk write would require bytemuck::cast_slice or similar to avoid unsafe.)
         let lineinfo_bytes: Vec<u8> = proto.lineinfo[..n_lineinfo]
             .iter()
             .map(|&b| b as u8)
@@ -337,7 +310,7 @@ impl<'a> DumpState<'a> {
         self.dump_int(n_absline as i32)?;
 
         for abs in proto.abslineinfo.iter().take(n_absline) {
-            // AbsLineInfo.pc and .line are i32 (types.tsv); non-negative in valid bytecode.
+            // AbsLineInfo.pc and .line are i32; non-negative in valid bytecode.
             self.dump_int(abs.pc)?;
             self.dump_int(abs.line)?;
         }
@@ -346,7 +319,6 @@ impl<'a> DumpState<'a> {
         self.dump_int(n_locvars as i32)?;
 
         for locvar in proto.locvars.iter().take(n_locvars) {
-            // LocVar.varname is GcRef<LuaString> (types.tsv).
             self.dump_string(Some(&locvar.varname))?;
             self.dump_int(locvar.startpc)?;
             self.dump_int(locvar.endpc)?;
@@ -358,11 +330,9 @@ impl<'a> DumpState<'a> {
         self.dump_int(n_upval_names as i32)?;
 
         for upval in proto.upvalues.iter().take(n_upval_names) {
-            // PORT NOTE: UpvalDesc.name is GcRef<LuaString> per types.tsv (non-optional).
-            // TODO(port): In C, `TString *name` can be NULL when an upvalue is unnamed (e.g.,
-            // in bytecode compiled without debug info). Verify whether UpvalDesc.name should be
-            // `Option<GcRef<LuaString>>` in the Rust model; if so, change call to pass the Option
-            // directly instead of wrapping in Some.
+            // C's `TString *name` can be NULL when an upvalue is unnamed (e.g.
+            // in bytecode compiled without debug info); `UpvalDesc.name` here
+            // is `Option<GcRef<LuaString>>` for the same reason.
             self.dump_string(upval.name.as_ref())?;
         }
         Ok(())
@@ -376,10 +346,9 @@ impl<'a> DumpState<'a> {
     /// source is written as null (size 0) to avoid duplication. The top-level call passes
     /// `None` to force writing the source.
     ///
-    ///
-    /// PORT NOTE: `f->source == psource` is a C pointer comparison exploiting string interning.
-    /// In Rust we use `GcRef::ptr_eq` (equivalent to `Rc::ptr_eq` in Phase A) for identity.
-    /// `is_vararg` is `bool` in Rust (types.tsv); cast to `u8` for the wire format.
+    /// `f->source == psource` is a C pointer comparison exploiting string interning;
+    /// here `GcRef::ptr_eq` gives the same identity check. `is_vararg` is `bool`
+    /// here; cast to `u8` for the wire format.
     fn dump_function(
         &mut self,
         proto: &LuaProto,
@@ -400,7 +369,6 @@ impl<'a> DumpState<'a> {
         self.dump_int(proto.linedefined)?;
         self.dump_int(proto.lastlinedefined)?;
         self.dump_byte(proto.numparams)?;
-        // PORT NOTE: is_vararg is bool in Rust (types.tsv); true → 1u8, false → 0u8.
         self.dump_byte(proto.is_vararg as u8)?;
         self.dump_byte(proto.maxstacksize)?;
 
@@ -497,13 +465,10 @@ impl<'a> DumpState<'a> {
 /// `Err(LuaError)` to abort. `strip` omits debug info (line numbers, local names, etc.)
 /// from the output.
 ///
-///
-/// PORT NOTE: `lua_Writer w` (fn pointer) + `void *data` (userdata) are collapsed into a
-/// single `impl FnMut(&[u8]) -> Result<(), LuaError>` closure — the Rust idiom for the
-/// callback + context pair. `_state` is retained in the signature for API parity but unused
-/// in the body: the C code needed it only for `lua_lock`/`lua_unlock`, which are no-ops per
-/// macros.tsv. Return type changes from `int` (0 = ok, non-zero = writer error) to
-/// `Result<(), LuaError>`.
+/// C's `lua_Writer w` (fn pointer) + `void *data` (userdata) are collapsed
+/// into a single `impl FnMut(&[u8]) -> Result<(), LuaError>` closure here —
+/// the callback + context pair. Return type changes from `int` (0 = ok,
+/// non-zero = writer error) to `Result<(), LuaError>`.
 pub(crate) fn dump(
     state: &LuaState,
     proto: &GcRef<LuaProto>,
@@ -518,8 +483,9 @@ pub(crate) fn dump(
 
     d.dump_header()?;
 
-    // PORT NOTE: f->sizeupvalues is covered by Vec::len(). Bounded by MAXUPVAL = 255
-    // (macros.tsv), so truncation via `as u8` is safe for well-formed prototypes.
+    // f->sizeupvalues has no counterpart here — Vec::len() covers it, and is
+    // bounded by MAXUPVAL = 255, so truncation via `as u8` is safe for
+    // well-formed prototypes.
     d.dump_byte(proto.upvalues.len() as u8)?;
 
     // psource = None forces the top-level function to always write its source name.
