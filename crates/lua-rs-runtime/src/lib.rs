@@ -114,7 +114,6 @@ use lua_stdlib::init::open_libs;
 use lua_types::closure::{LuaCClosure as RawLuaCClosure, LuaClosure as RawLuaClosure, LuaLClosure};
 use lua_types::gc::GcRef;
 use lua_types::string::LuaString as RawLuaString;
-use lua_types::upval::UpVal;
 use lua_types::userdata::LuaUserData as RawLuaUserData;
 use lua_types::value::{LuaTable as RawLuaTable, LuaValue as RawLuaValue};
 use lua_vm::state::{
@@ -4712,20 +4711,19 @@ fn parser_hook(
         name,
         firstchar,
     )?;
-    let nupvals = proto.upvalues.len();
-    let mut upvals = Vec::with_capacity(nupvals);
-    for _ in 0..nupvals {
-        upvals.push(std::cell::Cell::new(GcRef::new(UpVal::closed(
-            RawLuaValue::Nil,
-        ))));
-    }
+    // Build-then-wrap the proto: `GcRef` exposes only `Deref`, so the proto is
+    // populated as a `Box<LuaProto>` and wrapped afterwards.
     let proto_ref = GcRef::new(*proto);
     proto_ref.account_buffer(proto_ref.buffer_bytes() as isize);
-    let closure = GcRef::new(LuaLClosure {
-        proto: proto_ref,
-        upvals: upvals.into_boxed_slice(),
-    });
-    closure.account_buffer(closure.buffer_bytes() as isize);
+    // Route the closure through the canonical constructor: it fires
+    // `mark_gc_check_needed` (so a text-chunk load registers its allocations
+    // with the collector, matching the binary path), fills the upvalue slots
+    // with fresh closed nil upvalues, and accounts the closure's buffer.
+    // `api::load` then substitutes the `_ENV` upvalue. This keeps the
+    // text-parse path on the same allocation surface as the binary path now
+    // that the old `func::init_upvals` deferred-fill step is gone (issue #276).
+    let nupvals = proto_ref.upvalues.len();
+    let closure = state.new_lclosure(proto_ref, nupvals);
     Ok(closure)
 }
 

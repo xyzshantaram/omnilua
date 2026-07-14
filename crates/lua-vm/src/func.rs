@@ -34,21 +34,14 @@ pub(crate) const CLOSE_K_TOP: i32 = -1;
 
 // ── Closure allocation ────────────────────────────────────────────────────────
 
-/// Fills a Lua closure's upvalue slots with freshly-allocated closed upvalues,
-/// each holding `LuaValue::Nil`. Used when compiling closures that capture no
-/// live stack variables.
-///
-pub(crate) fn init_upvals(
-    state: &mut LuaState,
-    cl: &GcRef<lua_types::LuaLClosure>,
-) -> Result<(), LuaError> {
-    let n = cl.upvals.len();
-    for i in 0..n {
-        let uv: GcRef<UpVal> = state.new_upval_closed(LuaValue::Nil);
-        let _ = (i, uv);
-    }
-    Ok(())
-}
+// C's `luaF_initupvals` (called from `ldo.c::f_parser`) fills a freshly
+// loaded or parsed main closure's upvalue slots, which `luaU_undump` /
+// `luaY_parser` leave NULL. This port has no equivalent: a
+// `Cell<GcRef<UpVal>>` slot is non-nullable, so every closure-producing path
+// (`undump` via `state.new_lclosure`, the text parser hook) fills its slots
+// with fresh closed nil upvalues at construction rather than deferring the
+// fill. The deferred-fill helper was therefore removed as dead code (issue
+// #276); see the note in `do_.rs::f_parser`.
 
 // ── Open-upvalue management ───────────────────────────────────────────────────
 
