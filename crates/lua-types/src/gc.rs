@@ -14,8 +14,7 @@
 //! that identity/token pair remains live. Handles to legacy uncollected boxes
 //! still upgrade forever, matching their process-lifetime allocation model.
 
-#[allow(unused_imports)]
-use lua_gc::{Gc, HeapRef, Marker, Trace};
+use lua_gc::{Gc, HeapRef, Trace};
 
 /// A GC-managed pointer to a Lua collectable object. Newtype over
 /// `lua_gc::Gc<T>` so callers preserve `gc.0`-shape access while the
@@ -216,6 +215,7 @@ impl<T: Trace + 'static> AsRef<T> for GcRef<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lua_gc::Marker;
 
     struct NoRoots;
 
