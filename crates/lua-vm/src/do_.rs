@@ -1625,7 +1625,16 @@ fn f_parser(state: &mut LuaState, p: &mut SParser) -> Result<(), LuaError> {
     };
 
     debug_assert!(cl.upvals.len() == cl.proto.upvalues.len());
-    func::init_upvals(state, &cl)?;
+
+    // C's `f_parser` calls `luaF_initupvals` here to fill the closure's upvalue
+    // slots, which `luaU_undump` / `luaY_parser` leave NULL. This port has no
+    // such step: both closure-producing paths already fill their slots with
+    // fresh closed nil upvalues at construction (`undump` via
+    // `state.new_lclosure`, the text parser hook likewise), because a
+    // `Cell<GcRef<UpVal>>` slot is non-nullable and must hold a valid upvalue
+    // the moment the closure exists. The `_ENV` upvalue is then substituted by
+    // `api::load`. Filling here as well would only discard those upvalues and
+    // reallocate identical ones (issue #276).
 
     // In C, `luaY_parser` / `luaU_undump` themselves push the
     // closure onto the stack before returning (see lparser.c `luaY_parser`:

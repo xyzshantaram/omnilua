@@ -289,7 +289,14 @@ fn load_protos(s: &mut LoadState<'_>, f: &mut LuaProto) -> Result<(), LuaError> 
         let parent_source = f.source.clone();
         load_function(s, &mut sub, parent_source)?;
 
-        // Wrap in GcRef after loading.
+        // A `LuaProto` is populated field-by-field through a `&mut` local and
+        // then wrapped, because `GcRef` exposes only `Deref` (no `DerefMut`):
+        // the canonical `state.new_proto()` would hand back a placeholder that
+        // cannot be filled in place. The direct `GcRef::new` path is kept for
+        // that reason, but `mark_gc_check_needed` is invoked here so a
+        // precompiled-chunk load registers its allocations with the collector
+        // exactly as `state.new_proto()` would (issue #276).
+        s.state.mark_gc_check_needed();
         let sub_ref = GcRef::new(sub);
         sub_ref.account_buffer(sub_ref.buffer_bytes() as isize);
         protos.push(sub_ref);
@@ -601,10 +608,12 @@ fn check_legacy_sizes(s: &mut LoadState<'_>) -> Result<(), LuaError> {
 ///   - starts with `\x1b` → `"binary string"`
 ///   - otherwise used as-is.
 ///
-/// The closure is pushed onto the stack for GC anchoring before its proto is
-/// fully loaded, mirroring the C reference's discipline of anchoring the
-/// half-built closure while parsing continues; the caller is responsible for
-/// popping it when done. `luai_verifycode`, a no-op in the default C build,
+/// Unlike the C reference — which anchors the half-built closure on the stack
+/// (`setclLvalue2s` + `luaD_inctop`) so a mid-load emergency collection cannot
+/// sweep it — no stack anchoring is needed here: `protected_parser` stops the
+/// collector for the entire load window, and the closure is returned by value
+/// (`do_.rs::f_parser` pushes it onto the stack after undump returns, which is
+/// the real anchor point). `luai_verifycode`, a no-op in the default C build,
 /// has no equivalent call here.
 pub(crate) fn undump(
     state: &mut LuaState,
@@ -616,40 +625,31 @@ pub(crate) fn undump(
     check_header(&mut s)?;
 
     // Reads the number of upvalues for the top-level closure.
-    let nupvalues = load_byte(&mut s)?;
-    let mut cl = LuaLClosure::placeholder();
-    let mut upvals_vec = Vec::with_capacity(nupvalues as usize);
-    for _ in 0..nupvalues as usize {
-        upvals_vec.push(std::cell::Cell::new(
-            s.state.new_upval_closed(LuaValue::Nil),
-        ));
-    }
-    cl.upvals = upvals_vec.into_boxed_slice();
-
-    // Push a placeholder Nil first; the real closure value is set after the
-    // proto is loaded.
-    s.state.push(LuaValue::Nil); // placeholder; replaced below
+    let nupvalues = load_byte(&mut s)? as usize;
 
     let mut proto = LuaProto::placeholder();
 
     load_function(&mut s, &mut proto, None)?;
 
-    // Wrap the proto in a GcRef and attach it to the closure.
+    // Build-then-wrap the top proto (see the note in `load_protos` on why the
+    // direct `GcRef::new` path is kept and `mark_gc_check_needed` fired here).
+    s.state.mark_gc_check_needed();
     let proto_ref = GcRef::new(proto);
     proto_ref.account_buffer(proto_ref.buffer_bytes() as isize);
 
     debug_assert_eq!(
-        nupvalues as usize,
+        nupvalues,
         proto_ref.upvalues.len(),
         "upvalue count mismatch between closure header and prototype"
     );
 
-    // Attach the loaded proto to the closure.
-    cl.proto = proto_ref;
-
-    // Wrap the closure in GcRef.
-    let cl_ref = GcRef::new(cl);
-    cl_ref.account_buffer(cl_ref.buffer_bytes() as isize);
+    // Route the closure through the canonical constructor: it fires
+    // `mark_gc_check_needed`, fills the `nupvalues` upvalue slots with fresh
+    // closed nil upvalues (Rust's `Cell<GcRef<UpVal>>` slots are non-nullable,
+    // so C's `luaF_newLclosure`-with-NULL-slots followed by a later
+    // `luaF_initupvals` fill collapses into this one construction step), and
+    // accounts the closure's owned buffer (issue #276).
+    let cl_ref = s.state.new_lclosure(proto_ref, nupvalues);
 
     Ok(cl_ref)
 }

@@ -112,3 +112,79 @@ fn dump_load_roundtrip_reproduces_value() {
         assert_eq!(got, "42", "dump->load roundtrip failed on {tag}");
     }
 }
+
+/// Round-trips a chunk whose top proto owns nested function prototypes, so the
+/// undumper's `load_protos` sub-proto construction path (now routed through
+/// `mark_gc_check_needed` + build-then-wrap, issue #276) is exercised: the
+/// reloaded chunk must rebuild the whole proto tree and run it.
+#[test]
+fn dump_load_roundtrip_nested_functions() {
+    for (tag, version) in VERSIONS {
+        let got = eval_str(
+            *version,
+            "local d = string.dump(function()\n\
+             \x20 local function add(a, b) return a + b end\n\
+             \x20 local function mul(a, b) return a * b end\n\
+             \x20 return add(mul(2, 3), 4)\n\
+             end)\n\
+             local f = (loadstring or load)(d)\n\
+             return tostring(f())",
+        );
+        assert_eq!(
+            got, "10",
+            "nested-function dump->load roundtrip failed on {tag}"
+        );
+    }
+}
+
+/// Round-trips a chunk that, once reloaded and run, builds a nested closure
+/// capturing a live upvalue and drives it across several calls. This exercises
+/// both the reloaded top closure (built via `new_lclosure`, which fills its
+/// upvalue slots) and the runtime upvalue machinery over the reloaded proto
+/// tree (issue #276).
+#[test]
+fn dump_load_roundtrip_closure_upvalues() {
+    for (tag, version) in VERSIONS {
+        let got = eval_str(
+            *version,
+            "local d = string.dump(function()\n\
+             \x20 local counter = 0\n\
+             \x20 return function() counter = counter + 1; return counter end\n\
+             end)\n\
+             local make = (loadstring or load)(d)\n\
+             local c = make()\n\
+             c(); c()\n\
+             return tostring(c())",
+        );
+        assert_eq!(
+            got, "3",
+            "closure-upvalue dump->load roundtrip failed on {tag}"
+        );
+    }
+}
+
+/// Loads many precompiled chunks back-to-back and then forces a collection.
+/// Each load now marks the collector (`new_lclosure` -> `mark_gc_check_needed`),
+/// so this stresses the mark-on-chunk-load path under repeated loads and
+/// confirms a subsequent `collectgarbage()` leaves the results intact rather
+/// than sweeping the freshly reloaded closures (issue #276). A deterministic
+/// "collection was deferred" assertion is not feasible from Lua, so this covers
+/// the path via bulk load + collect consistency instead.
+#[test]
+fn many_loads_then_gc_stays_consistent() {
+    for (tag, version) in VERSIONS {
+        let got = eval_str(
+            *version,
+            "local sum = 0\n\
+             for _ = 1, 200 do\n\
+             \x20 local d = string.dump(function() return 7 end)\n\
+             \x20 local f = (loadstring or load)(d)\n\
+             \x20 sum = sum + f()\n\
+             \x20 collectgarbage('step')\n\
+             end\n\
+             collectgarbage()\n\
+             return tostring(sum)",
+        );
+        assert_eq!(got, "1400", "many-loads+gc consistency failed on {tag}");
+    }
+}
