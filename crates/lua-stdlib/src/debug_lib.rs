@@ -32,7 +32,7 @@ use std::io::{self, BufRead, Write};
 use std::rc::Rc;
 
 use crate::state_stub::{LuaDebug as DebugInfo, LuaState, LuaStateStubExt as _};
-use lua_types::{GcRef, LuaError, LuaString, LuaType, LuaValue, LuaVersion};
+use lua_types::{GcRef, LuaError, LuaStatus, LuaString, LuaType, LuaValue, LuaVersion};
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -972,16 +972,37 @@ pub(crate) fn debug_interactive(state: &mut LuaState) -> Result<usize, LuaError>
 
             let bytes: &[u8] = line.as_bytes();
 
-            let result = state
-                .load_buffer(bytes, b"=(debug command)", None)
-                .and_then(|_| state.protected_call(0, 0, 0));
-
-            if result.is_err() {
-                // Prints a generic message rather than the actual error text.
-                // `crate::auxlib::to_lua_string` (the `luaL_tolstring`
-                // equivalent) could render the real error object here.
-                eprintln!("(error in debug command)");
+            let load_status = state.load_buffer(bytes, b"=(debug command)", None)?;
+            let result: Result<(), LuaError> = if load_status == LuaStatus::Ok {
+                state.protected_call(0, 0, 0)
+            } else {
+                // Unlike `protected_call`'s failures (which the port's `pcall`
+                // machinery embeds in the `Err` itself, popping the Lua-stack
+                // copy before returning), a syntax error from `load_buffer`
+                // leaves the message on top of the stack, matching
+                // `luaL_loadbuffer`'s convention. Without this branch the code
+                // fell through to `protected_call` unconditionally, calling
+                // whatever the failed load left behind (the error message
+                // string) and reporting "attempt to call a string value"
+                // instead of the syntax error.
+                let top = state.top_idx();
+                let msg = state.get_at(top - 1);
                 state.pop_n(1);
+                Err(LuaError::Syntax(msg))
+            };
+
+            if let Err(e) = result {
+                // The error value must be back on the stack (rather than read
+                // from `e` directly) before `to_lua_string` — the `luaL_tolstring`
+                // equivalent — can stringify it the way the reference
+                // `db_debug` does, including calling `__tostring`.
+                let val = e.into_value();
+                state.push(val);
+                let msg = crate::auxlib::to_lua_string(state, -1)?;
+                let mut err = io::stderr();
+                let _ = err.write_all(&msg);
+                let _ = err.write_all(b"\n");
+                let _ = err.flush();
             }
 
             lua_vm::api::set_top(state, 0)?;
