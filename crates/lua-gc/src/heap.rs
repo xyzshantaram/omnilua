@@ -4111,6 +4111,88 @@ mod tests {
     /// by a non-ignored liveness test alongside the allgc->finobj acceptance
     /// test above (the redundant allgc->finobj baseline pin was removed with
     /// the fix).
+    /// Issue #263, codex-review variant: membership must survive the
+    /// `finobj -> tobefnz` move itself, and `sweep_young` must reconcile the
+    /// entry correctly while the object REMAINS on tobefnz across minors —
+    /// the other two G3 tests move the object back to allgc before
+    /// collecting, so neither proves this half. A `Touched1` transitional is
+    /// remembered while on finobj, moved to tobefnz, and left there for two
+    /// minors: the reachable young child ages New -> Survival -> Old1, the
+    /// transitional ages Touched1 -> Touched2 -> Old (C's correctgraylist
+    /// progression), and the grayagain entry persists exactly until the
+    /// transitional reaches Old (count 1 -> 1 -> 0).
+    #[test]
+    fn g3_transitional_remaining_on_tobefnz_reconciles_across_minors() {
+        let heap = Heap::new();
+        heap.unpause();
+        let child = heap.allocate(Cell0 {
+            next: Cell::new(None),
+            marker_calls: Cell::new(0),
+        });
+        let transitional = heap.allocate(Cell0 {
+            next: Cell::new(Some(child)),
+            marker_calls: Cell::new(0),
+        });
+        let parent = heap.allocate(Cell0 {
+            next: Cell::new(Some(transitional)),
+            marker_calls: Cell::new(0),
+        });
+        parent.set_age(GcAge::Old);
+        parent.set_color(Color::Black);
+        transitional.set_age(GcAge::Touched1);
+        transitional.set_color(Color::Black);
+
+        assert!(heap.move_allgc_to_finobj(transitional.as_trace_ptr()));
+        heap.remember_minor_revisit(transitional.as_trace_ptr());
+        assert_eq!(heap.grayagain_count(), 1);
+
+        assert!(heap.move_finobj_to_tobefnz(transitional.as_trace_ptr()));
+        assert_eq!(
+            heap.grayagain_count(),
+            1,
+            "── issue #263: finobj->tobefnz move preserves the grayagain entry"
+        );
+        assert!(heap
+            .header_from_ptr(transitional.as_trace_ptr())
+            .gray_listed());
+
+        heap.minor_collect_with_post_mark(&OneRoot(Some(parent)), |_| {});
+        assert_eq!(child.age(), GcAge::Survival, "child New -> Survival");
+        assert_eq!(
+            transitional.age(),
+            GcAge::Touched2,
+            "transitional Touched1 -> Touched2 while on tobefnz"
+        );
+        assert_eq!(heap.grayagain_count(), 1, "still tracked");
+        assert_eq!(heap.allgc_count(), 3, "child reachable after minor 1");
+
+        heap.minor_collect_with_post_mark(&OneRoot(Some(parent)), |_| {});
+        assert_eq!(child.age(), GcAge::Old1, "child Survival -> Old1");
+        assert_eq!(
+            transitional.age(),
+            GcAge::Old,
+            "transitional Touched2 -> Old while on tobefnz"
+        );
+        assert_eq!(
+            heap.grayagain_count(),
+            1,
+            "transitional retires at Old, but the child it kept young is now \
+             itself an Old1 tracked survivor — the obligation follows the \
+             live subgraph, not just the finalizable object"
+        );
+        assert_eq!(heap.allgc_count(), 3, "child reachable after minor 2");
+
+        heap.minor_collect_with_post_mark(&OneRoot(Some(parent)), |_| {});
+        assert_eq!(child.age(), GcAge::Old, "child Old1 -> Old");
+        assert_eq!(
+            heap.grayagain_count(),
+            0,
+            "once the whole subgraph reaches Old the revisit obligation is \
+             fully retired (C correctgraylist)"
+        );
+        assert_eq!(heap.allgc_count(), 3, "child reachable throughout — the #263 guarantee");
+    }
+
     #[test]
     fn g3_moved_transitional_via_tobefnz_keeps_young_child_reachable() {
         let heap = Heap::new();
