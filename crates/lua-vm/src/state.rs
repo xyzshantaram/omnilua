@@ -6069,6 +6069,15 @@ pub fn new_thread(state: &mut LuaState, initial_body: Option<LuaValue>) -> Resul
 /// Reset a thread to its base state, closing all to-be-closed variables.
 ///
 /// Returns the final status code as an `i32` (mirrors the C API).
+///
+/// Mirrors C's `luaE_resetthread` (`reference/lua-5.4.7/src/lstate.c`) line
+/// for line, including its final `luaD_reallocstack(L, ci->top.p -
+/// L->stack.p, 0)` call — routed here through `crate::do_::realloc_stack`
+/// with `raise_error = false`, matching C's `raiseerror = 0`. That call
+/// does more than grow: unlike a raw `Vec::resize`, it also shrinks the
+/// stack back down when the thread had grown large before being reset
+/// (reclaiming that memory, as C's `luaM_reallocvector` does), and it
+/// updates `stack_last` to match, which a direct resize would leave stale.
 pub fn reset_thread(state: &mut LuaState, status: i32) -> i32 {
     // Public low-level entry point: the __close error path under
     // close_protected() materializes error messages, which requires an
@@ -6108,13 +6117,7 @@ pub fn reset_thread(state: &mut LuaState, status: i32) -> i32 {
     let new_ci_top = StackIdx(state.top.0 + LUA_MINSTACK as u32);
     state.call_info[ci_idx].top = new_ci_top;
 
-    // Grows the stack directly with `resize` rather than going through
-    // `crate::do_::realloc_stack`, which additionally stops emergency GC
-    // during the grow, propagates OOM, and updates `stack_last`.
-    let needed = new_ci_top.0 as usize;
-    if state.stack.len() < needed {
-        state.stack.resize(needed, StackValue::default());
-    }
+    let _ = crate::do_::realloc_stack(state, new_ci_top.0 as usize, false);
 
     status
 }
@@ -6500,6 +6503,46 @@ mod tests {
         set_mainthread_registry_slot(&mut state).expect("V52 slot update should succeed");
         assert_eq!(registry.get_int(1), expected);
         assert_eq!(registry.get_int(3), LuaValue::Nil);
+    }
+
+    /// Issue #275 item 4: `reset_thread` must route the post-close stack
+    /// resize through `crate::do_::realloc_stack` rather than a raw
+    /// `Vec::resize`, matching C's `luaE_resetthread`
+    /// (`reference/lua-5.4.7/src/lstate.c`), whose final step is
+    /// `luaD_reallocstack(L, ci->top.p - L->stack.p, 0)`. A raw resize only
+    /// grows and never updates `stack_last`, both of which this test would
+    /// catch: it first grows the stack well past a fresh reset's minimal
+    /// size, then resets and checks the stack was shrunk back down AND
+    /// `stack_last` (`stack_size()`) reflects the new, smaller size instead
+    /// of the stale pre-reset one.
+    #[test]
+    fn reset_thread_shrinks_stack_and_updates_stack_last() {
+        let mut state = new_state().expect("state should initialize");
+        let _heap_guard = {
+            let g = state.global();
+            lua_gc::HeapGuard::push(&g.heap)
+        };
+
+        let grown_size = state.stack_size() + 500;
+        crate::do_::realloc_stack(&mut state, grown_size, false)
+            .expect("growing the stack should succeed");
+        assert_eq!(state.stack_size(), grown_size);
+        assert_eq!(state.stack.len(), grown_size + EXTRA_STACK);
+
+        let status = reset_thread(&mut state, LuaStatus::Ok as i32);
+        assert_eq!(status, LuaStatus::Ok as i32);
+
+        let expected_size = (state.top.0 + LUA_MINSTACK as u32) as usize;
+        assert_eq!(
+            state.stack_size(),
+            expected_size,
+            "stack_last should track reset_thread's realloc instead of the stale pre-reset size"
+        );
+        assert_eq!(
+            state.stack.len(),
+            expected_size + EXTRA_STACK,
+            "reset_thread should shrink the stack back down, matching C's luaE_resetthread"
+        );
     }
 
     #[test]
