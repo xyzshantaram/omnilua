@@ -14,7 +14,7 @@
 //! that identity/token pair remains live. Handles to legacy uncollected boxes
 //! still upgrade forever, matching their process-lifetime allocation model.
 
-use lua_gc::{Gc, HeapRef, Marker, Trace};
+use lua_gc::{Gc, HeapRef, Trace};
 
 /// A GC-managed pointer to a Lua collectable object. Newtype over
 /// `lua_gc::Gc<T>` so callers preserve `gc.0`-shape access while the
@@ -44,17 +44,6 @@ impl<T: Trace + 'static> GcRef<T> {
             ),
         });
         GcRef(gc)
-    }
-
-    /// Cycle-aware trace dispatch via `Marker::try_visit`'s identity
-    /// short-circuit, rather than the in-header color flag that
-    /// `Trace for GcRef<T>` (in `trace_impls.rs`) uses directly via
-    /// `m.mark(self.0)`. Nothing in this workspace currently calls
-    /// `trace_obj`.
-    pub fn trace_obj(&self, m: &mut Marker) {
-        if m.try_visit(self.identity()) {
-            (**self).trace(m);
-        }
     }
 }
 
@@ -226,6 +215,7 @@ impl<T: Trace + 'static> AsRef<T> for GcRef<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lua_gc::Marker;
 
     struct NoRoots;
 

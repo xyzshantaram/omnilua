@@ -1276,16 +1276,6 @@ impl Marker {
         }
     }
 
-    /// Record that an object has been visited and return whether this is the
-    /// first visit. Predates the real `Gc<T>` gray-queue path (`Color::Gray`
-    /// via `Marker::mark`), which now handles cycles natively (e.g. `_G._G
-    /// == _G`) without this bookkeeping; this method's only caller
-    /// (`GcRef::trace_obj`) itself has no remaining call sites, so both look
-    /// like dead code.
-    pub fn try_visit(&mut self, addr: usize) -> bool {
-        self.visited.insert(addr)
-    }
-
     /// True iff `id` was reached during the mark phase. Used by the
     /// post-mark hook (`Heap::full_collect_with_post_mark`) to decide whether
     /// a weak-table entry's target is still strongly reachable. Read-only —
