@@ -1,5 +1,7 @@
 //! Base library — Lua's built-in functions (`print`, `type`, `pairs`, `pcall`, …),
-//! a port of `lbaselib.c` covering Lua 5.1–5.5 from one source.
+//! covering Lua 5.1–5.5 from one source.
+//!
+//! C source: `reference/lua-5.4.7/src/lbaselib.c`.
 //!
 //! GRADUATED (Phase-2 idiomatization, 2026-06-14, `idiom/base`). base is the
 //! most VM-adjacent stdlib module: `pcall`/`xpcall`/`error` drive unwinding,
@@ -250,8 +252,8 @@ pub(crate) fn print_fn(state: &mut LuaState) -> Result<usize, LuaError> {
     Ok(0)
 }
 
-/// Faithful port of the Lua 5.1/5.2/5.3 `luaB_print`: fetch the global
-/// `tostring` once, then call it on each argument.
+/// Implements the Lua 5.1/5.2/5.3 `print` behavior (`luaB_print`): fetch the
+/// global `tostring` once, then call it on each argument.
 ///
 fn print_via_global_tostring(state: &mut LuaState) -> Result<usize, LuaError> {
     let n = state.top();

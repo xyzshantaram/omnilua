@@ -1,9 +1,9 @@
-//! Rust port of `ltablib.c` — Lua `table` standard library.
+//! Lua `table` standard library.
 //!
 //! Provides: `table.concat`, `table.insert`, `table.move`, `table.pack`,
 //! `table.remove`, `table.sort`, `table.unpack`.
 //!
-//! C source: `reference/lua-5.4.7/src/ltablib.c` (430 lines, 14 functions)
+//! C source: `reference/lua-5.4.7/src/ltablib.c`.
 
 use crate::state_stub::{CompareOp, LuaState, LuaStateStubExt as _};
 use lua_types::{GcRef, LuaError, LuaTable, LuaType, LuaValue};
@@ -182,32 +182,6 @@ pub fn insert(state: &mut LuaState) -> Result<usize, LuaError> {
 /// - **5.2 / 5.3**: `luaL_argcheck((lua_Unsigned)pos - 1u <= size, 1, ...)` —
 ///   the offending argument is reported as **#1**.
 /// - **5.4 / 5.5**: the identical check, but the argument index is **#2**.
-///
-/// ```c
-/// // 5.4.7
-/// static int tremove (lua_State *L) {
-///   lua_Integer size = aux_getn(L, 1, TAB_RW);
-///   lua_Integer pos = luaL_optinteger(L, 2, size);
-///   if (pos != size)
-///     luaL_argcheck(L, (lua_Unsigned)pos - 1u <= (lua_Unsigned)size, 2,
-///                      "position out of bounds");
-///   lua_geti(L, 1, pos);
-///   for ( ; pos < size; pos++) {
-///     lua_geti(L, 1, pos + 1);
-///     lua_seti(L, 1, pos);
-///   }
-///   lua_pushnil(L);
-///   lua_seti(L, 1, pos);
-///   return 1;
-/// }
-/// // 5.1.5
-/// static int tremove (lua_State *L) {
-///   int e = aux_getn(L, 1);
-///   int pos = luaL_optint(L, 2, e);
-///   if (!(1 <= pos && pos <= e)) return 0;  // nothing to remove
-///   ...
-/// }
-/// ```
 pub fn remove(state: &mut LuaState) -> Result<usize, LuaError> {
     let size = check_table_and_get_len(state, 1, TAB_RW)?;
     let mut pos = state.opt_arg_integer(2, size)?;
@@ -423,27 +397,19 @@ pub fn unpack(state: &mut LuaState) -> Result<usize, LuaError> {
 
 // ─── Quicksort ────────────────────────────────────────────────────────────────
 
-/// selection when a partition is severely imbalanced.
+/// A small pseudo-random value used to bias quicksort's pivot selection when
+/// a partition is severely imbalanced.
 ///
-/// `unsigned int` array whose elements are summed.
-///
-/// PORT NOTE: C uses a small randomised pivot guard to avoid pathological sort
-/// partitions. The Rust port asks the host for entropy when available and falls
-/// back to a deterministic pivot value in sandboxed/bare-WASM hosts.
+/// C uses a small randomised pivot guard to avoid pathological sort
+/// partitions. The Rust port asks the host for entropy when available and
+/// falls back to a deterministic pivot value in sandboxed/bare-WASM hosts.
 fn randomize_pivot(state: &LuaState) -> u32 {
     let entropy = state.global().entropy_hook.map(|hook| hook()).unwrap_or(0);
     let mixed = entropy ^ entropy.wrapping_shr(32);
     (mixed as u32) ^ (mixed as u32).wrapping_shr(16)
 }
 
-/// `table[i]` and `table[j]` respectively (table is at stack position 1).
-///
-/// ```c
-/// static void set2 (lua_State *L, IdxT i, IdxT j) {
-///   lua_seti(L, 1, i);
-///   lua_seti(L, 1, j);
-/// }
-/// ```
+/// Sets `table[i]` and `table[j]` respectively (table is at stack position 1).
 fn set2(state: &mut LuaState, i: IdxT, j: IdxT) -> Result<(), LuaError> {
     // First seti pops the stack top; second seti pops the new top.
     state.table_set_i(1, i as i64)?;
@@ -451,25 +417,9 @@ fn set2(state: &mut LuaState, i: IdxT, j: IdxT) -> Result<(), LuaError> {
     Ok(())
 }
 
-/// sort order: either the `<` operator (if arg 2 is nil) or the user's
-/// comparison function at stack position 2.
-///
-/// ```c
-/// static int sort_comp (lua_State *L, int a, int b) {
-///   if (lua_isnil(L, 2))
-///     return lua_compare(L, a, b, LUA_OPLT);
-///   else {
-///     int res;
-///     lua_pushvalue(L, 2);
-///     lua_pushvalue(L, a-1);
-///     lua_pushvalue(L, b-2);
-///     lua_call(L, 2, 1);
-///     res = lua_toboolean(L, -1);
-///     lua_pop(L, 1);
-///     return res;
-///   }
-/// }
-/// ```
+/// Compares elements `a` and `b` using the current sort order: either the
+/// `<` operator (if arg 2 is nil) or the user's comparison function at
+/// stack position 2.
 ///
 /// The offsets `a-1` and `b-2` compensate for the function and first-argument
 /// copies pushed before the respective values: `a-1` accounts for the function
@@ -489,36 +439,12 @@ fn sort_comp(state: &mut LuaState, a: i32, b: i32) -> Result<bool, LuaError> {
     Ok(res)
 }
 
-/// is already on the top of the Lua stack.
+/// Partitions `table[lo..=up]` around the pivot value, which the caller has
+/// already pushed onto the top of the Lua stack.
 ///
 /// Precondition: `a[lo] <= P == a[up-1] <= a[up]` and `P` is at stack top.
 /// Postcondition: `a[lo..i-1] <= a[i] == P <= a[i+1..up]`; stack is clean.
 /// Returns the final pivot index `i`.
-///
-/// ```c
-/// static IdxT partition (lua_State *L, IdxT lo, IdxT up) {
-///   IdxT i = lo;
-///   IdxT j = up - 1;
-///   for (;;) {
-///     while ((void)lua_geti(L, 1, ++i), sort_comp(L, -1, -2)) {
-///       if (l_unlikely(i == up - 1))
-///         luaL_error(L, "invalid order function for sorting");
-///       lua_pop(L, 1);
-///     }
-///     while ((void)lua_geti(L, 1, --j), sort_comp(L, -3, -1)) {
-///       if (l_unlikely(j < i))
-///         luaL_error(L, "invalid order function for sorting");
-///       lua_pop(L, 1);
-///     }
-///     if (j < i) {
-///       lua_pop(L, 1);
-///       set2(L, up - 1, i);
-///       return i;
-///     }
-///     set2(L, i, j);
-///   }
-/// }
-/// ```
 fn partition(state: &mut LuaState, lo: IdxT, up: IdxT) -> Result<IdxT, LuaError> {
     let mut i: IdxT = lo;
     let mut j: IdxT = up - 1;
@@ -572,16 +498,7 @@ fn partition(state: &mut LuaState, lo: IdxT, up: IdxT) -> Result<IdxT, LuaError>
     }
 }
 
-/// `[lo, up]`, randomised by `rnd`.
-///
-/// ```c
-/// static IdxT choosePivot (IdxT lo, IdxT up, unsigned int rnd) {
-///   IdxT r4 = (up - lo) / 4;
-///   IdxT p = rnd % (r4 * 2) + (lo + r4);
-///   lua_assert(lo + r4 <= p && p <= up - r4);
-///   return p;
-/// }
-/// ```
+/// Chooses a pivot index within `[lo, up]`, randomised by `rnd`.
 fn choose_pivot(lo: IdxT, up: IdxT, rnd: u32) -> IdxT {
     let r4 = (up - lo) / 4; // range / 4
     let p = rnd % (r4 * 2) + (lo + r4);
@@ -589,39 +506,9 @@ fn choose_pivot(lo: IdxT, up: IdxT, rnd: u32) -> IdxT {
     p
 }
 
-///
 /// Sorts `table[lo..=up]` in place, recursing on the smaller partition and
 /// tail-looping on the larger (to bound Rust's call stack). Randomises pivot
 /// selection when a partition is badly imbalanced.
-///
-/// ```c
-/// static void auxsort (lua_State *L, IdxT lo, IdxT up, unsigned int rnd) {
-///   while (lo < up) {
-///     IdxT p, n;
-///     lua_geti(L, 1, lo); lua_geti(L, 1, up);
-///     if (sort_comp(L, -1, -2)) set2(L, lo, up); else lua_pop(L, 2);
-///     if (up - lo == 1) return;
-///     if (up - lo < RANLIMIT || rnd == 0) p = (lo + up)/2;
-///     else p = choosePivot(lo, up, rnd);
-///     lua_geti(L, 1, p); lua_geti(L, 1, lo);
-///     if (sort_comp(L, -2, -1)) set2(L, p, lo);
-///     else {
-///       lua_pop(L, 1); lua_geti(L, 1, up);
-///       if (sort_comp(L, -1, -2)) set2(L, p, up); else lua_pop(L, 2);
-///     }
-///     if (up - lo == 2) return;
-///     lua_geti(L, 1, p); lua_pushvalue(L, -1); lua_geti(L, 1, up - 1);
-///     set2(L, p, up - 1);
-///     p = partition(L, lo, up);
-///     if (p - lo < up - p) {
-///       auxsort(L, lo, p - 1, rnd); n = p - lo; lo = p + 1;
-///     } else {
-///       auxsort(L, p + 1, up, rnd); n = up - p; up = p - 1;
-///     }
-///     if ((up - lo) / 128 > n) rnd = l_randomizePivot();
-///   }
-/// }
-/// ```
 fn aux_sort(
     state: &mut LuaState,
     mut lo: IdxT,
@@ -704,20 +591,8 @@ fn aux_sort(
     Ok(())
 }
 
-///
-/// ```c
-/// static int sort (lua_State *L) {
-///   lua_Integer n = aux_getn(L, 1, TAB_RW);
-///   if (n > 1) {
-///     luaL_argcheck(L, n < INT_MAX, 1, "array too big");
-///     if (!lua_isnoneornil(L, 2))
-///       luaL_checktype(L, 2, LUA_TFUNCTION);
-///     lua_settop(L, 2);
-///     auxsort(L, 1, (IdxT)n, 0);
-///   }
-///   return 0;
-/// }
-/// ```
+/// `table.sort(t, [comp])`: sorts `t` in place using `comp`, or the default
+/// `<` operator if `comp` is absent.
 pub fn sort(state: &mut LuaState) -> Result<usize, LuaError> {
     let n = check_table_and_get_len(state, 1, TAB_RW)?;
     if n > 1 {

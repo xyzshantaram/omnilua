@@ -1,4 +1,6 @@
-//! `bit32` — the Lua 5.2/5.3 32-bit bitwise library (port of `lbitlib.c`).
+//! `bit32` — the Lua 5.2/5.3 32-bit bitwise library.
+//!
+//! C source: `reference/lua-5.4.7/src/lbitlib.c`.
 //!
 //! `bit32` was introduced in Lua 5.2 and removed in 5.4 once native 64-bit
 //! bitwise operators (`&` `|` `~` `<<` `>>`) arrived in 5.3. In a stock build it

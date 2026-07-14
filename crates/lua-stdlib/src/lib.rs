@@ -1,7 +1,5 @@
-//! Lua 5.4 standard library — runtime stdlib crate.
-//!
-//! Each module corresponds to one C source under reference/lua-5.4.7/src/.
-//! See ANALYSES/file_deps.txt for the mapping.
+//! Lua standard library — runtime stdlib crate, covering Lua 5.1–5.5 from
+//! one source per module.
 
 pub mod auxlib;
 pub mod base;

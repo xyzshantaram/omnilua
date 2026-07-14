@@ -74,14 +74,13 @@ pub(crate) type LibFn = fn(&mut LuaState) -> Result<usize, LuaError>;
 )]
 pub(crate) type HookFn = fn(&mut LuaState, i32, i32) -> Result<(), LuaError>;
 
-/// Opaque identity handle for an upvalue.
+/// Opaque identity handle for an upvalue, used to check whether two
+/// upvalues share the same storage cell.
 ///
-/// check whether two upvalues share the same storage cell.
-///
-/// TODO(port): In C this is a raw pointer into the upvalue's storage cell.
-/// Safe Rust cannot expose a raw pointer outside `lua-gc`. A stable u64 ID
-/// or a GcRef-based comparison should be designed in Phase D. Using `usize`
-/// (pointer-sized) as a placeholder so the call sites compile.
+/// In C this is a raw pointer into the upvalue's storage cell. Safe Rust
+/// cannot expose a raw pointer outside `lua-gc`, so this uses `usize`
+/// (pointer-sized) as a placeholder so call sites compile; a stable u64 ID
+/// or a `GcRef`-based comparison would be the eventual real design.
 type UpvalId = usize;
 
 #[derive(Clone)]
@@ -129,9 +128,6 @@ fn check_cross_thread_stack(
     n: i32,
 ) -> Result<(), LuaError> {
     if !target_is_self {
-        // TODO(port): checking a different thread's stack requires simultaneous
-        // `&mut LuaState` for both threads, which is not expressible in safe Rust
-        // without interior mutability. Conservatively checks the current state only.
         state.ensure_stack(n, "stack overflow")?;
     }
     Ok(())
@@ -191,9 +187,10 @@ fn treat_stack_option(
     if target_is_self {
         state.rotate(-2, 1)?;
     } else {
-        // TODO(port): moving a value from another thread's stack (lua_xmove)
-        // requires simultaneous `&mut LuaState` for both threads. Not expressible
-        // in safe Rust without interior mutability. Pushes Nil as placeholder.
+        // Moving a value from another thread's stack (`lua_xmove`) needs a
+        // simultaneous `&mut LuaState` for both threads, which safe Rust
+        // cannot express without interior mutability, so this pushes Nil
+        // as a placeholder instead of the real cross-thread value.
         state.push(LuaValue::Nil);
     }
     state.set_field(-2, fname)
@@ -314,9 +311,10 @@ pub(crate) fn get_info(state: &mut LuaState) -> Result<usize, LuaError> {
         if target_is_self {
             state.push_value_at(arg + 1)?;
         } else {
-            // TODO(port): lua_xmove to another thread's stack requires simultaneous
-            // `&mut LuaState` for both threads. Cross-thread getinfo with a function
-            // argument is left incomplete for Phase A.
+            // Moving the function value to another thread's stack (`lua_xmove`)
+            // needs a simultaneous `&mut LuaState` for both threads, which safe
+            // Rust cannot express; cross-thread getinfo with a function argument
+            // is incomplete — this branch is a no-op rather than pushing the value.
         }
 
         // With '>' prefix, get_debug_info consumes the function from the top of stack.
@@ -658,10 +656,6 @@ fn check_upval(
 ) -> Result<(Option<UpvalId>, i32), LuaError> {
     let nup = state.check_arg_integer(argnup)? as i32;
     state.check_arg_type(argf, LuaType::Function)?;
-    // TODO(port): lua_upvalueid returns a raw void* that uniquely identifies
-    // an upvalue's storage cell. A safe equivalent (e.g., GcRef<UpVal> pointer
-    // comparison, or a stable u64 ID from the GC layer) must be defined in
-    // Phase D. Using Option<usize> as placeholder.
     let id: Option<UpvalId> = match state.upvalue_id(argf, nup) {
         Ok(p) if p.is_null() => None,
         Ok(p) => Some(p as usize),
@@ -983,10 +977,9 @@ pub(crate) fn debug_interactive(state: &mut LuaState) -> Result<usize, LuaError>
                 .and_then(|_| state.protected_call(0, 0, 0));
 
             if result.is_err() {
-                // TODO(port): display the error via state.coerce_to_string(-1) which
-                // maps to luaL_tolstring. The exact method name for the coercing
-                // to-string operation and the stderr-write helper need to be established
-                // in Phase B (lua-vm/src/api.rs).
+                // Prints a generic message rather than the actual error text.
+                // `crate::auxlib::to_lua_string` (the `luaL_tolstring`
+                // equivalent) could render the real error object here.
                 eprintln!("(error in debug command)");
                 state.pop_n(1);
             }

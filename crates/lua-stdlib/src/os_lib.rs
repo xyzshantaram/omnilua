@@ -1,4 +1,5 @@
-//! Lua `os` standard library — a pure-Rust port of `loslib.c`.
+//! Lua `os` standard library — `os.*` time/date arithmetic, environment, and
+//! process control.
 //!
 //! ## Graduation (Idiomatization Sprint 2, Phase 2 — 2026-06-14)
 //!
@@ -214,8 +215,6 @@ fn get_field(state: &mut LuaState, key: &[u8], d: i32, delta: i32) -> Result<i32
     Ok(res)
 }
 
-/// ptrdiff_t convlen, char *buff)`
-///
 /// Validates the `strftime` conversion specifier at the start of `conv` against
 /// `STRFTIME_OPTIONS`.
 ///
@@ -737,7 +736,7 @@ pub(crate) fn os_rename(state: &mut LuaState) -> Result<usize, LuaError> {
 /// Generates a unique temporary file name and pushes it as a string.
 /// Raises a runtime error if generation fails.
 ///
-/// PORT NOTE: Temporary names are host capability. Native hosts can install
+/// Temporary names are a host capability. Native hosts can install
 /// `GlobalState::temp_name_hook`; bare WASM without that hook raises a Lua
 /// error instead of touching `std::env` / `std::time` stubs.
 pub(crate) fn os_tmpname(state: &mut LuaState) -> Result<usize, LuaError> {
@@ -770,8 +769,8 @@ pub(crate) fn os_getenv(state: &mut LuaState) -> Result<usize, LuaError> {
 
             #[cfg(all(not(unix), not(all(target_arch = "wasm32", target_os = "unknown"))))]
             {
-                // TODO(port): from_utf8 used on Lua string data for OS API interop on
-                // non-Unix platforms.  Ideally replaced with wide-string conversion.
+                // Non-Unix platforms: requires valid UTF-8 for OS API interop
+                // (a wide-string conversion would be more permissive).
                 match std::str::from_utf8(&name_bytes) {
                     Ok(name_str) => std::env::var(name_str).ok().map(|v| v.into_bytes()),
                     Err(_) => None,
@@ -924,7 +923,7 @@ pub(crate) fn os_time(state: &mut LuaState) -> Result<usize, LuaError> {
         t = unix_now(state)?;
     } else {
         state.check_arg_type(1, LuaType::Table)?;
-        // PORT NOTE: must use the public-API `set_top` (relative to the current
+        // Must use the public-API `set_top` (relative to the current
         // C-frame's `func`), not `LuaState::set_top` which is an inherent that
         // sets an absolute stack index and would truncate the entire stack.
         lua_vm::api::set_top(state, 1)?;
@@ -970,7 +969,7 @@ pub(crate) fn os_time(state: &mut LuaState) -> Result<usize, LuaError> {
             ..TmFields::default()
         };
 
-        // PORT NOTE: C `mktime` interprets the broken-down time as LOCAL and
+        // C `mktime` interprets the broken-down time as LOCAL and
         // returns the corresponding UTC timestamp. We reproduce it: treat the
         // fields as UTC to get a provisional `t_utc` (this also normalises the
         // month axis), then subtract the host timezone offset to recover the true
@@ -989,8 +988,7 @@ pub(crate) fn os_time(state: &mut LuaState) -> Result<usize, LuaError> {
         set_all_fields(state, &stm)?;
     }
 
-    //        return luaL_error(L, "time result cannot be represented in this installation");
-    // PORT NOTE: On 64-bit targets time_t == i64 == lua_Integer so the cast check
+    // On 64-bit targets time_t == i64 == lua_Integer so the cast check
     // is a no-op.  We only guard against mktime's failure sentinel (−1).
     if t == -1 {
         return Err(LuaError::runtime(format_args!(
@@ -1005,8 +1003,8 @@ pub(crate) fn os_time(state: &mut LuaState) -> Result<usize, LuaError> {
 ///
 /// Returns the number of seconds between two time values as a float (`t1 − t2`).
 ///
-/// PORT NOTE: C's `difftime(t1, t2)` returns `t1 − t2` as a `double`.  For
-/// 64-bit `time_t` this is exact as `f64` up to approximately 2^53 seconds
+/// Returns `t1 − t2` as a `double`, matching C's `difftime`. For 64-bit
+/// `time_t` this is exact as `f64` up to approximately 2^53 seconds
 /// (~285 million years), which is sufficient for all practical timestamps.
 pub(crate) fn os_difftime(state: &mut LuaState) -> Result<usize, LuaError> {
     let t1 = check_time(state, 1)?;
@@ -1032,7 +1030,7 @@ pub(crate) fn os_setlocale(state: &mut LuaState) -> Result<usize, LuaError> {
 
     let _op: usize = state.check_arg_option(2, Some(b"all"), CAT_NAMES)?;
 
-    // PORT NOTE: calling libc::setlocale requires unsafe (banned in lua-stdlib, budget=0).
+    // Calling libc::setlocale requires unsafe (banned in lua-stdlib, budget=0).
     // Rust programs inherit the "C" locale by default and never change it, so returning
     // "C" for the C locale (and nil for anything else) is faithful for this build:
     // "C" is the only locale guaranteed available on every POSIX system.
