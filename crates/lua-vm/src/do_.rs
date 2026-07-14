@@ -330,7 +330,12 @@ fn stack_in_use(state: &LuaState) -> usize {
         }
         ci_idx_opt = ci.previous;
     }
-    debug_assert!(true /* TODO(phase-b): lim <= state.stack_last + EXTRA_STACK */);
+    debug_assert!(
+        lim.0 <= state.stack_last.0 + EXTRA_STACK as u32,
+        "stack_in_use: max frame top {} exceeds stack_last {} + EXTRA_STACK",
+        lim.0,
+        state.stack_last.0
+    );
     let res = lim.0 as usize + 1;
     if res < LUA_MINSTACK as usize {
         LUA_MINSTACK as usize
@@ -743,7 +748,12 @@ fn precall_c(
     let ci_idx = prep_call_info(state, func_idx, nresults, CIST_C, top_idx + LUA_MINSTACK)?;
     state.get_ci_mut(ci_idx).call_metamethods = call_metamethods;
 
-    debug_assert!(true /* TODO(phase-b): state.get_ci(ci_idx).top <= state.stack_last */);
+    debug_assert!(
+        state.get_ci(ci_idx).top.0 <= state.stack_last.0,
+        "precall_c: ci.top {} exceeds stack_last {}",
+        state.get_ci(ci_idx).top.0,
+        state.stack_last.0
+    );
 
     if state.hookmask & LUA_MASKCALL != 0 {
         let narg = (state.top_idx().0 as i32 - func_idx.0 as i32) - 1;
