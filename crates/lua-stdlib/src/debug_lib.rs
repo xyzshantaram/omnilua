@@ -287,17 +287,33 @@ pub(crate) fn get_info(state: &mut LuaState) -> Result<usize, LuaError> {
     let target_is_self = other_thread.is_none();
     let target_state = resolve_debug_thread_target(state, &other_thread);
 
+    // The default option string is version-gated, mirroring `db_getinfo`'s
+    // `luaL_optstring(L, arg+2, ...)` default: 5.1 has no tail-call ('t') or
+    // transfer ('r') info (`flnSu`); 5.2/5.3 add 't' (`flnStu`); 5.4/5.5 add 'r'
+    // (`flnSrtu`). The per-version accepted-option set is enforced separately in
+    // the VM's `aux_get_info`.
+    let default_opts: &[u8] = match state.global().lua_version {
+        LuaVersion::V51 => b"flnSu",
+        LuaVersion::V52 | LuaVersion::V53 => b"flnStu",
+        _ => b"flnSrtu",
+    };
     // to_vec() immediately to avoid borrow-checker conflict with subsequent &mut state ops.
-    let raw_opts: Vec<u8> = state.opt_arg_string(arg + 2, b"flnSrtu")?.to_vec();
+    let raw_opts: Vec<u8> = state.opt_arg_string(arg + 2, default_opts)?.to_vec();
 
     check_cross_thread_stack(state, target_is_self, 3)?;
 
     if raw_opts.first() == Some(&b'>') {
-        return Err(lua_vm::debug::arg_error_impl(
-            state,
-            arg + 2,
-            b"invalid option '>'",
-        ));
+        // 5.4/5.5 reject a leading '>' explicitly with `luaL_argcheck(...,
+        // "invalid option '>'")`. Pre-5.4 has no such early check: a leading '>'
+        // instead flows into the natural path where `aux_get_info` reports the
+        // bare `invalid option`. The explicit guard is kept on every version
+        // (the function value it would otherwise consume off the stack is not
+        // present here), but the message matches the target era.
+        let msg: &[u8] = match state.global().lua_version {
+            LuaVersion::V54 | LuaVersion::V55 => b"invalid option '>'",
+            _ => b"invalid option",
+        };
+        return Err(lua_vm::debug::arg_error_impl(state, arg + 2, msg));
     }
 
     // Build the effective options string, prepending '>' when the subject is a function.
@@ -312,42 +328,26 @@ pub(crate) fn get_info(state: &mut LuaState) -> Result<usize, LuaError> {
         prefixed.extend_from_slice(&raw_opts);
         options = prefixed;
 
-        // With '>' prefix, get_debug_info consumes the function from the top of
-        // whichever stack it runs against — self or the cross-thread target — so
-        // the function value must be pushed there, not onto `state`, mirroring
-        // C's `lua_pushvalue(L, arg+1); lua_xmove(L, L1, 1)`.
-        match target_state {
-            DebugThreadTarget::Current | DebugThreadTarget::Unavailable => {
-                info_target_is_self = true;
-                state.push_value_at(arg + 1)?;
-                if state.get_debug_info(&options, &mut ar).is_err() {
-                    return Err(lua_vm::debug::arg_error_impl(
-                        state,
-                        arg + 2,
-                        b"invalid option",
-                    ));
-                }
-            }
-            DebugThreadTarget::Other(target_owner) => {
-                let func_val = state.value_at(arg + 1);
-                info_target_owner = Some(target_owner);
-                let mut target = crate::coro_lib::borrow_thread_rooted(
-                    state,
-                    info_target_owner
-                        .as_ref()
-                        .expect("target owner just stored"),
-                );
-                target.push(func_val);
-                if target.get_debug_info(&options, &mut ar).is_err() {
-                    return Err(lua_vm::debug::arg_error_impl(
-                        state,
-                        arg + 2,
-                        b"invalid option",
-                    ));
-                }
-                target.resnapshot();
-                info_target = Some(target);
-            }
+        // Function-form getinfo is thread-INDEPENDENT: it inspects the closure's
+        // proto (source, line-defined, nparams, upvalue count, the function value
+        // itself, its active-lines table), none of which depends on which thread
+        // is nominated. C runs `lua_getinfo(L1, ">...")` only because it xmoved
+        // the function onto L1, but the result is identical on any thread. So we
+        // always push the function onto the CURRENT `state` and inspect it there,
+        // for every DebugThreadTarget — never borrowing the nominated thread. That
+        // both avoids a redundant borrow and sidesteps a "RefCell already
+        // borrowed" panic when the nominated thread is an actively-suspended
+        // ancestor mid-resume (its cell is already mutably borrowed up the call
+        // stack). Target-thread borrowing is reserved for the level-based form,
+        // which genuinely reads that thread's live call stack.
+        info_target_is_self = true;
+        state.push_value_at(arg + 1)?;
+        if state.get_debug_info(&options, &mut ar).is_err() {
+            return Err(lua_vm::debug::arg_error_impl(
+                state,
+                arg + 2,
+                b"invalid option",
+            ));
         }
     } else {
         options = raw_opts;
@@ -1017,12 +1017,30 @@ pub(crate) fn debug_interactive(state: &mut LuaState) -> Result<usize, LuaError>
 
             if let Err(e) = result {
                 // The error value must be back on the stack (rather than read
-                // from `e` directly) before `to_lua_string` — the `luaL_tolstring`
-                // equivalent — can stringify it the way the reference
-                // `db_debug` does, including calling `__tostring`.
+                // from `e` directly) before stringifying it the way the
+                // reference `db_debug` does.
                 let val = e.into_value();
                 state.push(val);
-                let msg = crate::auxlib::to_lua_string(state, -1)?;
+                // The stringification is era-split, mirroring `db_debug`:
+                // 5.4/5.5 use `luaL_tolstring` (honors `__tostring`, and renders
+                // other non-string objects as `type: 0x…`); 5.1-5.3 use plain
+                // `lua_tostring`, which yields the value only for a string or a
+                // number and otherwise NULL — printed via `lua_writestringerror`
+                // as the literal `(null)`.
+                let msg: Vec<u8> = if matches!(
+                    state.global().lua_version,
+                    LuaVersion::V54 | LuaVersion::V55
+                ) {
+                    crate::auxlib::to_lua_string(state, -1)?
+                } else {
+                    // `lua_tostring` returning `None` is the meaningful
+                    // "not a string or number" signal (C's NULL), which
+                    // `lua_writestringerror("%s\n", NULL)` renders as `(null)`.
+                    match state.to_lua_string_bytes(-1) {
+                        Some(bytes) => bytes,
+                        None => b"(null)".to_vec(),
+                    }
+                };
                 let mut err = io::stderr();
                 let _ = err.write_all(&msg);
                 let _ = err.write_all(b"\n");

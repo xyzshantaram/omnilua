@@ -939,7 +939,9 @@ fn aux_get_info(
                 }
             }
             b't' => {
-                if let Some(ci) = ci {
+                if state.global().lua_version == lua_types::LuaVersion::V51 {
+                    status = false;
+                } else if let Some(ci) = ci {
                     ar.istailcall = ci.callstatus & CIST_TAIL != 0;
                     ar.extraargs = ci.call_metamethods;
                 } else {
@@ -957,16 +959,27 @@ fn aux_get_info(
                     ar.name = name;
                 }
             }
-            b'r' => match ci {
-                Some(ci) if ci.callstatus & CIST_TRAN != 0 => {
-                    ar.ftransfer = ci.transfer_ftransfer();
-                    ar.ntransfer = ci.transfer_ntransfer();
+            b'r' => {
+                if matches!(
+                    state.global().lua_version,
+                    lua_types::LuaVersion::V51
+                        | lua_types::LuaVersion::V52
+                        | lua_types::LuaVersion::V53
+                ) {
+                    status = false;
+                } else {
+                    match ci {
+                        Some(ci) if ci.callstatus & CIST_TRAN != 0 => {
+                            ar.ftransfer = ci.transfer_ftransfer();
+                            ar.ntransfer = ci.transfer_ntransfer();
+                        }
+                        _ => {
+                            ar.ftransfer = 0;
+                            ar.ntransfer = 0;
+                        }
+                    }
                 }
-                _ => {
-                    ar.ftransfer = 0;
-                    ar.ntransfer = 0;
-                }
-            },
+            }
             b'L' | b'f' => {}
             _ => {
                 status = false;
