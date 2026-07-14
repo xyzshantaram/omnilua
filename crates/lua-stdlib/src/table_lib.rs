@@ -470,7 +470,7 @@ fn partition(state: &mut LuaState, lo: IdxT, up: IdxT) -> Result<IdxT, LuaError>
         // Retreat j: find last a[j] <= P.
         // Stack during j-loop body: P(-3), a[i](-2), a[j](-1)
         loop {
-            // PERF(port): wrapping_sub mirrors C unsigned IdxT behaviour for edge cases
+            // wrapping_sub mirrors C's unsigned IdxT behavior for edge cases.
             j = j.wrapping_sub(1);
             state.table_get_i(1, j as i64)?; // push a[j]
             if !sort_comp(state, -3, -1)? {
