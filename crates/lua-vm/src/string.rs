@@ -53,13 +53,9 @@ const MAX_STR_TAB: usize = i32::MAX as usize / std::mem::size_of::<usize>();
 
 /// Whether a Lua string is short (interned) or long (not interned).
 ///
-/// Corresponds to `LUA_VSHRSTR` / `LUA_VLNGSTR` tags from `lobject.h`.
-///
-/// # C mapping (types.tsv)
-/// ```text
-/// LUA_VSHRSTR → LuaStringImpl::Short  (shrlen holds length 0..=40)
-/// LUA_VLNGSTR → LuaStringImpl::Long   (shrlen = 0xFF sentinel; u.lnglen holds length)
-/// ```
+/// Corresponds to the `LUA_VSHRSTR` / `LUA_VLNGSTR` tags from `lobject.h`;
+/// C distinguishes them via a `shrlen` sentinel value (0xFF) rather than a
+/// separate enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StringKind {
     Short,
@@ -214,80 +210,37 @@ pub struct LuaUserDataImpl {
 /// Hash a byte string with a seed using Lua's FNV-style hash.
 ///
 /// This is a pure function with no allocations.  The algorithm XORs shifts and
-/// additions over each byte in reverse order, seeded by `seed ^ len`.
+/// additions over each byte in reverse order, seeded by `seed ^ len`. Mirrors
+/// C's `luaS_hash`.
 ///
-/// # C source
-/// ```c
-///
-/// //   unsigned int h = seed ^ cast_uint(l);
-/// //   for (; l > 0; l--)
-/// //     h ^= ((h<<5) + (h>>2) + cast_byte(str[l - 1]));
-/// //   return h;
-/// // }
-/// ```
-///
-/// PORT NOTE: C parenthesises `(h<<5)` and `(h>>2)` explicitly, so the outer
-/// additions are unambiguous despite C's `<<`/`>>` having lower precedence than
-/// `+`.  In Rust `<<` and `>>` have higher precedence than `+`, so the same
-/// expression is computed without extra parentheses; `wrapping_add` is used to
-/// match C's unsigned wrap-around arithmetic.
+/// C parenthesises `(h<<5)` and `(h>>2)` explicitly, so the outer additions
+/// are unambiguous despite C's `<<`/`>>` having lower precedence than `+`.
+/// In Rust `<<` and `>>` have higher precedence than `+`, so the same
+/// expression is computed without extra parentheses; `wrapping_add` is used
+/// to match C's unsigned wrap-around arithmetic.
 pub(crate) fn hash_bytes(bytes: &[u8], seed: u32) -> u32 {
-    // macros.tsv: cast_uint → x as u32
     let mut h: u32 = seed ^ (bytes.len() as u32);
 
     let mut l = bytes.len();
     while l > 0 {
         l -= 1;
-        // macros.tsv: cast_byte → x as u8 (then as u32 for the arithmetic)
         h ^= (h << 5).wrapping_add(h >> 2).wrapping_add(bytes[l] as u32);
     }
 
     h
 }
 
-//
-// PORT NOTE: `tablerehash` walked the intrusive `hnext` chain in each bucket and
-// redistributed `TString *` pointers into new bucket slots.  In Rust the
-// `HashMap` in `StringPool` handles its own rehashing automatically whenever its
-// load factor is exceeded or `reserve` / `shrink_to` is called.  The entire
-// function is therefore dropped; its effects are subsumed by the HashMap.
-
-// lstring.h: LUAI_FUNC → pub(crate)
 /// Resize the string intern table to approximately `nsize` buckets.
 ///
-/// When growing, `HashMap::reserve` hints the desired capacity.  When shrinking,
-/// `HashMap::shrink_to` is used as an approximation of the C logic, which
-/// would rehash entries out of the shrinking tail.  The C function's graceful
+/// C's `tablerehash` walked the intrusive `hnext` chain in each bucket and
+/// redistributed `TString *` pointers into new bucket slots; that entire
+/// mechanism is unneeded here since `HashMap` rehashes itself automatically.
+/// When growing, `HashMap::reserve` hints the desired capacity. When
+/// shrinking, `HashMap::shrink_to` is a hint rather than a guarantee (C
+/// freed exact memory), used as an approximation of the C logic that would
+/// rehash entries out of the shrinking tail. The C function's graceful
 /// degradation on allocation failure (keep the current size) is preserved:
 /// `HashMap` will simply retain its existing capacity if memory is tight.
-///
-/// # C source
-/// ```c
-///
-/// //   stringtable *tb = &G(L)->strt;
-/// //   int osize = tb->size;
-/// //   TString **newvect;
-/// //   if (nsize < osize)
-/// //     tablerehash(tb->hash, osize, nsize);  /* depopulate shrinking part */
-/// //   newvect = luaM_reallocvector(L, tb->hash, osize, nsize, TString*);
-/// //   if (l_unlikely(newvect == NULL)) {
-/// //     if (nsize < osize)
-/// //       tablerehash(tb->hash, nsize, osize);  /* restore to original size */
-/// //   } else {
-/// //     tb->hash = newvect;
-/// //     tb->size = nsize;
-/// //     if (nsize > osize)
-/// //       tablerehash(newvect, osize, nsize);
-/// //   }
-/// // }
-/// ```
-///
-/// PORT NOTE: The three calls to `tablerehash` are dropped because `HashMap`
-/// automatically rehashes.  The allocation-failure fallback (restore to `osize`)
-/// has no direct analogue; `HashMap` will retain existing capacity on OOM, which
-/// matches the intent.
-// PERF(port): luaS_resize shrink — HashMap::shrink_to() is a hint, not a
-// guarantee; the C code freed exact memory.  Profile in Phase B.
 pub(crate) fn resize(state: &mut LuaState, nsize: usize) {
     let strt = &mut state.global_mut().strt;
     let osize = strt.size;
@@ -296,7 +249,6 @@ pub(crate) fn resize(state: &mut LuaState, nsize: usize) {
         let additional = nsize.saturating_sub(strt.map.len());
         strt.map.reserve(additional);
     } else if nsize < osize {
-        // PERF(port): shrink_to is a hint; exact shrink not guaranteed in Rust
         strt.map.shrink_to(nsize);
     }
 
@@ -307,44 +259,24 @@ pub(crate) fn resize(state: &mut LuaState, nsize: usize) {
 /// Initialise the string intern table and the API string cache.
 ///
 /// Must be called exactly once during VM startup, before any strings are created.
-/// Pre-creates the memory-error message and fixes it in the GC (so it is never
-/// collected), then fills every cache slot with that same string.
+/// Pre-creates the memory-error message, then fills every cache slot with
+/// that same string.
 ///
-/// # C source
-/// ```c
-///
-/// //   global_State *g = G(L);
-/// //   int i, j;
-/// //   stringtable *tb = &G(L)->strt;
-/// //   tb->hash = luaM_newvector(L, MINSTRTABSIZE, TString*);
-/// //   tablerehash(tb->hash, 0, MINSTRTABSIZE);
-/// //   tb->size = MINSTRTABSIZE;
-/// //   g->memerrmsg = luaS_newliteral(L, MEMERRMSG);
-/// //   luaC_fix(L, obj2gco(g->memerrmsg));
-/// //   for (i = 0; i < STRCACHE_N; i++)
-/// //     for (j = 0; j < STRCACHE_M; j++)
-/// //       g->strcache[i][j] = g->memerrmsg;
-/// // }
-/// ```
+/// C fixes the message in the GC (`luaC_fix`, marking it non-collectable);
+/// there is no equivalent call here (`state.gc().fix_object` is a no-op —
+/// see its doc in state.rs). The message instead stays alive for the life
+/// of the process simply because `GlobalState::memerrmsg` holds a
+/// permanent strong reference to it.
 pub(crate) fn init(state: &mut LuaState) -> Result<(), LuaError> {
-    //    tablerehash(tb->hash, 0, MINSTRTABSIZE);
-    //    tb->size = MINSTRTABSIZE;
-    // macros.tsv: luaM_newvector → vec![T::default(); n]
-    // PORT NOTE: StringPool::new() sets the initial capacity to MIN_STR_TAB_SIZE,
-    // replacing both the allocation and the tablerehash clear pass.
+    // StringPool::new() sets the initial capacity to MIN_STR_TAB_SIZE,
+    // replacing both the C allocation and the tablerehash clear pass.
     state.global_mut().strt = StringPool::new();
 
-    // macros.tsv: luaS_newliteral → state.intern_str(b"...")
     let memerrmsg = new_lstr(state, MEMERR_MSG)?;
 
-    // macros.tsv: luaC_fix — not listed; it marks the object as fixed (non-collectable)
-    // TODO(port): call state.gc().fix(memerrmsg.clone()) when GC is wired in Phase D;
-    // in Phases A–C the Rc keeps it alive as long as GlobalState holds the clone
     let memerrmsg_lt = impl_to_lt(&memerrmsg);
     state.global_mut().memerrmsg = memerrmsg_lt.clone();
 
-    //      for (j = 0; j < STRCACHE_M; j++)
-    //        g->strcache[i][j] = g->memerrmsg;
     for i in 0..STRCACHE_N {
         for j in 0..STRCACHE_M {
             state.global_mut().strcache[i][j] = memerrmsg_lt.clone();
@@ -354,7 +286,6 @@ pub(crate) fn init(state: &mut LuaState) -> Result<(), LuaError> {
     Ok(())
 }
 
-// lstring.h: LUAI_FUNC → pub(crate)
 /// Create or retrieve a Lua string from `bytes`.
 ///
 /// If `bytes.len() <= MAX_SHORT_LEN` (40), the string is interned: an existing
@@ -363,22 +294,6 @@ pub(crate) fn init(state: &mut LuaState) -> Result<(), LuaError> {
 ///
 /// If `bytes.len() > MAX_SHORT_LEN`, a new long string is allocated each time
 /// (long strings are never interned).
-///
-/// # C source
-/// ```c
-///
-/// //   if (l <= LUAI_MAXSHORTLEN)  /* short string? */
-/// //     return internshrstr(L, str, l);
-/// //   else {
-/// //     TString *ts;
-/// //     if (l_unlikely(l * sizeof(char) >= (MAX_SIZE - sizeof(TString))))
-/// //       luaM_toobig(L);
-/// //     ts = luaS_createlngstrobj(L, l);
-/// //     memcpy(getlngstr(ts), str, l * sizeof(char));
-/// //     return ts;
-/// //   }
-/// // }
-/// ```
 pub(crate) fn new_lstr(
     state: &mut LuaState,
     bytes: &[u8],
@@ -386,17 +301,12 @@ pub(crate) fn new_lstr(
     if bytes.len() <= MAX_SHORT_LEN {
         intern_short_str(state, bytes)
     } else {
-        //        luaM_toobig(L);
-        // macros.tsv: luaM_toobig → return Err(LuaError::Memory)
-        // PORT NOTE: sizeof(TString) is a C-specific overhead; in Rust we just
-        // check that the byte count fits within MAX_SIZE.
+        // `sizeof(TString)` is a C-specific per-object overhead; here we
+        // just check that the byte count fits within MAX_SIZE.
         if bytes.len() >= MAX_SIZE {
             return Err(LuaError::Memory);
         }
 
-        //    memcpy(getlngstr(ts), str, l * sizeof(char));
-        // PORT NOTE: Rather than creating a zeroed buffer and then copying,
-        // we construct the LuaStringImpl directly from `bytes`.
         let seed = state.global().seed;
         let h = hash_bytes(bytes, seed);
         let ts = create_str_obj(state, bytes, StringKind::Long, h);
@@ -404,80 +314,44 @@ pub(crate) fn new_lstr(
     }
 }
 
-// lstring.h: LUAI_FUNC → pub(crate)
-
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 /// Allocate and initialise a new `LuaStringImpl` with the given bytes, kind, and hash.
 ///
 /// In C, `createstrobj` allocated uninitialised memory via `luaC_newobj` and set
-/// the header fields; the caller then filled the content via `memcpy`.  In Rust
-/// we construct the string directly from the provided `bytes`, eliminating the
-/// two-step pattern.
-///
-/// # C source
-/// ```c
-///
-/// //   TString *ts;
-/// //   GCObject *o;
-/// //   size_t totalsize = sizelstring(l);
-/// //   o = luaC_newobj(L, tag, totalsize);
-/// //   ts = gco2ts(o);
-/// //   ts->hash = h;
-/// //   ts->extra = 0;
-/// //   getstr(ts)[l] = '\0';  /* ending 0 */
-/// //   return ts;
-/// // }
-/// ```
-///
-/// PORT NOTE: `sizelstring(l)` computed the total allocation size including the
-/// nul terminator.  In Rust, `Rc<[u8]>` stores the bytes without a nul; the
-/// nul terminator is dropped.  Callers that need a nul-terminated `*const u8`
-/// for FFI must use a temporary `CString` or equivalent.
+/// the header fields; the caller then filled the content via `memcpy`. Here the
+/// string is constructed directly from the provided `bytes`, eliminating the
+/// two-step pattern. `Rc<[u8]>` stores the bytes without C's nul terminator;
+/// callers that need a nul-terminated `*const u8` for FFI must use a temporary
+/// `CString` or equivalent.
 fn create_str_obj(
     state: &mut LuaState,
     bytes: &[u8],
     kind: StringKind,
     hash: u32,
 ) -> GcRef<LuaStringImpl> {
-    // macros.tsv: luaM_newobject → state.gc().new_obj(tag, sz)
-    // TODO(port): register with GC tracking list (state.global_mut().allgc)
-    // in Phase D; Phase A–C creates a bare Rc
+    // Creates a bare Rc<...>, never registered with any GC tracking list;
+    // harmless in practice since every caller of this module keeps its
+    // result alive permanently anyway (see the module doc).
     let _ = state; // state needed for GC registration in Phase D
-                   // TODO(D-1c-bridge): LuaStringImpl is the rich local type; state helper produces lua_types::LuaString
     GcRef::new(LuaStringImpl {
         hash: Cell::new(hash),
         extra: Cell::new(0),
-        // PORT NOTE: we receive bytes directly; no separate memcpy step needed
         bytes: Rc::from(bytes),
         kind,
     })
 }
 
-/// Grow the string intern table, first attempting a GC collection if the table is
-/// at its absolute maximum size.
+/// Grow the string intern table.
 ///
-/// # C source
-/// ```c
-///
-/// //   if (l_unlikely(tb->nuse == MAX_INT)) {  /* too many strings? */
-/// //     luaC_fullgc(L, 1);  /* try to free some... */
-/// //     if (tb->nuse == MAX_INT)  /* still too many? */
-/// //       luaM_error(L);  /* cannot even create a message... */
-/// //   }
-/// //   if (tb->size <= MAXSTRTB / 2)  /* can grow string table? */
-/// //     luaS_resize(L, tb->size * 2);
-/// // }
-/// ```
+/// C first attempts a full GC collection (`luaC_fullgc`) when the table is
+/// at its absolute maximum size, in case that frees up some short strings;
+/// this does not, and goes straight to the OOM error. In practice `nuse`
+/// never approaches `i32::MAX` here, since this pool only ever holds the
+/// one bootstrap OOM message (see the module doc).
 fn grow_str_tab(state: &mut LuaState) -> Result<(), LuaError> {
-    // macros.tsv: MAX_INT → i32::MAX
     let nuse = state.global().strt.nuse;
     if nuse == i32::MAX as usize {
-        // macros.tsv: luaC_fullgc → state.gc().full_collect()
-        // TODO(port): state.gc().full_collect() — GC not yet wired in Phase A–C; no-op
-        // (When GC is live this call may reduce nuse by sweeping dead short strings.)
-
-        // macros.tsv: luaM_error → return Err(LuaError::Memory)
         if state.global().strt.nuse == i32::MAX as usize {
             return Err(LuaError::Memory);
         }
@@ -494,56 +368,20 @@ fn grow_str_tab(state: &mut LuaState) -> Result<(), LuaError> {
 /// Look up `bytes` in the intern table; create and insert a new short string if
 /// not found.
 ///
-/// The `isdead` / `changewhite` resurrection path is elided in Phases A–C because
-/// `Rc`-based reference counting keeps objects alive until all references drop
-/// (there are no dead-but-not-collected strings in Phase A–C).
-///
-/// # C source
-/// ```c
-///
-/// //   TString *ts;
-/// //   global_State *g = G(L);
-/// //   stringtable *tb = &g->strt;
-/// //   unsigned int h = luaS_hash(str, l, g->seed);
-/// //   TString **list = &tb->hash[lmod(h, tb->size)];
-/// //   lua_assert(str != NULL);
-/// //   for (ts = *list; ts != NULL; ts = ts->u.hnext) {
-/// //     if (l == ts->shrlen && (memcmp(str, getshrstr(ts), l) == 0)) {
-/// //       if (isdead(g, ts)) changewhite(ts);  /* resurrect it */
-/// //       return ts;
-/// //     }
-/// //   }
-/// //   if (tb->nuse >= tb->size) {
-/// //     growstrtab(L, tb);
-/// //     list = &tb->hash[lmod(h, tb->size)];
-/// //   }
-/// //   ts = createstrobj(L, l, LUA_VSHRSTR, h);
-/// //   ts->shrlen = cast_byte(l);
-/// //   memcpy(getshrstr(ts), str, l);
-/// //   ts->u.hnext = *list;
-/// //   *list = ts;
-/// //   tb->nuse++;
-/// //   return ts;
-/// // }
-/// ```
-///
-/// PORT NOTE: `lmod(h, tb->size)` (power-of-two bucket modulo via
-/// `macros.tsv: lmod → (s & (size - 1)) as usize`) and the `hnext` chain walk
-/// are both gone.  `HashMap::get` replaces the linear bucket scan.
+/// C's bucket lookup walks an intrusive `hnext` chain and, on a hit, checks
+/// `isdead`/`changewhite` to resurrect a dead-but-not-yet-swept entry.
+/// `HashMap::get` replaces the chain walk; the resurrection check has no
+/// equivalent because `LuaStringImpl` values are plain `Rc`-held and kept
+/// alive by reference count, not tracked by the collector (see the module
+/// doc), so there is no dead-but-not-collected state to resurrect from.
 fn intern_short_str(state: &mut LuaState, bytes: &[u8]) -> Result<GcRef<LuaStringImpl>, LuaError> {
-    // In Rust, &[u8] slices are never null; the assertion is trivially satisfied.
-
     let seed = state.global().seed;
     let h = hash_bytes(bytes, seed);
 
-    // PORT NOTE: intrusive hnext chain replaced by HashMap lookup
-    // Clone the existing GcRef<LuaStringImpl> so the immutable borrow on `state` ends
-    // before any mutable access below.
+    // Clone the existing GcRef<LuaStringImpl> so the immutable borrow on
+    // `state` ends before any mutable access below.
     let existing = state.global().strt.map.get(bytes).cloned();
     if let Some(ts) = existing {
-        // macros.tsv: isdead → g.is_dead(obj);  changewhite → obj.flip_white()
-        // PORT NOTE: GC color management deferred to Phase D; in Phases A–C all
-        // Rc-held objects are live by definition (Rc keeps them alive).
         return Ok(ts);
     }
 
@@ -555,8 +393,6 @@ fn intern_short_str(state: &mut LuaState, bytes: &[u8]) -> Result<GcRef<LuaStrin
         grow_str_tab(state)?;
     }
 
-    //    ts->shrlen = cast_byte(l);  — encoded in StringKind::Short
-    //    memcpy(getshrstr(ts), str, l);  — bytes passed directly to create_str_obj
     let ts = create_str_obj(state, bytes, StringKind::Short, h);
 
     state
@@ -569,14 +405,4 @@ fn intern_short_str(state: &mut LuaState, bytes: &[u8]) -> Result<GcRef<LuaStrin
     Ok(ts)
 }
 
-// ── Re-export marker for type defined here ────────────────────────────────────
-
-// TODO(port): LuaError is used in function signatures above but is not yet defined
-// in lua-types.  Phase B must add LuaError to lua-types/src/error.rs per
-// PORTING.md §6 before this file can compile.  The expected variants are:
-//   LuaError::Runtime(LuaValue)
-//   LuaError::Memory
-//   LuaError::Syntax(LuaValue)
-//   ... (full list in PORTING.md §6)
-// For now, reference LuaError as an opaque import from the future lua-types crate.
 use lua_types::LuaError;
