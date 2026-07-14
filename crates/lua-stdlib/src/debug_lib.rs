@@ -177,8 +177,16 @@ fn settabsb(state: &mut LuaState, k: &[u8], v: bool) -> Result<(), LuaError> {
 /// onto L1's stack, move it into the result table on L as field `fname`.
 ///
 /// When target is self, the value is already on our stack; rotate to bring
-/// it above the result table. When target is a different thread, use xmove.
+/// it above the result table.
 ///
+/// `target_is_self` is always `true` at every current call site: the real
+/// cross-thread case (target is a different, reachable thread) is handled by
+/// [`move_stack_option_from_target`] instead, which xmoves the value off the
+/// target's own stack. The `false` arm here is unreachable dead code kept
+/// only because a `target_is_self` caller could in principle exist; it must
+/// never be exercised by a genuine cross-thread borrow (that always goes
+/// through `move_stack_option_from_target`), so it pushes `Nil` rather than
+/// silently fabricating a value.
 fn treat_stack_option(
     state: &mut LuaState,
     target_is_self: bool,
@@ -187,10 +195,6 @@ fn treat_stack_option(
     if target_is_self {
         state.rotate(-2, 1)?;
     } else {
-        // Moving a value from another thread's stack (`lua_xmove`) needs a
-        // simultaneous `&mut LuaState` for both threads, which safe Rust
-        // cannot express without interior mutability, so this pushes Nil
-        // as a placeholder instead of the real cross-thread value.
         state.push(LuaValue::Nil);
     }
     state.set_field(-2, fname)
@@ -308,22 +312,42 @@ pub(crate) fn get_info(state: &mut LuaState) -> Result<usize, LuaError> {
         prefixed.extend_from_slice(&raw_opts);
         options = prefixed;
 
-        if target_is_self {
-            state.push_value_at(arg + 1)?;
-        } else {
-            // Moving the function value to another thread's stack (`lua_xmove`)
-            // needs a simultaneous `&mut LuaState` for both threads, which safe
-            // Rust cannot express; cross-thread getinfo with a function argument
-            // is incomplete — this branch is a no-op rather than pushing the value.
-        }
-
-        // With '>' prefix, get_debug_info consumes the function from the top of stack.
-        if state.get_debug_info(&options, &mut ar).is_err() {
-            return Err(lua_vm::debug::arg_error_impl(
-                state,
-                arg + 2,
-                b"invalid option",
-            ));
+        // With '>' prefix, get_debug_info consumes the function from the top of
+        // whichever stack it runs against — self or the cross-thread target — so
+        // the function value must be pushed there, not onto `state`, mirroring
+        // C's `lua_pushvalue(L, arg+1); lua_xmove(L, L1, 1)`.
+        match target_state {
+            DebugThreadTarget::Current | DebugThreadTarget::Unavailable => {
+                info_target_is_self = true;
+                state.push_value_at(arg + 1)?;
+                if state.get_debug_info(&options, &mut ar).is_err() {
+                    return Err(lua_vm::debug::arg_error_impl(
+                        state,
+                        arg + 2,
+                        b"invalid option",
+                    ));
+                }
+            }
+            DebugThreadTarget::Other(target_owner) => {
+                let func_val = state.value_at(arg + 1);
+                info_target_owner = Some(target_owner);
+                let mut target = crate::coro_lib::borrow_thread_rooted(
+                    state,
+                    info_target_owner
+                        .as_ref()
+                        .expect("target owner just stored"),
+                );
+                target.push(func_val);
+                if target.get_debug_info(&options, &mut ar).is_err() {
+                    return Err(lua_vm::debug::arg_error_impl(
+                        state,
+                        arg + 2,
+                        b"invalid option",
+                    ));
+                }
+                target.resnapshot();
+                info_target = Some(target);
+            }
         }
     } else {
         options = raw_opts;

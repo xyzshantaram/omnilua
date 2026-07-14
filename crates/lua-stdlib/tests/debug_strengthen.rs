@@ -311,3 +311,61 @@ fn gethook_with_no_hook_is_nil_all_versions() {
         assert_eq!(eval_str(v, probe), "nil", "gethook (no hook) diverged under {v:?}");
     }
 }
+
+// ── cross-thread getinfo (issue #277 item 2) ────────────────────────────────
+
+/// `debug.getinfo(co, level, ...)` from the main thread against a coroutine
+/// suspended (via `coroutine.yield`) inside a function: `currentline`/`what`/
+/// `namewhat` must describe `co`'s suspended frame, not the caller's. This
+/// path already worked (`DebugThreadTarget::Other` routes through
+/// `crate::coro_lib::borrow_thread_rooted`); pinned here as a regression lock
+/// alongside the function-argument form below, which did not.
+#[test]
+fn getinfo_level_on_suspended_coroutine_all_versions() {
+    let probe = "local co = coroutine.create(function()\n\
+                   local x = 42\n\
+                   coroutine.yield()\n\
+                   return x\n\
+                 end)\n\
+                 coroutine.resume(co)\n\
+                 local info = debug.getinfo(co, 1, 'nSl')\n\
+                 return tostring(info.currentline)..'|'..tostring(info.what)\n\
+                   ..'|'..tostring(info.namewhat)";
+    for v in ALL_VERSIONS {
+        assert_eq!(
+            eval_str(v, probe),
+            "3|Lua|",
+            "cross-thread getinfo(co, level, ...) diverged under {v:?}"
+        );
+    }
+}
+
+/// `debug.getinfo(co, function, ...)` — the function-argument form targeting a
+/// different, reachable thread. This used to panic (`get_info: function
+/// expected` in `lua-vm/src/debug.rs`): the cross-thread branch was a
+/// documented no-op that pushed nothing before `get_debug_info` ran (on the
+/// wrong thread besides), so `get_debug_info` found no function on top of the
+/// stack it read from. Fixed by pushing the function value onto the target
+/// thread's own stack (via `crate::coro_lib::borrow_thread_rooted`, the same
+/// pattern the level-based branch already used) and running `get_debug_info`
+/// there, mirroring C's `lua_pushvalue(L, arg+1); lua_xmove(L, L1, 1)`.
+#[test]
+fn getinfo_function_argument_cross_thread_on_suspended_coroutine_all_versions() {
+    let probe = "local function target(a, b)\n\
+                   return a + b\n\
+                 end\n\
+                 local co = coroutine.create(function()\n\
+                   coroutine.yield()\n\
+                 end)\n\
+                 coroutine.resume(co)\n\
+                 local info = debug.getinfo(co, target, 'nS')\n\
+                 return tostring(info.what)..'|'..tostring(info.name)\n\
+                   ..'|'..tostring(info.namewhat)";
+    for v in ALL_VERSIONS {
+        assert_eq!(
+            eval_str(v, probe),
+            "Lua|nil|",
+            "cross-thread getinfo(co, function, ...) diverged under {v:?}"
+        );
+    }
+}
