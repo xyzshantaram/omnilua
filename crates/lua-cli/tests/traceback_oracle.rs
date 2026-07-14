@@ -979,3 +979,64 @@ fn warn_subsystem_via_cli() {
         }
     }
 }
+
+/// Issue #277 item 1: `get_upval_name` (the port of `varinfo`/`getupvalname`)
+/// used to compute the real upvalue name via `upval_name` and then discard
+/// it, hardcoding the literal string `"upvalue"`. Separately, its match test
+/// compared only the numeric `StackIdx` of a candidate upvalue against the
+/// erroring register, ignoring which thread the upvalue is homed on.
+///
+/// Neither bug is reachable on its own within a single thread: an open
+/// upvalue of the running closure always refers to an ancestor frame *on the
+/// same stack*, so its index can never equal one of the current frame's own
+/// register indices. The only way to reach a match at all is a closure
+/// created on one thread that runs on another (e.g. a function capturing a
+/// main-thread local, invoked inside `coroutine.resume`) whose independent
+/// index space happens to coincide numerically with the upvalue's home-thread
+/// index.
+///
+/// Here `f`'s only upvalue `up` is open on the main thread; `f` runs inside a
+/// coroutine whose own local `x` happens to land on that same numeric
+/// `StackIdx`. Before the fix this misattributed `x` (a plain local) as
+/// `(upvalue 'upvalue')`; the reference — and the fixed port — say
+/// `(local 'x')`.
+#[test]
+fn cross_thread_upvalue_name_not_misattributed() {
+    const PROG: &str = "local up\n\
+        local co = coroutine.create(function()\n  \
+        local a,b,c,x = nil,nil,nil,nil\n  \
+        return up, x.y\n\
+        end)\n\
+        local ok, err = coroutine.resume(co)\n\
+        print(ok, err)\n";
+    for &v in &["5.1", "5.3", "5.4", "5.5"] {
+        let out = lua_rs()
+            .env("LUA_RS_VERSION", v)
+            .arg("-e")
+            .arg(PROG)
+            .output()
+            .expect("spawn lua-rs -e");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            stdout.contains("local 'x'"),
+            "[xthread-upval/{v}] expected `local 'x'`, got stdout `{stdout}`"
+        );
+        assert!(
+            !stdout.contains("upvalue"),
+            "[xthread-upval/{v}] must not misattribute as upvalue, got stdout `{stdout}`"
+        );
+
+        if let Some(refbin) = reference_binary(v) {
+            let rout = Command::new(&refbin)
+                .arg("-e")
+                .arg(PROG)
+                .output()
+                .expect("spawn reference");
+            assert_eq!(
+                String::from_utf8_lossy(&rout.stdout).trim_end(),
+                stdout.trim_end(),
+                "[xthread-upval/{v}] stdout must match reference"
+            );
+        }
+    }
+}
