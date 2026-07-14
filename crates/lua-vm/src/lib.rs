@@ -1,8 +1,6 @@
 //! Lua 5.4 virtual machine — runtime crate.
 //!
 //! Modules map to the canonical C source files per `ANALYSES/file_deps.txt`.
-//! Phase A populated each module with a faithful transliteration; Phase B is
-//! reconciling cross-module references against the `lua-types` foundation.
 
 pub mod api;
 pub mod debug;
@@ -21,11 +19,8 @@ pub mod undump;
 pub mod vm;
 pub mod zio;
 
-/// Glob-imported by every module so the Phase-B extension traits resolve
+/// Glob-imported by every module so the extension traits below resolve
 /// without each module having to list them individually.
-///
-/// TODO(phase-b): once the canonical types in `lua-types` grow these methods
-/// natively, this prelude can shrink to just the LuaState helpers.
 pub mod prelude {
     pub use crate::state::{
         LuaClosureExt, LuaLClosureRefExt, LuaProtoExt, LuaStringRefExt, LuaTableRefExt, LuaTypeExt,
