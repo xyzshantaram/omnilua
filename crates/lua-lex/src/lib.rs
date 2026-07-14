@@ -589,10 +589,26 @@ fn token2str_raw(token: i32, version: lua_types::LuaVersion) -> Vec<u8> {
 
 // ── Public init / setup ───────────────────────────────────────────────────────
 
-/// Initialise the lexer subsystem: intern all reserved words and fix them
-/// in the GC so they are never collected.
+/// Pre-intern `_ENV` and every reserved word.
 ///
-/// Must be called exactly once during VM startup.
+/// C's `luaX_init` is load-bearing for two reasons that don't apply to this
+/// port: it tags each reserved-word `TString` with an `extra` index so
+/// `read_name` in `llex.c` can recognize keywords in O(1) by pointer/field
+/// check, and it calls `luaC_fix` to pin those strings permanently so the
+/// tag survives for the process lifetime. This port's keyword recognition
+/// (see the reserved-word lookup in `next`, below) instead matches the
+/// freshly scanned byte slice directly against [`LUAX_TOKENS`], so it never
+/// depends on any string created here being the "same" object, tagged, or even
+/// still alive — a byte-identical re-intern after collection works exactly
+/// as well. And unlike `luaC_fix`, this function does not durably root
+/// anything: the returned `GcRef`s are dropped immediately, so any string
+/// it interns is just as collectible afterward as if `init` had never run.
+///
+/// So this function has no observable effect: every reserved word is
+/// re-interned anyway by [`new_string`] the first time it is actually
+/// scanned, and `_ENV` is re-interned by every [`set_input`] call. It has
+/// zero call sites and is safe to leave uncalled; despite its name, no VM
+/// startup path requires it.
 pub fn init(state: &mut LuaState) -> Result<(), LuaError> {
     let _e = intern_str_stub(state, LUA_ENV)?;
 

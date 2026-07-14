@@ -5802,14 +5802,17 @@ fn init_registry(state: &mut LuaState) -> Result<(), LuaError> {
     Ok(())
 }
 
+/// Does not call `lua_lex::init`: that function pre-interns the reserved
+/// words, mirroring C's `luaX_init`, but this port's keyword recognition
+/// matches scanned bytes directly against `LUAX_TOKENS` rather than relying
+/// on identity/tagging of a pre-created string (see `lua_lex::init`'s doc),
+/// and every reserved word is re-interned anyway the first time it is
+/// scanned. The call is unnecessary, not missing.
 fn lua_open(state: &mut LuaState) -> Result<(), LuaError> {
     stack_init(state);
     init_registry(state)?;
     crate::string::init(state)?;
     crate::tagmethods::init(state)?;
-    // `lua_lex::init` interns and fixes the reserved-word strings against GC
-    // collection and documents itself as required at VM startup, but no call
-    // site in this crate invokes it.
     state.global_mut().gcstp = 0;
     state.global().heap.unpause();
     // Setting nilvalue = Nil signals completestate() → is_complete() = true.
