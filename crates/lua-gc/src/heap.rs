@@ -1943,7 +1943,20 @@ impl Heap {
     /// quarantine mode the box is poisoned and parked instead of freed, so
     /// later use-after-sweep dereferences hit intact memory and the
     /// `HDR_FREED` debug asserts instead of undefined behavior.
+    ///
+    /// A gray-listed box is dropped from grayagain here, before its header is
+    /// freed (or, under quarantine, before it is parked with `HDR_FREED`): this
+    /// is the one place a box actually leaves the heap, so it is the single
+    /// point that enforces "a freed/parked box never lingers in grayagain"
+    /// (issue #263). Cross-list moves do NOT free and so no longer touch
+    /// grayagain — an object moved off `allgc` keeps its revisit obligation, as
+    /// in C where the gray `gclist` link is orthogonal to the owner chain. The
+    /// teardown drain (`drop_all`) clears grayagain wholesale up front and frees
+    /// via `drop_list`, so it does not rely on this path.
     fn release_box(&self, ptr: NonNull<GcBox<dyn Trace>>) {
+        if self.header_from_ptr(ptr).gray_listed() {
+            self.unlink_grayagain(ptr);
+        }
         if self.quarantine {
             let header = self.header_from_ptr(ptr);
             header.set_flag(HDR_FREED, true);
@@ -1983,6 +1996,17 @@ impl Heap {
         self.clear_grayagain();
     }
 
+    /// Advance every generational cursor that points at `removed` to `next`
+    /// when `removed` leaves its owner list. This is the analog of C's
+    /// `correctpointers` (`lgc.c`): it fixes only the list-position cursors and
+    /// deliberately does NOT touch gray-list membership. In upstream Lua the
+    /// gray link is a separate `gclist` field, so a cross-list move
+    /// (`luaC_checkfinalizer`, `udata2finalize`) leaves an object's grayagain
+    /// membership intact; membership is reconciled during collection by
+    /// `correctgraylist` and dropped for real only when the box is freed.
+    /// Grayagain removal therefore belongs to the free/park path (`release_box`)
+    /// — see issue #263: deleting the entry here freed reachable young children
+    /// whose only revisit root was a transitional object being moved.
     fn correct_generation_pointers(
         &self,
         removed: NonNull<GcBox<dyn Trace>>,
@@ -2008,9 +2032,6 @@ impl Heap {
         }
         if self.finobjrold.get() == Some(removed) {
             self.finobjrold.set(next);
-        }
-        if self.header_from_ptr(removed).gray_listed() {
-            self.unlink_grayagain(removed);
         }
     }
 
@@ -2182,10 +2203,11 @@ impl Heap {
     }
 
     /// Remove `removed` from the grayagain set and clear its flag. Called from
-    /// `correct_generation_pointers` whenever a gray-listed object is unlinked
-    /// from an owner list (full-sweep free, young-sweep free, or a cross-list
-    /// move). Order-preserving `retain`; the borrow is dropped before the box
-    /// can be freed.
+    /// `release_box` when a gray-listed box is freed (full-sweep or young-sweep)
+    /// or parked under quarantine — the only situations where a grayagain entry
+    /// must not outlive its box. Cross-list moves do NOT call this: a moved
+    /// object keeps its revisit obligation (issue #263). Order-preserving
+    /// `retain`; the borrow is dropped before the box can be freed.
     fn unlink_grayagain(&self, removed: NonNull<GcBox<dyn Trace>>) {
         self.header_from_ptr(removed).set_gray_listed(false);
         self.grayagain
@@ -3963,15 +3985,17 @@ mod tests {
         assert_eq!(heap.last_sweep_stats().freed, 1);
     }
 
-    /// W1 deletion invariant (test matrix G3, list-mechanics half): a
-    /// cross-list move of a gray-listed object deletes its grayagain entry and
-    /// clears `HDR_GRAY_LISTED`, via `unlink_from_list` ->
-    /// `correct_generation_pointers` -> `unlink_grayagain`. Covers both the
-    /// `allgc -> finobj` and `tobefnz -> allgc` transitions, and every move
-    /// returns `true` (R1 item 7 sync note). Deterministic; identical on
-    /// pristine and W1 code.
+    /// Issue #263 list-mechanics invariant (inverts the former W1
+    /// `cross_list_move_deletes_grayagain_entry` pin): a cross-list move of a
+    /// gray-listed object PRESERVES its grayagain entry and keeps
+    /// `HDR_GRAY_LISTED` set. `unlink_from_list -> correct_generation_pointers`
+    /// no longer touches gray-list membership — matching C, where the gray
+    /// `gclist` link is orthogonal to the owner chain and neither
+    /// `luaC_checkfinalizer` (allgc->finobj) nor `udata2finalize`
+    /// (tobefnz->allgc) removes the object from `grayagain`. Covers both
+    /// transitions, and every move still returns `true`. Deterministic.
     #[test]
-    fn cross_list_move_deletes_grayagain_entry() {
+    fn cross_list_move_preserves_grayagain_entry() {
         let heap = Heap::new();
         heap.unpause();
         let obj = heap.allocate(Cell0 {
@@ -3986,10 +4010,10 @@ mod tests {
         assert!(heap.move_allgc_to_finobj(obj.as_trace_ptr()));
         assert_eq!(
             heap.grayagain_count(),
-            0,
-            "allgc->finobj move deletes the grayagain entry"
+            1,
+            "── issue #263: allgc->finobj move preserves the grayagain entry"
         );
-        assert!(!heap.header_from_ptr(obj.as_trace_ptr()).gray_listed());
+        assert!(heap.header_from_ptr(obj.as_trace_ptr()).gray_listed());
 
         let heap = Heap::new();
         heap.unpause();
@@ -4006,38 +4030,34 @@ mod tests {
         assert!(heap.move_tobefnz_to_allgc(obj.as_trace_ptr()));
         assert_eq!(
             heap.grayagain_count(),
-            0,
-            "tobefnz->allgc move deletes the grayagain entry"
+            1,
+            "── issue #263: tobefnz->allgc move preserves the grayagain entry"
         );
-        assert!(!heap.header_from_ptr(obj.as_trace_ptr()).gray_listed());
+        assert!(heap.header_from_ptr(obj.as_trace_ptr()).gray_listed());
     }
 
-    /// Test matrix G3 (graph-shaped, baseline-first). Root -> exact-`Old`
-    /// parent (skipped by `Marker::should_trace_age` in a minor) -> a
-    /// gray-listed `Old1` transitional object -> a `New` young child. Moving
-    /// the transitional off `allgc` deletes its grayagain entry (the only
-    /// revisit rooting the child), then a minor runs. This is a pure
-    /// generational-liveness property of *today's* collector that W1 inherits
-    /// unchanged — `correct_generation_pointers`' deletion, `should_trace_age`,
-    /// and the minor mark/sweep are all untouched by W1.
+    /// Test matrix G3 (graph-shaped) — the acceptance test for issue #263.
+    /// Root -> exact-`Old` parent (skipped by `Marker::should_trace_age` in a
+    /// minor) -> a gray-listed `Old1` transitional object -> a `New` young
+    /// child. The transitional is moved off `allgc` (the `setmetatable`-with-
+    /// `__gc` path, `move_allgc_to_finobj`), then a minor runs.
     ///
-    /// BASELINE (recorded against pristine origin/main, via a throwaway
-    /// worktree, 2026-07-13): the young child is FREED by the minor
-    /// (`allgc_count` 3 -> 2). With the transitional's grayagain entry deleted
-    /// by the move and the parent exact-`Old` (so the minor marker never
-    /// descends into it), nothing re-marks the transitional and its `New`
-    /// child is swept. This is the "reachable young child dying" case the spec
-    /// anticipates (§"Every owner-list move"): a pre-existing latent hole in
-    /// the generational collector, filed as issue #263, NOT a W1 regression and
-    /// NOT something W1 fixes. W1 reproduces the baseline exactly. The test is
-    /// `#[ignore]`d because it asserts the *correct* invariant (child should
-    /// survive), which the pre-existing baseline violates; running it
-    /// (`cargo test -p lua-gc -- --ignored g3_`) documents the live gap. This
-    /// test is the acceptance test for the #263 fix — un-`#[ignore]` it then.
+    /// C-faithful contract: the move must PRESERVE the transitional's grayagain
+    /// membership. In upstream Lua the gray link is a separate `gclist` field,
+    /// so `luaC_checkfinalizer`'s allgc->finobj move (`lgc.c`) touches only the
+    /// owner chain and the generational cursors (`correctpointers`) and leaves
+    /// the object on `grayagain`; membership is reconciled only during
+    /// collection (`correctgraylist`) or dropped when the box is freed. Because
+    /// the parent is exact-`Old` (never descended in a minor), that surviving
+    /// grayagain entry is the ONLY path by which the next minor re-marks the
+    /// transitional and reaches its young child.
+    ///
+    /// Pre-fix (pristine origin/main) the move deleted the entry as a side
+    /// effect of `unlink_from_list -> correct_generation_pointers`, so the minor
+    /// had no path to the child and swept the reachable object
+    /// (`allgc_count` 3 -> 2). With #263 fixed the grayagain entry survives the
+    /// move and the child lives (`allgc_count` stays 3).
     #[test]
-    #[ignore = "pre-existing generational-liveness gap (issue #263): reachable \
-                young child dies when a gray-listed transitional is moved \
-                cross-list; identical on pristine and W1 — not a W1 bug"]
     fn g3_moved_transitional_keeps_young_child_reachable() {
         let heap = Heap::new();
         heap.unpause();
@@ -4064,8 +4084,8 @@ mod tests {
         assert!(heap.move_allgc_to_finobj(transitional.as_trace_ptr()));
         assert_eq!(
             heap.grayagain_count(),
-            0,
-            "cross-list move deletes the grayagain entry"
+            1,
+            "── issue #263: cross-list move preserves the grayagain entry"
         );
 
         heap.minor_collect_with_post_mark(&OneRoot(Some(parent)), |_| {});
@@ -4073,18 +4093,36 @@ mod tests {
         assert_eq!(
             heap.allgc_count(),
             3,
-            "reachable young child should survive the minor"
+            "reachable young child survives the minor because the moved \
+             transitional kept its grayagain revisit entry"
         );
     }
 
-    /// Baseline-preservation pin for the #263 scenario (codex W1 review,
-    /// finding 1): the SAME graph as `g3_moved_transitional_keeps_young_child_
-    /// reachable`, but asserting what the collector does TODAY — the
-    /// reachable young child is freed. Runs in normal CI so any W1-era
-    /// divergence in this scenario is caught immediately. When #263 is fixed,
-    /// this test must be inverted/removed together with un-ignoring G3.
+    /// Issue #263, `move_tobefnz_to_allgc` variant of the G3 acceptance test.
+    /// Same graph as `g3_moved_transitional_keeps_young_child_reachable`, but
+    /// the transitional travels allgc -> finobj -> tobefnz, is remembered for
+    /// revisit there, and is moved BACK to allgc (the `udata2finalize` return
+    /// path). That move must PRESERVE its grayagain entry, so the following
+    /// minor re-marks the transitional and its reachable young child survives.
+    ///
+    /// Pre-fix this move deleted the entry and the minor freed the child
+    /// (`allgc_count` 3 -> 2); with #263 fixed the entry survives and the child
+    /// lives (count stays 3). This keeps the tobefnz->allgc transition covered
+    /// by a non-ignored liveness test alongside the allgc->finobj acceptance
+    /// test above (the redundant allgc->finobj baseline pin was removed with
+    /// the fix).
+    /// Issue #263, codex-review variant: membership must survive the
+    /// `finobj -> tobefnz` move itself, and `sweep_young` must reconcile the
+    /// entry correctly while the object REMAINS on tobefnz across minors —
+    /// the other two G3 tests move the object back to allgc before
+    /// collecting, so neither proves this half. A `Touched1` transitional is
+    /// remembered while on finobj, moved to tobefnz, and left there for two
+    /// minors: the reachable young child ages New -> Survival -> Old1, the
+    /// transitional ages Touched1 -> Touched2 -> Old (C's correctgraylist
+    /// progression), and the grayagain entry persists exactly until the
+    /// transitional reaches Old (count 1 -> 1 -> 0).
     #[test]
-    fn g3_baseline_child_freed_after_move_allgc_to_finobj() {
+    fn g3_transitional_remaining_on_tobefnz_reconciles_across_minors() {
         let heap = Heap::new();
         heap.unpause();
         let child = heap.allocate(Cell0 {
@@ -4101,32 +4139,62 @@ mod tests {
         });
         parent.set_age(GcAge::Old);
         parent.set_color(Color::Black);
-        transitional.set_age(GcAge::Old1);
-        transitional.set_color(Color::Gray);
-        heap.remember_minor_revisit(transitional.as_trace_ptr());
+        transitional.set_age(GcAge::Touched1);
+        transitional.set_color(Color::Black);
 
         assert!(heap.move_allgc_to_finobj(transitional.as_trace_ptr()));
-        assert_eq!(heap.grayagain_count(), 0);
+        heap.remember_minor_revisit(transitional.as_trace_ptr());
+        assert_eq!(heap.grayagain_count(), 1);
+
+        assert!(heap.move_finobj_to_tobefnz(transitional.as_trace_ptr()));
+        assert_eq!(
+            heap.grayagain_count(),
+            1,
+            "── issue #263: finobj->tobefnz move preserves the grayagain entry"
+        );
+        assert!(heap
+            .header_from_ptr(transitional.as_trace_ptr())
+            .gray_listed());
 
         heap.minor_collect_with_post_mark(&OneRoot(Some(parent)), |_| {});
-
+        assert_eq!(child.age(), GcAge::Survival, "child New -> Survival");
         assert_eq!(
-            heap.allgc_count(),
-            2,
-            "baseline (pre-#263-fix): the young child is freed; if this \
-             changes, either #263 was fixed (invert this test and un-ignore \
-             G3) or minor liveness regressed"
+            transitional.age(),
+            GcAge::Touched2,
+            "transitional Touched1 -> Touched2 while on tobefnz"
         );
+        assert_eq!(heap.grayagain_count(), 1, "still tracked");
+        assert_eq!(heap.allgc_count(), 3, "child reachable after minor 1");
+
+        heap.minor_collect_with_post_mark(&OneRoot(Some(parent)), |_| {});
+        assert_eq!(child.age(), GcAge::Old1, "child Survival -> Old1");
+        assert_eq!(
+            transitional.age(),
+            GcAge::Old,
+            "transitional Touched2 -> Old while on tobefnz"
+        );
+        assert_eq!(
+            heap.grayagain_count(),
+            1,
+            "transitional retires at Old, but the child it kept young is now \
+             itself an Old1 tracked survivor — the obligation follows the \
+             live subgraph, not just the finalizable object"
+        );
+        assert_eq!(heap.allgc_count(), 3, "child reachable after minor 2");
+
+        heap.minor_collect_with_post_mark(&OneRoot(Some(parent)), |_| {});
+        assert_eq!(child.age(), GcAge::Old, "child Old1 -> Old");
+        assert_eq!(
+            heap.grayagain_count(),
+            0,
+            "once the whole subgraph reaches Old the revisit obligation is \
+             fully retired (C correctgraylist)"
+        );
+        assert_eq!(heap.allgc_count(), 3, "child reachable throughout — the #263 guarantee");
     }
 
-    /// Baseline-preservation pin, `move_tobefnz_to_allgc` variant (codex W1
-    /// review, finding 1): the transitional travels allgc -> finobj ->
-    /// tobefnz, is re-remembered for revisit there, and the move BACK to
-    /// allgc deletes the entry; the following minor frees the reachable
-    /// young child, same as the finobj variant. Invert together with the
-    /// #263 fix.
     #[test]
-    fn g3_baseline_child_freed_after_move_tobefnz_to_allgc() {
+    fn g3_moved_transitional_via_tobefnz_keeps_young_child_reachable() {
         let heap = Heap::new();
         heap.unpause();
         let child = heap.allocate(Cell0 {
@@ -4154,18 +4222,17 @@ mod tests {
         assert!(heap.move_tobefnz_to_allgc(transitional.as_trace_ptr()));
         assert_eq!(
             heap.grayagain_count(),
-            0,
-            "tobefnz->allgc move deletes the grayagain entry"
+            1,
+            "── issue #263: tobefnz->allgc move preserves the grayagain entry"
         );
 
         heap.minor_collect_with_post_mark(&OneRoot(Some(parent)), |_| {});
 
         assert_eq!(
             heap.allgc_count(),
-            2,
-            "baseline (pre-#263-fix): the young child is freed after the \
-             tobefnz->allgc move deletes the revisit entry; invert together \
-             with the #263 fix"
+            3,
+            "reachable young child survives the minor because the tobefnz->allgc \
+             move kept the transitional's grayagain revisit entry"
         );
     }
 
