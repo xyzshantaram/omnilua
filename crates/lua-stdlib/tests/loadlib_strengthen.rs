@@ -30,7 +30,7 @@
 //! `omnilua` is a dev-dependency (it depends on `lua-stdlib`, so it can only be
 //! a dev-dep — see `Cargo.toml`).
 
-use omnilua::{Lua, LuaVersion, Value};
+use omnilua::{HostHooks, Lua, LuaVersion, Value};
 
 const ALL: [LuaVersion; 5] = [
     LuaVersion::V51,
@@ -78,6 +78,68 @@ fn assert_true(version: LuaVersion, code: &str) {
     match eval_value(version, code) {
         Value::Boolean(true) => {}
         other => panic!("`{code}` under {version:?} returned {other:?}, expected true"),
+    }
+}
+
+fn versioned_package_env(name: &[u8]) -> Option<Vec<u8>> {
+    match name {
+        b"LUA_PATH_5_1" => Some(b"path-5.1".to_vec()),
+        b"LUA_CPATH_5_1" => Some(b"cpath-5.1".to_vec()),
+        b"LUA_PATH_5_4" => Some(b"path-5.4".to_vec()),
+        b"LUA_CPATH_5_4" => Some(b"cpath-5.4".to_vec()),
+        b"LUA_PATH_5_5" => Some(b"path-5.5".to_vec()),
+        b"LUA_CPATH_5_5" => Some(b"cpath-5.5".to_vec()),
+        _ => None,
+    }
+}
+
+fn empty_env(_name: &[u8]) -> Option<Vec<u8>> {
+    None
+}
+
+#[test]
+fn package_paths_use_the_active_version_env_suffix() {
+    for (version, expected) in [
+        (LuaVersion::V51, "path-5.1,cpath-5.1"),
+        (LuaVersion::V54, "path-5.4,cpath-5.4"),
+        (LuaVersion::V55, "path-5.5,cpath-5.5"),
+    ] {
+        let hooks = HostHooks::new().env(versioned_package_env);
+        let lua = Lua::with_hooks_versioned(hooks, version).expect("versioned runtime");
+        let value = lua
+            .load("return package.path .. ',' .. package.cpath")
+            .eval::<Value>()
+            .expect("package paths");
+        let Value::String(value) = value else {
+            panic!("package paths under {version:?} were not a string");
+        };
+        assert_eq!(
+            value.to_str().expect("UTF-8 package paths"),
+            expected,
+            "{version:?}"
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn default_package_paths_use_the_active_version_directory() {
+    for (version, directory) in [
+        (LuaVersion::V51, "/lua/5.1/"),
+        (LuaVersion::V54, "/lua/5.4/"),
+        (LuaVersion::V55, "/lua/5.5/"),
+    ] {
+        let hooks = HostHooks::new().env(empty_env);
+        let lua = Lua::with_hooks_versioned(hooks, version).expect("versioned runtime");
+        let value = lua
+            .load("return package.path .. ';' .. package.cpath")
+            .eval::<Value>()
+            .expect("package paths");
+        let Value::String(value) = value else {
+            panic!("package paths under {version:?} were not a string");
+        };
+        let value = value.to_str().expect("UTF-8 package paths");
+        assert!(value.contains(directory), "{version:?}: {value}");
     }
 }
 

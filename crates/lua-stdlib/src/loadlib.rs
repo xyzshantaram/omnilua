@@ -82,17 +82,60 @@ const LUA_CPATH_VAR: &[u8] = b"LUA_CPATH";
 // Matches C-Lua's luaconf.h defaults exactly: LUA_LDIR entries first, then
 // LUA_CDIR entries, then the local ./? fallback last.
 #[cfg(not(target_os = "windows"))]
-const LUA_PATH_DEFAULT: &[u8] = b"/usr/local/share/lua/5.4/?.lua;/usr/local/share/lua/5.4/?/init.lua;/usr/local/lib/lua/5.4/?.lua;/usr/local/lib/lua/5.4/?/init.lua;./?.lua;./?/init.lua";
+fn lua_path_default(version: lua_types::LuaVersion) -> Vec<u8> {
+    let version = lua_version_dir(version);
+    let mut path = b"/usr/local/share/lua/".to_vec();
+    path.extend_from_slice(version);
+    path.extend_from_slice(b"/?.lua;/usr/local/share/lua/");
+    path.extend_from_slice(version);
+    path.extend_from_slice(b"/?/init.lua;/usr/local/lib/lua/");
+    path.extend_from_slice(version);
+    path.extend_from_slice(b"/?.lua;/usr/local/lib/lua/");
+    path.extend_from_slice(version);
+    path.extend_from_slice(b"/?/init.lua;./?.lua;./?/init.lua");
+    path
+}
 #[cfg(target_os = "windows")]
-const LUA_PATH_DEFAULT: &[u8] = b"./?.lua;./?/init.lua";
+fn lua_path_default(_version: lua_types::LuaVersion) -> Vec<u8> {
+    b"./?.lua;./?/init.lua".to_vec()
+}
 
 #[cfg(not(target_os = "windows"))]
-const LUA_CPATH_DEFAULT: &[u8] =
-    b"/usr/local/lib/lua/5.4/?.so;/usr/local/lib/lua/5.4/loadall.so;./?.so";
+fn lua_cpath_default(version: lua_types::LuaVersion) -> Vec<u8> {
+    let version = lua_version_dir(version);
+    let mut path = b"/usr/local/lib/lua/".to_vec();
+    path.extend_from_slice(version);
+    path.extend_from_slice(b"/?.so;/usr/local/lib/lua/");
+    path.extend_from_slice(version);
+    path.extend_from_slice(b"/loadall.so;./?.so");
+    path
+}
 #[cfg(target_os = "windows")]
-const LUA_CPATH_DEFAULT: &[u8] = b"./?.dll";
+fn lua_cpath_default(_version: lua_types::LuaVersion) -> Vec<u8> {
+    b"./?.dll".to_vec()
+}
 
-const LUA_VERSUFFIX: &[u8] = b"_5_4";
+fn lua_version_dir(version: lua_types::LuaVersion) -> &'static [u8] {
+    match version {
+        lua_types::LuaVersion::V51 => b"5.1",
+        lua_types::LuaVersion::V52 => b"5.2",
+        lua_types::LuaVersion::V53 => b"5.3",
+        lua_types::LuaVersion::V54 => b"5.4",
+        lua_types::LuaVersion::V55 => b"5.5",
+        _ => b"5.4",
+    }
+}
+
+fn lua_version_suffix(version: lua_types::LuaVersion) -> &'static [u8] {
+    match version {
+        lua_types::LuaVersion::V51 => b"_5_1",
+        lua_types::LuaVersion::V52 => b"_5_2",
+        lua_types::LuaVersion::V53 => b"_5_3",
+        lua_types::LuaVersion::V54 => b"_5_4",
+        lua_types::LuaVersion::V55 => b"_5_5",
+        _ => b"_5_4",
+    }
+}
 
 /// Build the `package.config` string for `version`.
 ///
@@ -369,7 +412,7 @@ fn setpath(
     dft: &[u8],
 ) -> Result<(), LuaError> {
     let mut nver = envname.to_vec();
-    nver.extend_from_slice(LUA_VERSUFFIX);
+    nver.extend_from_slice(lua_version_suffix(state.global().lua_version));
 
     let path_opt = if noenv(state) {
         None
@@ -1281,9 +1324,12 @@ pub fn luaopen_package(state: &mut LuaState) -> Result<usize, LuaError> {
 
     createsearcherstable(state)?;
 
-    setpath(state, b"path", LUA_PATH_VAR, LUA_PATH_DEFAULT)?;
+    let version = state.global().lua_version;
+    let path_default = lua_path_default(version);
+    setpath(state, b"path", LUA_PATH_VAR, &path_default)?;
 
-    setpath(state, b"cpath", LUA_CPATH_VAR, LUA_CPATH_DEFAULT)?;
+    let cpath_default = lua_cpath_default(version);
+    setpath(state, b"cpath", LUA_CPATH_VAR, &cpath_default)?;
 
     let config = package_config(state.global().lua_version);
     let config_s = state.intern_str(&config)?;
