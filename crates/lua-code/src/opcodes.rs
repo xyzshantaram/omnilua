@@ -1,11 +1,9 @@
 //! Opcode definitions and instruction encoding/decoding for the Lua 5.4 VM.
 //!
-//! Ports `src/lopcodes.c` (the `luaP_opmodes` table) and `src/lopcodes.h`
-//! (the `OpCode`/`OpMode` enums, field-size constants, and instruction
-//! accessor macros). Per PORTING.md §1, headers merge into their consuming
-//! `.rs`.
-//!
-//! C source preserved inline as `
+//! C source: `reference/lua-5.4.7/src/lopcodes.c` (the `luaP_opmodes` table)
+//! and `reference/lua-5.4.7/src/lopcodes.h` (the `OpCode`/`OpMode` enums,
+//! field-size constants, and instruction accessor macros — the header
+//! merges into this file, per PORTING.md §1).
 
 // ─── Instruction format diagram ──────────────────────────────────────────────
 //
@@ -111,10 +109,6 @@ const M_AX: u8 = OpMode::Ax as u8;
 const M_SJ: u8 = OpMode::SJ as u8;
 
 // ─── OP_MODES table ───────────────────────────────────────────────────────────
-//
-//
-// Per macros.tsv: LUAI_DDEF → drop (definition site, no modifier needed in Rust).
-// Per macros.tsv: LUAI_DDEC → `pub(crate) static` at the declaration site.
 
 /// Opcode properties table, indexed by `OpCode as usize`.
 ///
@@ -222,7 +216,7 @@ pub fn get_op_mode(op: OpCode) -> OpMode {
         2 => OpMode::AsBx,
         3 => OpMode::Ax,
         4 => OpMode::SJ,
-        // PERF(port): unreachable branch — values 5-7 are unused; profile in Phase B
+        // Values 5-7 are unused by any opcode; this arm is unreachable in practice.
         _ => OpMode::Abc,
     }
 }
@@ -264,8 +258,8 @@ pub fn test_mm_mode(op: OpCode) -> bool {
 
 // ─── Instruction newtype ──────────────────────────────────────────────────────
 //
-// Per types.tsv: `Instruction` is a `u32` newtype; bytecode word.
-// All accessor/builder macros from lopcodes.h become methods here.
+// A single bytecode word; accessor/builder logic corresponding to
+// `lopcodes.h`'s macros lives as methods below.
 
 /// A single Lua bytecode instruction (unsigned 32-bit word).
 ///

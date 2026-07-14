@@ -1,18 +1,15 @@
 //! Opcode name table for debug/disassembly output.
 //!
-//! Direct port of `src/lopnames.h` from Lua 5.4.7. Order must match the
-//! `OpCode` enum (`src/lopcodes.h`); `ORDER OP` invariant.
-//!
-//! The C source is preserved inline as `
-//! review.
+//! Order must match the `OpCode` enum (`lopcodes.h` in the reference C
+//! source): the `ORDER OP` invariant.
 
 //
-// PORT NOTE: dropped the trailing NULL sentinel. Length is `OP_COUNT` known
-// at compile time; Rust slice + bounds-check serves the role of the
-// sentinel.
+// Drops the trailing NULL sentinel C uses to mark the end of the array:
+// length is `OP_COUNT`, known at compile time, and a Rust slice with
+// bounds-checking serves the same role.
 
 /// Total number of opcodes. Must equal `OpCode::Count as usize` once the
-/// enum lands; trailer-required hook checks this constant exists.
+/// enum lands.
 pub const OP_COUNT: usize = 86;
 
 /// Opcode names, indexed by `OpCode as usize`. ORDER OP — must match the
