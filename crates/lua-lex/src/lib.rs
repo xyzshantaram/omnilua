@@ -604,9 +604,13 @@ fn token2str_raw(token: i32, version: lua_types::LuaVersion) -> Vec<u8> {
 /// anything: the returned `GcRef`s are dropped immediately, so any string
 /// it interns is just as collectible afterward as if `init` had never run.
 ///
-/// So this function has no observable effect: every reserved word is
-/// re-interned anyway by [`new_string`] the first time it is actually
-/// scanned, and `_ENV` is re-interned by every [`set_input`] call. It has
+/// So this function has no observable lexical/parse effect and no startup
+/// correctness dependency: every reserved word is re-interned anyway by
+/// [`new_string`] the first time it is actually scanned, and `_ENV` is
+/// re-interned by every [`set_input`] call. (It is not literally side-effect
+/// free — it allocates the interned strings, charges the GC, and sets
+/// `gc_check_needed` like any other interning — but nothing about lexing,
+/// parsing, or VM startup depends on those effects having happened.) It has
 /// zero call sites and is safe to leave uncalled; despite its name, no VM
 /// startup path requires it.
 pub fn init(state: &mut LuaState) -> Result<(), LuaError> {

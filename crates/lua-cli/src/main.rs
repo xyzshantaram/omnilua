@@ -1525,7 +1525,7 @@ fn main() -> ExitCode {
             }
             state.global_mut().lua_version = lv;
         }
-        lua_vm::state::set_mainthread_registry_slot(&mut state)
+        lua_vm::state::set_versioned_registry_slots(&mut state)
             .map_err(|e| format!("failed to initialize registry: {e:?}"))?;
         state.global_mut().parser_hook = Some(parser_hook);
         state.global_mut().file_loader_hook = Some(file_loader_hook);
