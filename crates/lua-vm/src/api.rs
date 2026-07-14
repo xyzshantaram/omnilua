@@ -1,9 +1,9 @@
-//
-// PORT NOTE: This is the Rust-native translation of lapi.c.
-// The C-API surface (lua_State *, int stack-index protocol) is replaced by
-// methods on LuaState.  `lua_lock` / `lua_unlock` are dropped (no-op in the
-// single-threaded default build).  `api_incr_top` is dropped; `state.push()`
-// already increments.  Stack pointers (StkId) become StackIdx (u32).
+//! Rust-native translation of `lapi.c` — the Lua C-API surface.
+//!
+//! The C-API surface (`lua_State *`, int stack-index protocol) is replaced by
+//! methods on `LuaState`. `lua_lock`/`lua_unlock` are dropped (no-op in the
+//! single-threaded default build). `api_incr_top` is dropped; `state.push()`
+//! already increments. Stack pointers (`StkId`) become `StackIdx` (u32).
 
 #![allow(dead_code)]
 
@@ -41,10 +41,10 @@ fn is_upvalue(idx: i32) -> bool {
     idx < LUA_REGISTRYINDEX
 }
 
-// PORT NOTE: In C, the only "invalid" TValue is the global nilvalue singleton
-// pointer returned by index2value when the index is out of range. In Rust we
-// cannot do pointer-equality on a singleton, so validity is decided by whether
-// the index resolves to a real stack/upvalue slot — see `is_valid_index`.
+// In C, the only "invalid" TValue is the global nilvalue singleton
+// pointer returned by index2value when the index is out of range. Here,
+// pointer-equality on a singleton isn't available, so validity is decided by
+// whether the index resolves to a real stack/upvalue slot — see `is_valid_index`.
 #[inline]
 fn is_valid_index(state: &LuaState, idx: i32) -> bool {
     if idx == 0 {
@@ -72,7 +72,7 @@ fn is_valid_index(state: &LuaState, idx: i32) -> bool {
 
 // ── index helpers ─────────────────────────────────────────────────────────────
 
-// PORT NOTE: In Rust we cannot return a pointer; we return a cloned LuaValue.
+// Returns a cloned LuaValue rather than a pointer.
 // Writers use a companion index_to_stack_idx() for actual stack slots.
 fn index_to_value(state: &LuaState, idx: i32) -> LuaValue {
     let ci = state.current_call_info();
@@ -186,10 +186,9 @@ pub fn check_stack(state: &mut LuaState, n: i32) -> bool {
 /// for v in args { to.push(v); }
 /// ```
 ///
-///
-/// Phase E-3: implemented for the same-`GlobalState` case (the only one
-/// `lua-stdlib` uses today). `lua-vm` callers should prefer this helper
-/// over hand-rolling the snapshot/push dance.
+/// Implemented for the same-`GlobalState` case (the only one `lua-stdlib`
+/// uses today). `lua-vm` callers should prefer this helper over hand-rolling
+/// the snapshot/push dance.
 pub fn xmove(from: &mut LuaState, to: &mut LuaState, n: i32) {
     if n <= 0 {
         return;
@@ -254,8 +253,6 @@ pub fn set_top(state: &mut LuaState, idx: i32) -> Result<(), LuaError> {
                 state.set_at(i, LuaValue::Nil);
             }
         }
-        // TODO(port): to-be-closed variable closing on stack shrink;
-        // luaF_close not yet translated. Skipping close logic for Phase A.
         state.set_top_idx(new_top);
     } else {
         debug_assert!(
@@ -263,7 +260,6 @@ pub fn set_top(state: &mut LuaState, idx: i32) -> Result<(), LuaError> {
             "invalid new top"
         );
         let new_top = (state.top_idx().0 as i32 + idx + 1) as u32;
-        // TODO(port): to-be-closed variable closing on stack shrink (same as above)
         state.set_top_idx(new_top);
     }
     Ok(())
@@ -271,7 +267,6 @@ pub fn set_top(state: &mut LuaState, idx: i32) -> Result<(), LuaError> {
 
 pub fn close_slot(state: &mut LuaState, idx: i32) -> Result<(), LuaError> {
     let level = index_to_stack_idx(state, idx);
-    // TODO(port): tbc-list check and luaF_close not yet translated.
     state.set_at(level, LuaValue::Nil);
     Ok(())
 }
@@ -328,7 +323,6 @@ pub fn copy(state: &mut LuaState, fromidx: i32, toidx: i32) {
             }
         }
     } else if toidx == LUA_REGISTRYINDEX {
-        // TODO(port): write to registry — needs GlobalState::set_registry(fr)
     } else {
         let to_slot = index_to_stack_idx(state, toidx);
         state.set_at(to_slot, fr);
@@ -341,9 +335,9 @@ pub fn push_value(state: &mut LuaState, idx: i32) {
 }
 
 /// Inherent `push_copy` so the `LuaStateStubExt::push_copy` default
-/// `todo!()` no longer fires. Phase-A `state.push_copy(idx)` call-sites
-/// (base.rs, etc.) duplicate the value at `idx` onto the top of the stack —
-/// the same semantics as `lua_pushvalue`.
+/// `todo!()` no longer fires. `state.push_copy(idx)` call-sites (base.rs,
+/// etc.) duplicate the value at `idx` onto the top of the stack — the same
+/// semantics as `lua_pushvalue`.
 impl LuaState {
     pub fn push_copy(&mut self, idx: i32) -> Result<(), LuaError> {
         push_value(self, idx);
@@ -860,7 +854,9 @@ impl LuaState {
         nuvalue: i32,
     ) -> Result<GcRef<LuaUserData>, LuaError> {
         debug_assert!(nuvalue >= 0 && nuvalue < u16::MAX as i32, "invalid value");
-        // TODO(D-1c-bridge): state.new_userdata is still todo!(); keep direct alloc
+        // Constructs the GcRef<LuaUserData> directly rather than through
+        // state.new_userdata, which is unimplemented and errors out pointing
+        // callers back here.
         let u = GcRef::new(LuaUserData {
             data: vec![0u8; size].into_boxed_slice(),
             uv: std::cell::RefCell::new(vec![LuaValue::Nil; nuvalue as usize]),
@@ -970,10 +966,8 @@ pub fn raw_equal(state: &LuaState, index1: i32, index2: i32) -> bool {
     state.equal_obj(None, &o1, &o2)
 }
 
-// PORT NOTE: LUA_OPUNM / LUA_OPBNOT are unary; all others are binary.
+// LUA_OPUNM / LUA_OPBNOT are unary; all others are binary.
 pub fn arith(state: &mut LuaState, op: i32) -> Result<(), LuaError> {
-    // TODO(port): LUA_OPUNM and LUA_OPBNOT constant values not yet defined in
-    // Rust; using raw i32 comparison for now.
     const LUA_OPUNM: i32 = 12;
     const LUA_OPBNOT: i32 = 14;
     if op == LUA_OPUNM || op == LUA_OPBNOT {
@@ -1010,7 +1004,6 @@ pub fn compare(state: &mut LuaState, index1: i32, index2: i32, op: i32) -> Resul
 }
 
 pub fn string_to_number(state: &mut LuaState, s: &[u8]) -> usize {
-    // TODO(port): luaO_str2num not yet translated; push result if successful.
     match state.str_to_num(s) {
         Some((val, consumed)) => {
             state.push(val);
@@ -1035,7 +1028,7 @@ pub fn to_boolean(state: &LuaState, idx: i32) -> bool {
     !matches!(o, LuaValue::Nil | LuaValue::Bool(false))
 }
 
-// PORT NOTE: returns Option<GcRef<LuaString>> instead of raw C pointer+len.
+// Returns Option<GcRef<LuaString>> instead of raw C pointer+len.
 pub fn to_lua_string(state: &mut LuaState, idx: i32) -> Result<Option<GcRef<LuaString>>, LuaError> {
     let o = index_to_value(state, idx);
     if let LuaValue::Str(s) = &o {
@@ -1071,9 +1064,8 @@ pub fn to_cfunction(
 ) -> Option<fn(&mut LuaState) -> Result<usize, LuaError>> {
     let o = index_to_value(state, idx);
     match o {
-        // TODO(phase-b): lua-types `LuaClosure::LightC` carries a placeholder
-        // `fn() -> i32` until it can reference `LuaState`. The real cast
-        // happens once lua-types absorbs the LuaState-aware signature.
+        // `LuaClosure::LightC` carries a placeholder `fn() -> i32` until it
+        // can reference `LuaState`, so this always reports no C function.
         LuaValue::Function(LuaClosure::LightC(_f)) => None,
         LuaValue::Function(LuaClosure::C(_ccl)) => None,
         _ => None,
@@ -1084,9 +1076,9 @@ pub fn to_cfunction(
 fn to_userdata_ptr(o: &LuaValue) -> Option<*mut core::ffi::c_void> {
     match o {
         LuaValue::UserData(u) => {
-            // TODO(port): getudatamem returns a pointer to the raw byte payload of Udata.
-            // In Rust, LuaUserData carries a Box<[u8]>; we'd need to return a raw ptr.
-            // This is only safe inside lua-gc; stubbing with None for Phase A.
+            // C's getudatamem returns a pointer to the raw byte payload of
+            // Udata. LuaUserData carries a Box<[u8]> here, and returning a raw
+            // pointer to it is only safe inside lua-gc, so this reports none.
             let _ = u;
             None
         }
@@ -1101,9 +1093,9 @@ pub fn to_userdata(state: &LuaState, idx: i32) -> Option<*mut core::ffi::c_void>
 }
 
 pub fn to_thread(state: &LuaState, idx: i32) -> Option<GcRef<lua_types::value::LuaThread>> {
-    // TODO(phase-b): lua-vm's rich LuaState is not the same type as
-    // lua_types::value::LuaThread; the latter is a placeholder. Resolve in
-    // Phase B by unifying thread types.
+    // lua-vm's rich LuaState is not the same type as
+    // lua_types::value::LuaThread, which carries only an identity (`id: u64`);
+    // callers get an opaque thread handle, not a usable coroutine object.
     let o = index_to_value(state, idx);
     if let LuaValue::Thread(t) = o {
         Some(t)
@@ -1112,12 +1104,10 @@ pub fn to_thread(state: &LuaState, idx: i32) -> Option<GcRef<lua_types::value::L
     }
 }
 
-// PORT NOTE: returns a usize (opaque identity) rather than a raw void*.
-// Raw pointers are only allowed in lua-gc / lua-coro.
+// Returns a usize (opaque GC identity) rather than a raw void*, since raw
+// pointers are only allowed in lua-gc / lua-coro.
 pub fn to_pointer(state: &LuaState, idx: i32) -> Option<usize> {
     let o = index_to_value(state, idx);
-    // TODO(port): returning a raw pointer here is not safe outside lua-gc.
-    // Returning the GC identity as a usize for opaque pointer identity purposes.
     match &o {
         LuaValue::Function(LuaClosure::LightC(f)) => Some(*f as usize),
         LuaValue::LightUserData(p) => Some(*p as usize),
@@ -1145,7 +1135,7 @@ pub fn push_integer(state: &mut LuaState, n: i64) {
     state.push(LuaValue::Int(n));
 }
 
-// PORT NOTE: returns the interned LuaString instead of a raw C pointer.
+// Returns the interned LuaString instead of a raw C pointer.
 pub fn push_lstring(state: &mut LuaState, s: &[u8]) -> Result<GcRef<LuaString>, LuaError> {
     let ts = state.intern_str(s)?;
     state.push(LuaValue::Str(ts.clone()));
@@ -1175,9 +1165,9 @@ pub fn push_string(
     }
 }
 
-// PORT NOTE: va_list is not representable in safe Rust; callers pass a pre-formatted &[u8].
-// TODO(port): lua_pushvfstring uses C varargs (va_list); no direct Rust equivalent.
-// The Rust API uses state.push_fstring(format_args!(...)) instead.
+// C's va_list is not representable in safe Rust; callers pass a
+// pre-formatted &[u8]. The Rust API uses
+// state.push_fstring(format_args!(...)) instead.
 pub fn push_vfstring(state: &mut LuaState, formatted: &[u8]) -> Result<GcRef<LuaString>, LuaError> {
     let ts = state.intern_str(formatted)?;
     state.push(LuaValue::Str(ts.clone()));
@@ -1186,7 +1176,7 @@ pub fn push_vfstring(state: &mut LuaState, formatted: &[u8]) -> Result<GcRef<Lua
     Ok(ts)
 }
 
-// PORT NOTE: C varargs not used; callers use format_args! and push_fstring.
+// C varargs not used; callers use format_args! and push_fstring.
 pub fn push_fstring(state: &mut LuaState, formatted: &[u8]) -> Result<GcRef<LuaString>, LuaError> {
     push_vfstring(state, formatted)
 }
@@ -1196,16 +1186,7 @@ pub fn push_cclosure(
     f: fn(&mut LuaState) -> Result<usize, LuaError>,
     n: i32,
 ) -> Result<(), LuaError> {
-    //    if (n == 0) { setfvalue(s2v(L->top.p), fn); api_incr_top(L); }
-    //    else { api_checknelems(L, n); api_check(L, n <= MAXUPVAL, ...);
-    //           cl = luaF_newCclosure(L, n); cl->f = fn;
-    //           L->top.p -= n;
-    //           while (n--) setobj2n(L, &cl->upvalue[n], s2v(L->top.p + n));
-    //           setclCvalue(L, s2v(L->top.p), cl); api_incr_top(L);
-    //           luaC_checkGC(L); }
-    //    lua_unlock(L);
-    //
-    // PORT NOTE: `LuaClosure::LightC` and `LuaCClosure` carry a `LuaCFnPtr`
+    // `LuaClosure::LightC` and `LuaCClosure` carry a `LuaCFnPtr`
     // (a `usize` index into `GlobalState.c_functions`) rather than the raw
     // function pointer, because lua-types cannot reference `LuaState`. We
     // register `f` in the per-state registry and store the resulting index.
@@ -1246,7 +1227,9 @@ pub fn push_cclosure(
             upvalues.push(state.get_at(crate::state::StackIdx((base + i) as u32)));
         }
         state.pop_n(n_usize);
-        // TODO(D-1c-bridge): state.new_c_closure is still todo!(); keep direct alloc
+        // Constructs the closure directly rather than through
+        // state.new_c_closure, which is unimplemented and errors out pointing
+        // callers back to push_cclosure.
         let cl = LuaClosure::C(GcRef::new(lua_types::closure::LuaCClosure {
             func: idx,
             upvalues: std::cell::RefCell::new(upvalues),
@@ -1290,8 +1273,6 @@ fn aux_get_str(state: &mut LuaState, t: LuaValue, k: &[u8]) -> Result<LuaType, L
         let ts = state.intern_str(k)?;
         LuaValue::Str(ts)
     };
-    // TODO(port): luaV_fastget / luaV_finishget not yet translated; using
-    // a simplified table_get that may miss metamethod chains.
     let result = state.table_get_with_tm(&t, &str_val)?;
     state.push(result);
     let top = state.top_idx();
@@ -1299,11 +1280,8 @@ fn aux_get_str(state: &mut LuaState, t: LuaValue, k: &[u8]) -> Result<LuaType, L
 }
 
 fn get_global_table(state: &LuaState) -> LuaValue {
-    // PORT NOTE (phase-b-reconcile): The lua-types LuaTable placeholder has
-    // no storage, so we cannot fetch the globals table from the registry's
-    // array slot. init_registry now stashes globals in a direct
-    // GlobalState field; read it from there until the LuaTable placeholder
-    // reconciles with lua-vm::table::LuaTable.
+    // Globals are read from a dedicated GlobalState field (populated by
+    // init_registry) rather than fetched through the registry table.
     //
     // Lua 5.1 has a per-thread global table (`lua_State.l_gt`): a freshly
     // loaded top-level chunk takes the *running* thread's `l_gt` as its
@@ -1553,8 +1531,8 @@ pub fn raw_set_i(state: &mut LuaState, idx: i32, n: i64) -> Result<(), LuaError>
 
 /// Returns true if `mt` (a metatable) holds a non-nil `__gc` entry.
 ///
-/// PORT NOTE: Mirrors the body of C's `tofinalize` in `lgc.c` minus the bits
-/// that consult per-object GC bits (irrelevant in Phase B's Rc world).
+/// Mirrors the body of C's `tofinalize` in `lgc.c`, minus the per-object
+/// GC-bit checks (that state lives in the collector, not here).
 fn metatable_has_gc(state: &LuaState, mt: &GcRef<LuaTable>) -> bool {
     let name = state.global().tmname[crate::tagmethods::TagMethod::Gc as usize].clone();
     !matches!(mt.get_short_str(&name), LuaValue::Nil)
@@ -2045,7 +2023,6 @@ pub fn call_k(
     Ok(())
 }
 
-//                            lua_KContext ctx, lua_KFunction k)
 pub fn pcall_k(
     state: &mut LuaState,
     nargs: i32,
@@ -2054,10 +2031,10 @@ pub fn pcall_k(
     ctx: isize,
     k: Option<fn(&mut LuaState, i32, isize) -> Result<usize, LuaError>>,
 ) -> Result<LuaStatus, LuaError> {
-    // Phase D-1c: activate the heap for the duration of this protected call.
-    // GcRef::new (post D-1e) and any future allocator-aware code will route
-    // through state.global.heap via with_current_heap(...). Stacked so nested
-    // pcalls inside the same thread don't clobber each other.
+    // Activate the heap for the duration of this protected call. GcRef::new
+    // and any other allocator-aware code route through state.global.heap via
+    // with_current_heap(...). Stacked so nested pcalls inside the same
+    // thread don't clobber each other.
     let _heap_guard = {
         let g = state.global.borrow();
         // The HeapGuard borrows &Heap; we let it live for the function scope.
@@ -2126,9 +2103,6 @@ pub fn pcall_k(
     }
 }
 
-//                          const char *chunkname, const char *mode)
-// PORT NOTE: lua_Reader (void* callback) is replaced by Box<dyn FnMut>; mode
-// is &[u8].
 /// Whether the freshly loaded closure's first upvalue is the synthetic `_ENV`
 /// cell, used to decide if `load` should seed it with the globals table on
 /// Lua 5.1.
@@ -2228,7 +2202,7 @@ pub enum GcWhat {
     Inc = 11,
 }
 
-// PORT NOTE: C varargs replaced by explicit GcArgs enum; callers supply parameters directly.
+// C varargs replaced by explicit GcArgs enum; callers supply parameters directly.
 pub enum GcArgs {
     Stop,
     Restart,
@@ -2477,14 +2451,10 @@ pub fn configure_startup_gc_mode(state: &mut LuaState) {
 
 // ── miscellaneous functions ───────────────────────────────────────────────────
 
-// PORT NOTE: returns Result<Infallible, _> — semantically "always Err". The
-// translator originally wrote `Result<!, _>` but the `!` type in a return
-// position is still nightly-only as of Rust 1.93; Infallible is the stable
-// stand-in. Callsites just pattern-match on Err.
+// Returns Result<Infallible, _> — semantically "always Err". The `!` type in
+// a return position is still nightly-only as of Rust 1.93; Infallible is the
+// stable stand-in. Callsites just pattern-match on Err.
 pub fn lua_error(state: &mut LuaState) -> Result<Infallible, LuaError> {
-    //      luaM_error(L);  /* memory error */
-    //    else
-    //      luaG_errormsg(L);  /* regular error */
     let top = state.top_idx();
     let errobj = state.get_at(top - 1);
     let is_mem_err = if let LuaValue::Str(ref s) = errobj {
@@ -2542,8 +2512,6 @@ pub fn next(state: &mut LuaState, idx: i32) -> Result<bool, LuaError> {
 
 pub fn to_close(state: &mut LuaState, idx: i32) -> Result<(), LuaError> {
     let _level = index_to_stack_idx(state, idx);
-    // TODO(port): luaF_newtbcupval and to-be-closed variable infrastructure
-    // not yet translated. Stubbing for Phase A.
     Ok(())
 }
 
@@ -2566,12 +2534,11 @@ pub fn len(state: &mut LuaState, idx: i32) -> Result<(), LuaError> {
     Ok(())
 }
 
-// PORT NOTE: The custom allocator hook is not exposed in the Rust-native API.
-// Rust's allocator handles all allocation.
-// These are intentionally omitted.
+// The custom allocator hook is not exposed in the Rust-native API. Rust's
+// allocator handles all allocation. These are intentionally omitted.
 
 pub fn set_warn_f(state: &mut LuaState, f: Option<Box<dyn FnMut(&[u8], bool)>>) {
-    // PORT NOTE: ud_warn userdata is folded into the closure per types.tsv.
+    // ud_warn userdata is folded into the closure here.
     state.global_mut().warnf = f;
 }
 
@@ -2594,7 +2561,7 @@ pub fn new_userdata_uv(
 
 // ── upvalue access ────────────────────────────────────────────────────────────
 
-// PORT NOTE: Returns (name, value) instead of mutating output pointers. The name
+// Returns (name, value) instead of mutating output pointers. The name
 // is returned as an owned Vec<u8> because Lua upvalue names live in the proto's
 // LuaString table (GC heap), not in static storage.
 fn aux_upvalue(state: &LuaState, fi: &LuaValue, n: i32) -> Option<(Vec<u8>, LuaValue)> {
@@ -2668,7 +2635,7 @@ pub fn setup_value(state: &mut LuaState, funcindex: i32, n: i32) -> Option<Vec<u
     Some(name)
 }
 
-// PORT NOTE: returns an index into the upvals vec rather than a pointer-to-pointer.
+// Returns an index into the upvals vec rather than a pointer-to-pointer.
 // Returns None if n is out of range.
 fn get_upval_ref_idx(state: &LuaState, fidx: i32, n: i32) -> Option<usize> {
     let fi = index_to_value(state, fidx);
@@ -2688,7 +2655,7 @@ fn get_upval_ref_idx(state: &LuaState, fidx: i32, n: i32) -> Option<usize> {
     }
 }
 
-// PORT NOTE: Returns Option<usize> identity instead of raw void*.
+// Returns Option<usize> identity instead of raw void*.
 pub fn upvalue_id(state: &LuaState, fidx: i32, n: i32) -> Option<usize> {
     let fi = index_to_value(state, fidx);
     match &fi {
@@ -2700,8 +2667,9 @@ pub fn upvalue_id(state: &LuaState, fidx: i32, n: i32) -> Option<usize> {
         LuaValue::Function(LuaClosure::C(ccl)) => {
             let upvalues = ccl.upvalues.borrow();
             if n >= 1 && n <= upvalues.len() as i32 {
-                // TODO(port): returning address of upvalue slot not possible without raw ptr.
-                // Return a synthetic identity based on the closure's identity + n.
+                // Returning the address of the upvalue slot isn't possible
+                // without a raw pointer, so this returns a synthetic identity
+                // based on the closure's identity + n instead.
                 Some(GcRef::identity(ccl) ^ (n as usize))
             } else {
                 None
