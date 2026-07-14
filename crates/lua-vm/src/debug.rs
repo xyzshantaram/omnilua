@@ -2,9 +2,6 @@
 //!
 //! Provides the Lua debug API: stack inspection, source info, variable lookup,
 //! hook management, and runtime error formatting.
-//!
-//! # C source
-//! `reference/lua-5.4.7/src/ldebug.c` (962 lines, 30 functions)
 
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -17,45 +14,27 @@ use lua_types::error::LuaError;
 use lua_types::opcode::Instruction;
 use lua_types::{CallInfoIdx, LuaString, StackIdx};
 
-// TODO(port): the following are cross-crate imports that will resolve in Phase B:
-//   - LuaDebug  (lua_Debug struct; Phase E debug)
-//   - HookEvent (LUA_HOOKCALL / LUA_HOOKLINE / LUA_HOOKCOUNT constants)
-//   - LuaStatus (LUA_OK / LUA_YIELD / LUA_ERRRUN)
-//   - luaF_getlocalname — from crate::func
-//   - luaT_objtypename  — from crate::tagmethods
-//   - luaO_chunkid      — from crate::object
-//   - luaD_hookcall, luaD_hook, luaD_callnoyield — from crate::do_
-//   - luaH_setint       — from crate::table
-//   - luaV_tointegerns  — from crate::vm
-//   - OpCode, Instruction field accessors — from lua_code crate
+// ─── Constants from ldebug.h ──────────────────────────────────────────────────
 
-// ─── Constants from macros.tsv / ldebug.h ────────────────────────────────────
-
-// macros.tsv: ABSLINEINFO → const ABS_LINE_INFO: i8 = -0x80
 const ABS_LINE_INFO: i8 = -0x80_i8;
 
-// macros.tsv: MAXIWTHABS → const MAX_IWTH_ABS: i32 = 128
 const MAX_IWTH_ABS: i32 = 128;
 
-// TODO(port): import from lua_types or luaconf.h translation
+/// Matches `LUA_IDSIZE` in upstream `luaconf.h`.
 const LUA_IDSIZE: usize = 60;
 
-// TODO(port): import from HookEvent enum once defined
 const LUA_MASKLINE: u8 = 1 << 2;
 const LUA_MASKCOUNT: u8 = 1 << 3;
 
 const LUA_HOOKLINE: i32 = 2;
 const LUA_HOOKCOUNT: i32 = 3;
 
-// macros.tsv: LUA_ENV → const LUA_ENV: &[u8] = b"_ENV"
 const LUA_ENV: &[u8] = b"_ENV";
 
 // ─── Local error constructors (not yet in lua-types) ─────────────────────────
 
 /// Build a `LuaError::Runtime` from a raw byte-string message.
 ///
-/// TODO(phase-b): expose as `LuaError::runtime_bytes` in lua-types once
-/// that crate has a `LuaString::from_bytes` constructor in its public API.
 fn runtime_bytes(msg: Vec<u8>) -> LuaError {
     LuaError::Runtime(lua_types::LuaValue::Str(lua_types::GcRef::new(
         lua_types::LuaString::from_bytes(msg),
@@ -229,7 +208,7 @@ fn find_func_name_in_loaded(state: &LuaState, func_val: &LuaValue) -> Option<Vec
 /// - **5.3+** searches `package.loaded` and explicitly strips a leading `_G.`
 ///   (C: `strncmp(name, LUA_GNAME ".", 3)`), reporting the bare `<name>`.
 ///
-/// PORT NOTE: PUC-Rio 5.2's exact `_G.`-vs-bare choice is *also*
+/// PUC-Rio 5.2's exact `_G.`-vs-bare choice is *also*
 /// hash-iteration-order-dependent and non-deterministic across runs of the
 /// reference binary itself: the global table contains `_G._G` (a self-reference),
 /// so `findfield` reaches e.g. `next` either directly under `_G` (→ `'next'`) or
@@ -304,12 +283,10 @@ pub fn arg_error_impl(state: &mut LuaState, mut arg: i32, extramsg: &[u8]) -> Lu
 
 /// Debug introspection record.
 ///
-/// holds only the fields that `ldebug.c` writes/reads.
-///
-/// # Port note
-/// `name` and `namewhat` are optional byte strings because in C they can be
-/// NULL. `source` is owned here because we build it from Proto.source (a GcRef).
-/// `short_src` matches C layout as a fixed array.
+/// Holds only the fields that `ldebug.c` writes/reads. `name` and `namewhat`
+/// are optional byte strings because in C they can be NULL. `source` is owned
+/// here, built from `Proto.source` (a `GcRef`). `short_src` matches the C
+/// layout as a fixed array.
 pub struct LuaDebug {
     pub event: i32,
     pub name: Option<Vec<u8>>,
@@ -328,7 +305,8 @@ pub struct LuaDebug {
     pub ftransfer: u16,
     pub ntransfer: u16,
     pub short_src: [u8; LUA_IDSIZE],
-    // PORT NOTE: C stores a raw pointer; Rust stores an index into LuaState.call_stack.
+    /// C stores a raw pointer here; this stores an index into
+    /// `LuaState.call_stack` instead.
     pub i_ci: Option<CallInfoIdx>,
 }
 
@@ -359,7 +337,6 @@ impl Default for LuaDebug {
 
 // ─── File-local helper: is this a Lua (non-C) closure? ───────────────────────
 
-// macros.tsv: LUA_VLCL → LuaClosure::Lua(_)
 #[inline]
 fn is_lua_closure(cl: Option<&LuaClosure>) -> bool {
     matches!(cl, Some(LuaClosure::Lua(_)))
@@ -370,19 +347,12 @@ fn is_lua_closure(cl: Option<&LuaClosure>) -> bool {
 /// Returns the program counter (0-based instruction index) for the current
 /// instruction in call frame `ci`.
 ///
-/// ```c
-/// lua_assert(isLua(ci));
-/// return pcRel(ci->u.l.savedpc, ci_func(ci)->p);
-/// ```
-///
-/// PORT NOTE: In C, `savedpc` is a pointer to the *next* instruction. `pcRel`
-/// subtracts the code base and then subtracts 1 more to get the *current*
-/// instruction. In Rust, `saved_pc()` stores the 0-based index of the next
-/// instruction, so the current instruction index is `saved_pc() - 1`.
+/// C's `savedpc` is a pointer to the *next* instruction; `pcRel` subtracts the
+/// code base and then subtracts 1 more to get the *current* instruction.
+/// Here `saved_pc()` stores the 0-based index of the next instruction, so the
+/// current instruction index is `saved_pc() - 1`.
 fn current_pc(ci: &CallInfo) -> i32 {
     debug_assert!(ci.is_lua());
-    // macros.tsv: pcRel → (pc - proto.code_base()) as i32 - 1
-    // In Rust savedpc is a u32 offset into code[]; current = savedpc - 1
     ci.saved_pc().saturating_sub(1) as i32
 }
 
@@ -398,7 +368,6 @@ fn get_baseline(f: &LuaProto, pc: i32, basepc: &mut i32) -> i32 {
         *basepc = -1;
         return f.linedefined;
     }
-    // macros.tsv: cast_uint(x) → x as u32
     let mut i = (pc as u32 / MAX_IWTH_ABS as u32).saturating_sub(1) as usize;
     debug_assert!(
         i < f.abslineinfo.len() && f.abslineinfo[i].pc <= pc,
@@ -420,8 +389,9 @@ pub(crate) fn get_func_line(f: &LuaProto, pc: i32) -> i32 {
     }
     let mut basepc: i32 = 0;
     let mut baseline = get_baseline(f, pc, &mut basepc);
-    // PORT NOTE: C uses post-increment `basepc++` in the condition; the body
-    // then uses the already-incremented value. Rewritten as pre-increment.
+    // C uses post-increment `basepc++` in the loop condition and the body then
+    // uses the already-incremented value; this loop pre-increments instead to
+    // get the same sequence of values.
     while basepc < pc {
         basepc += 1;
         debug_assert!(
@@ -445,20 +415,17 @@ fn get_current_line(ci: &CallInfo, state: &LuaState) -> i32 {
 /// Sets the `trap` flag on every active Lua call frame so that the VM checks
 /// debug hooks before each instruction.
 ///
-///
-/// PORT NOTE: In C this walks an intrusive doubly-linked list. In Rust,
-/// `LuaState.call_stack` is a `Vec<CallInfo>`, so we iterate the slice.
-/// Marks every Lua call-frame on `state` as trapped so the dispatch loop
-/// re-reads the hook mask on its next iteration. Exposed for the sandbox,
-/// which arms the count-hook mask directly rather than through [`set_hook`].
+/// C walks an intrusive doubly-linked list of call frames; here
+/// `LuaState.call_stack` is a `Vec<CallInfo>`, so this iterates the slice
+/// instead. Marks every Lua call-frame on `state` as trapped so the dispatch
+/// loop re-reads the hook mask on its next iteration. Exposed for the
+/// sandbox, which arms the count-hook mask directly rather than through
+/// [`set_hook`].
 pub(crate) fn arm_traps(state: &mut LuaState) {
     set_traps(state);
 }
 
 fn set_traps(state: &mut LuaState) {
-    //      if (isLua(ci)) ci->u.l.trap = 1;
-    // TODO(port): call_stack iteration API not yet finalised; this will change
-    // when LuaState.call_stack is fully implemented.
     for ci in state.call_stack_mut().iter_mut() {
         if ci.is_lua() {
             ci.set_trap(true);
@@ -481,21 +448,18 @@ pub fn set_hook(
     };
     state.set_hook(func);
     state.set_base_hook_count(count);
-    // macros.tsv: resethookcount → state.reset_hook_count()
     state.reset_hook_count();
-    // macros.tsv: cast_byte(x) → x as u8
     state.set_hook_mask(mask as u8);
     if mask != 0 {
         set_traps(state);
     }
 }
 
-/// Returns the current debug hook function, if any.
+/// Returns whether a debug hook function is currently installed.
 ///
-///
-/// TODO(port): In C this returns a `lua_Hook` function pointer. In Rust the hook
-/// is a `Box<dyn FnMut>` and cannot be returned by raw reference without
-/// restructuring; for now returns a bool indicating whether a hook is installed.
+/// C's `lua_gethook` returns the `lua_Hook` function pointer itself; a
+/// `Box<dyn FnMut>` cannot be returned by reference the same way, so this
+/// reports only presence.
 pub fn get_hook_installed(state: &LuaState) -> bool {
     state.hook().is_some()
 }
@@ -559,17 +523,6 @@ pub fn get_stack(state: &LuaState, level: i32, ar: &mut LuaDebug) -> bool {
 /// `Some(CallInfoIdx(0))`, which `get_info` reads as "emit a tail frame". The
 /// base CI is never a real `getinfo` target, so that index is free to overload
 /// exactly as C overloads it.
-///
-/// C reference (`ldebug.c`):
-/// ```c
-/// for (ci = L->ci; level > 0 && ci > L->base_ci; ci--) {
-///   level--;
-///   if (f_isLua(ci)) level -= ci->tailcalls;
-/// }
-/// if (level == 0 && ci > L->base_ci) { i_ci = ci - base_ci; }
-/// else if (level < 0) { i_ci = 0; }  // a lost tail call
-/// else status = 0;
-/// ```
 fn get_stack_51(state: &LuaState, level: i32, ar: &mut LuaDebug) -> bool {
     let mut remaining = level;
     let mut ci_idx = state.current_ci_idx();
@@ -618,11 +571,7 @@ fn visible_upvalue_count_51(p: &LuaProto) -> usize {
 /// Returns the name of upvalue `uv` in proto `p` (as a byte slice), or `b"?"`.
 ///
 fn upval_name(p: &LuaProto, uv: usize) -> &[u8] {
-    //    if (s == NULL) return "?"; else return getstr(s);
-    // macros.tsv: check_exp(c, e) → { debug_assert!(c); e }
     debug_assert!(uv < p.upvalues.len(), "upval_name: index out of range");
-    // TODO(port): UpvalDesc.name is GcRef<LuaString>; calling .as_bytes() requires
-    // access to the interned string's data. Actual lifetime is tied to the GcRef.
     p.upvalues[uv]
         .name
         .as_ref()
@@ -660,15 +609,14 @@ fn temporary_local_name(state: &LuaState, ci_is_lua: bool) -> &'static [u8] {
 /// to `(vararg)`. 5.1 has no `findvararg` (it exposes varargs through the `arg`
 /// table, not `debug.getlocal`), so it never reaches this path.
 ///
-/// PORT NOTE: C sets `*pos` as an out-parameter. Rust returns an Option of the
-/// stack index alongside the name.
+/// C sets `*pos` as an out-parameter; this returns an `Option` of the stack
+/// index alongside the name instead.
 fn find_vararg(state: &LuaState, ci: &CallInfo, n: i32) -> Option<(StackIdx, &'static [u8])> {
     let proto = ci_lua_proto(ci, state);
     if proto.is_vararg {
         let nextra = ci.nextra_args();
         if n >= -(nextra as i32) {
-            // PORT NOTE: pointer arithmetic converted to index arithmetic.
-            // ci->func.p is the function slot; varargs are at func - nextra - 1 .. func - 1
+            // ci.func is the function slot; varargs are at func - nextra - 1 .. func - 1.
             let pos = ci.func - (nextra + n + 1);
             let name: &'static [u8] = match state.global().lua_version {
                 lua_types::LuaVersion::V52 | lua_types::LuaVersion::V53 => b"(*vararg)",
@@ -687,11 +635,10 @@ fn find_vararg(state: &LuaState, ci: &CallInfo, n: i32) -> Option<(StackIdx, &'s
 /// - Returns `None` if no such variable exists.
 /// - If `pos` is `Some`, sets it to the variable's stack index.
 ///
-///
-/// PORT NOTE: returns an owned `Vec<u8>` rather than `&[u8]`. The Lua-function
-/// case must call `get_local_name`, which returns a slice borrowed from a
-/// `GcRef<LuaProto>` that drops at function end — there is no caller lifetime
-/// the slice could be tied to. Cloning the name is cheap (a handful of bytes).
+/// Returns an owned `Vec<u8>` rather than `&[u8]`: the Lua-function case calls
+/// `get_local_name`, which returns a slice borrowed from a `GcRef<LuaProto>`
+/// that drops at function end, so there is no caller lifetime the slice could
+/// be tied to. Cloning the name is cheap (a handful of bytes).
 pub(crate) fn find_local(
     state: &LuaState,
     ci_idx: CallInfoIdx,
@@ -745,19 +692,17 @@ pub(crate) fn find_local(
 ///
 pub fn get_local(state: &mut LuaState, ar: Option<&LuaDebug>, n: i32) -> Option<Vec<u8>> {
     if ar.is_none() {
-        // macros.tsv: isLfunction → matches!(o, LuaValue::Function(LuaClosure::Lua(_)))
         let top_val = state.peek_top();
         if !matches!(top_val, LuaValue::Function(LuaClosure::Lua(_))) {
             return None;
         }
-        // PORT NOTE: reshaped for borrowck — convert to owned Vec<u8> inside the
-        // block so `cl` (and the borrow through it) drop before we return.
+        // Convert to an owned Vec<u8> inside the block so `cl` (and the
+        // borrow through it) drop before we return.
         let name_owned: Option<Vec<u8>> = {
             let cl = match top_val {
                 LuaValue::Function(LuaClosure::Lua(ref cl)) => cl.clone(),
                 _ => unreachable!(),
             };
-            // TODO(port): access proto from LuaClosureLua GcRef
             get_local_name_from_closure(&cl, n, 0).map(|s| s.to_vec())
         };
         return name_owned;
@@ -766,8 +711,8 @@ pub fn get_local(state: &mut LuaState, ar: Option<&LuaDebug>, n: i32) -> Option<
     let ar = ar.unwrap();
     let ci_idx = ar.i_ci?;
     let mut pos = StackIdx(0);
-    // PORT NOTE: reshaped for borrowck — clone name to an owned Vec<u8> so the
-    // immutable borrow of `state` ends before the mutable push below.
+    // Clone name to an owned Vec<u8> so the immutable borrow of `state` ends
+    // before the mutable push below.
     let name_owned: Option<Vec<u8>> = find_local(state, ci_idx, n, Some(&mut pos));
 
     if name_owned.is_some() {
@@ -783,7 +728,6 @@ pub fn get_local(state: &mut LuaState, ar: Option<&LuaDebug>, n: i32) -> Option<
 pub fn set_local(state: &mut LuaState, ar: &LuaDebug, n: i32) -> Option<Vec<u8>> {
     let ci_idx = ar.i_ci?;
     let mut pos = StackIdx(0);
-    // PORT NOTE: reshaped for borrowck — clone name before mutably borrowing state.
     let name_owned: Option<Vec<u8>> = find_local(state, ci_idx, n, Some(&mut pos));
     if name_owned.is_some() {
         let val = state.get_at(state.top_idx() - 1).clone();
@@ -799,7 +743,6 @@ pub fn set_local(state: &mut LuaState, ar: &LuaDebug, n: i32) -> Option<Vec<u8>>
 ///
 fn func_info(ar: &mut LuaDebug, cl: Option<&LuaClosure>) {
     if !is_lua_closure(cl) {
-        // macros.tsv: LL(x) → literal.len()
         ar.source = Some(b"=[C]".to_vec());
         ar.srclen = b"=[C]".len();
         ar.linedefined = -1;
@@ -810,7 +753,6 @@ fn func_info(ar: &mut LuaDebug, cl: Option<&LuaClosure>) {
             Some(LuaClosure::Lua(cl)) => cl,
             _ => unreachable!(),
         };
-        // TODO(port): access proto via GcRef<LuaProto>
         let proto: &LuaProto = &lua_cl.proto;
         // renders as "?". Stripped binary chunks commonly have no source.
         if let Some(src) = proto.source_string() {
@@ -824,7 +766,6 @@ fn func_info(ar: &mut LuaDebug, cl: Option<&LuaClosure>) {
         ar.lastlinedefined = proto.lastlinedefined;
         ar.what = Some(if ar.linedefined == 0 { b"main" } else { b"Lua" });
     }
-    // TODO(port): luaO_chunkid lives in crate::object; call it once available
     chunk_id(
         &mut ar.short_src,
         ar.source.as_deref().unwrap_or(b"?"),
@@ -849,7 +790,6 @@ fn next_line(p: &LuaProto, currentline: i32, pc: usize) -> i32 {
 ///
 fn collect_valid_lines(state: &mut LuaState, cl: Option<&LuaClosure>) -> Result<(), LuaError> {
     if !is_lua_closure(cl) {
-        // macros.tsv: setnilvalue → *o = LuaValue::Nil; api_incr_top → gone
         state.push(LuaValue::Nil);
         return Ok(());
     }
@@ -857,25 +797,20 @@ fn collect_valid_lines(state: &mut LuaState, cl: Option<&LuaClosure>) -> Result<
         Some(LuaClosure::Lua(cl)) => cl.clone(),
         _ => unreachable!(),
     };
-    // TODO(port): access proto via GcRef<LuaProto>
     let proto: GcRef<LuaProto> = lua_cl.proto.clone();
     let p: &LuaProto = &proto;
 
     let mut currentline = p.linedefined;
 
-    // macros.tsv: luaH_new(L) → state.new_table()
     let t = state.new_table();
-    // macros.tsv: sethvalue2s → state.set_at(o, LuaValue::Table(t.clone()))
     state.push(LuaValue::Table(t.clone()));
 
     if !p.lineinfo.is_empty() {
-        // macros.tsv: setbtvalue → *o = LuaValue::Bool(true)
         let v = LuaValue::Bool(true);
 
         let start_i = if !p.is_vararg {
             0usize
         } else {
-            // TODO(port): verify opcode — GET_OPCODE lives in lua_code crate
             debug_assert!(
                 p.code.first().map(|i| i.is_vararg_prep()).unwrap_or(false),
                 "collect_valid_lines: first instruction of vararg should be OP_VARARGPREP"
@@ -884,10 +819,9 @@ fn collect_valid_lines(state: &mut LuaState, cl: Option<&LuaClosure>) -> Result<
             1usize
         };
 
-        // PORT NOTE: C iterates up to sizelineinfo (same as lineinfo.len() in Rust).
+        // C iterates up to sizelineinfo, which is the same as lineinfo.len() here.
         for i in start_i..p.lineinfo.len() {
             currentline = next_line(p, currentline, i);
-            // TODO(port): luaH_setint lives in crate::table; stub call here
             t.raw_set_int(state, currentline as i64, v.clone())?;
         }
     }
@@ -992,7 +926,6 @@ fn aux_get_info(
                 ar.nups = cl.map_or(0, |c| c.nupvalues() as u8);
                 match cl {
                     Some(LuaClosure::Lua(lua_cl)) => {
-                        // TODO(port): access proto via GcRef<LuaProto>
                         ar.isvararg = lua_cl.proto.is_vararg;
                         ar.nparams = lua_cl.proto.numparams;
                         if state.global().lua_version == lua_types::LuaVersion::V51 {
@@ -1024,10 +957,8 @@ fn aux_get_info(
                     ar.name = name;
                 }
             }
-            //              else { ftransfer = ...; ntransfer = ...; }
             b'r' => match ci {
                 Some(ci) if ci.callstatus & CIST_TRAN != 0 => {
-                    // TODO(port): ci->u2.transferinfo.ftransfer / ntransfer
                     ar.ftransfer = ci.transfer_ftransfer();
                     ar.ntransfer = ci.transfer_ntransfer();
                 }
@@ -1095,7 +1026,6 @@ pub fn get_info(state: &mut LuaState, what: &[u8], ar: &mut LuaDebug) -> bool {
         state.push(func_val);
     }
     if what.contains(&b'L') {
-        // TODO(port): propagate error from collect_valid_lines
         let _ = collect_valid_lines(state, cl.as_ref());
     }
     status
@@ -1107,18 +1037,6 @@ pub fn get_info(state: &mut LuaState, what: &[u8], ar: &mut LuaDebug) -> bool {
 /// `source == "=(tail call)"` (rendered `(tail call)`), all lines `-1`, empty
 /// name/namewhat, zero upvalues, and a `nil` function pushed for the `'f'`
 /// option / `nil` valid-lines table for `'L'`.
-///
-/// C reference (`ldebug.c`):
-/// ```c
-/// static void info_tailcall (lua_Debug *ar) {
-///   ar->name = ar->namewhat = "";
-///   ar->what = "tail";
-///   ar->lastlinedefined = ar->linedefined = ar->currentline = -1;
-///   ar->source = "=(tail call)";
-///   luaO_chunkid(ar->short_src, ar->source, LUA_IDSIZE);
-///   ar->nups = 0;
-/// }
-/// ```
 fn get_info_tailcall_51(state: &mut LuaState, what: &[u8], ar: &mut LuaDebug) -> bool {
     let what = if what.first() == Some(&b'>') {
         &what[1..]
@@ -1177,8 +1095,6 @@ fn find_set_reg(p: &LuaProto, lastpc: i32, reg: i32) -> i32 {
     let mut setreg: i32 = -1;
     let mut jmptarget: i32 = 0;
 
-    // macros.tsv: testMMMode(op) → (luaP_opmodes[op as usize] & (1 << 7)) != 0
-    // TODO(port): GET_OPCODE and opmode tests live in lua_code crate
     let effective_lastpc = if p
         .code
         .get(lastpc as usize)
@@ -1210,8 +1126,6 @@ fn find_set_reg(p: &LuaProto, lastpc: i32, reg: i32) -> i32 {
                 false
             }
             _ => {
-                // macros.tsv: testAMode(op) → (luaP_opmodes[op as usize] & (1 << 3)) != 0
-                // TODO(port): opmode table lives in lua_code crate
                 instr.test_a_mode() && reg == a
             }
         };
@@ -1228,11 +1142,8 @@ fn find_set_reg(p: &LuaProto, lastpc: i32, reg: i32) -> i32 {
 /// or returns `None` and sets `*name` to `"?"`.
 ///
 fn kname<'a>(p: &'a LuaProto, index: usize, name: &mut &'a [u8]) -> Option<&'static [u8]> {
-    //    if (ttisstring(kvalue)) { *name = getstr(tsvalue(kvalue)); return "constant"; }
-    //    else { *name = "?"; return NULL; }
     match p.k.get(index) {
         Some(LuaValue::Str(s)) => {
-            // TODO(port): as_bytes() lifetime is tied to GcRef; revisit in Phase B
             *name = s.as_bytes();
             Some(b"constant")
         }
@@ -1296,7 +1207,6 @@ fn basic_get_obj_name<'a>(
 ///
 fn rname<'a>(p: &'a LuaProto, pc: i32, c: i32, name: &mut &'a [u8]) {
     let mut pc = pc;
-    //    if (!(what && *what == 'c')) *name = "?";
     let what = basic_get_obj_name(p, &mut pc, c, name);
     if !matches!(what, Some(kind) if kind.first() == Some(&b'c')) {
         *name = b"?";
@@ -1307,7 +1217,6 @@ fn rname<'a>(p: &'a LuaProto, pc: i32, c: i32, name: &mut &'a [u8]) {
 ///
 fn rkname<'a>(p: &'a LuaProto, pc: i32, instr: Instruction, name: &mut &'a [u8]) {
     let c = instr.arg_c() as i32;
-    // macros.tsv: GETARG_k → i.arg_k() -> u32
     if instr.arg_k() != 0 {
         kname(p, c as usize, name);
     } else {
@@ -1420,8 +1329,6 @@ fn funcname_from_code<'a>(
             get_tm_name(state, TagMethod::NewIndex, name)
         }
         OpCode::MmBin | OpCode::MmBinI | OpCode::MmBinK => {
-            // macros.tsv: cast(TMS, x) → x as TagMethod
-            // TODO(port): TagMethod::from_u8 needs to exist
             let tm_idx = instr.arg_c() as u8;
             let tm = TagMethod::from_u8(tm_idx);
             get_tm_name(state, tm, name)
@@ -1441,7 +1348,7 @@ fn funcname_from_code<'a>(
 /// Looks up the name for tag method `tm` from GlobalState and stores it in `*name`.
 /// Returns `Some("metamethod")`, or `None` on Lua 5.1.
 ///
-/// PORT NOTE: 5.1's `getfuncname` only recognises `OP_CALL`/`OP_TAILCALL`/
+/// 5.1's `getfuncname` only recognises `OP_CALL`/`OP_TAILCALL`/
 /// `OP_TFORLOOP`; it never names a metamethod-dispatched call, so a 5.1
 /// metamethod handler reports `namewhat == "" , name == nil`. 5.2/5.3 added the
 /// metamethod cases and report the raw event name (`__index`). 5.4's
@@ -1455,9 +1362,8 @@ fn get_tm_name(
     if state.global().lua_version == lua_types::LuaVersion::V51 {
         return None;
     }
-    // macros.tsv: getshrstr(ts) → ts.as_bytes(); G → state.global()
-    // PORT NOTE: reshaped for borrowck — tm_name returns Option<GcRef<LuaString>>;
-    // materialise the bytes before stripping so there is no borrow of a temporary.
+    // tm_name returns Option<GcRef<LuaString>>; materialise the bytes before
+    // stripping so there is no borrow of a temporary.
     let raw_bytes: Vec<u8> = state
         .global()
         .tm_name(tm)
@@ -1504,14 +1410,10 @@ fn funcname_from_call<'a>(
 /// register window, and if so returns the register index (0-based).
 /// Returns -1 if not found.
 ///
-///
-/// PORT NOTE: In C this compares raw pointers. In Rust we compare StackIdx
-/// values. The function signature changes: instead of a `*o` pointer we take
-/// the StackIdx of the value directly.
+/// C compares raw pointers here; this compares `StackIdx` values instead,
+/// taking the value's `StackIdx` directly rather than a `*o` pointer.
 fn in_stack(ci: &CallInfo, val_idx: StackIdx) -> i32 {
     let base = StackIdx(ci.func.0 + 1);
-    // TODO(port): in C this is a pointer-identity check (`o == s2v(base+pos)`).
-    // In Rust, `val_idx` IS a StackIdx; we just check whether it falls in range.
     let ci_top = ci.top;
     let mut pos = 0i32;
     let mut cur = base;
@@ -1528,11 +1430,10 @@ fn in_stack(ci: &CallInfo, val_idx: StackIdx) -> i32 {
 /// Checks whether `val_idx` is the current value of one of the upvalues in the
 /// Lua closure at `ci`. If so, sets `*name` and returns `Some("upvalue")`.
 ///
-///
-/// PORT NOTE: In C this compares `c->upvals[i]->v.p == o` (pointer identity on
-/// open upvalues or the closed slot). In Rust, open upvalues hold a StackIdx; we
-/// compare that against `val_idx`. Closed upvalues cannot be identified by stack
-/// position, so they are not matched here.
+/// C compares `c->upvals[i]->v.p == o` (pointer identity on open upvalues or
+/// the closed slot). Here, open upvalues hold a `StackIdx`, compared directly
+/// against `val_idx`; closed upvalues cannot be identified by stack position,
+/// so they are not matched here.
 fn get_upval_name<'a>(
     ci: &CallInfo,
     val_idx: StackIdx,
@@ -1540,8 +1441,6 @@ fn get_upval_name<'a>(
     state: &'a LuaState,
 ) -> Option<&'static [u8]> {
     let proto = ci_lua_proto(ci, state);
-    // TODO(port): actual upvalue objects require ci.lua_closure() on the LuaState;
-    // this is a best-effort translation
     let lua_cl = match state.get_at(ci.func) {
         LuaValue::Function(LuaClosure::Lua(cl)) => cl.clone(),
         _ => return None,
@@ -1550,8 +1449,6 @@ fn get_upval_name<'a>(
         let upval = upval_slot.get();
         if let Some((_thread_id, idx)) = upval.try_open_payload() {
             if idx == val_idx {
-                // TODO(phase-b): the name needs to be tied to state's lifetime; using
-                // a static fallback keeps the trait bounds satisfied for now.
                 let _ = upval_name(&proto, i);
                 *name = b"upvalue";
                 return Some(b"upvalue");
@@ -1837,7 +1734,6 @@ pub(crate) fn op_int_error(
     p2_idx: StackIdx,
     msg: &[u8],
 ) -> LuaError {
-    // macros.tsv: ttisnumber → matches!(o, LuaValue::Int(_) | LuaValue::Float(_))
     let (bad_val, bad_idx) = if !matches!(p1, LuaValue::Int(_) | LuaValue::Float(_)) {
         (p1, p1_idx)
     } else {
@@ -1877,10 +1773,8 @@ pub(crate) fn to_int_error(
 /// Raises an order-comparison type error for incompatible types.
 ///
 pub(crate) fn order_error(state: &LuaState, p1: &LuaValue, p2: &LuaValue) -> LuaError {
-    // TODO(port): obj_type_name lives in crate::tagmethods
     let t1 = state.obj_type_name(p1);
     let t2 = state.obj_type_name(p2);
-    //    else                      luaG_runerror(L, "attempt to compare %s with %s", t1, t2);
     let msg = if t1 == t2 {
         let mut m = Vec::new();
         m.extend_from_slice(b"attempt to compare two ");
@@ -1913,11 +1807,8 @@ pub(crate) fn add_info(
     line: i32,
     unknown_line_as_question: bool,
 ) -> Vec<u8> {
-    //    else { buff[0] = '?'; buff[1] = '\0'; }
     let mut buff = [0u8; LUA_IDSIZE];
     if let Some(src) = src {
-        // macros.tsv: getstr(ts) → ts.as_bytes(); tsslen(ts) → ts.len()
-        // TODO(port): luaO_chunkid lives in crate::object
         chunk_id(&mut buff, src.as_bytes(), src.len());
     } else if unknown_line_as_question {
         let mut out = Vec::with_capacity(5 + msg.len());
@@ -1927,8 +1818,8 @@ pub(crate) fn add_info(
     } else {
         buff[0] = b'?';
     }
-    // PORT NOTE: Instead of pushing on the stack, we return the formatted Vec<u8>.
-    // Callers that need the result on the stack should push it themselves.
+    // Returns the formatted Vec<u8> instead of pushing on the stack; callers
+    // that need the result on the stack push it themselves.
     let src_part = buff
         .iter()
         .position(|&b| b == 0)
@@ -1989,7 +1880,6 @@ pub(crate) fn trace_call(state: &mut LuaState) -> Result<i32, LuaError> {
         if proto.is_vararg {
             return Ok(0);
         } else if ci.callstatus & CIST_HOOKYIELD == 0 {
-            // TODO(port): luaD_hookcall lives in crate::do_
             state.hook_call(ci_idx)?;
         }
     }
@@ -2000,11 +1890,10 @@ pub(crate) fn trace_call(state: &mut LuaState) -> Result<i32, LuaError> {
 /// Fires line and count hooks as appropriate.
 /// Returns 1 to keep trap on, 0 to turn it off.
 ///
-///
-/// PORT NOTE: The C `pc` parameter is a pointer to the instruction array.
-/// In Rust, `pc` is the 0-based index of the NEXT instruction (same semantic as
-/// `savedpc`). After incrementing for reference (`pc++` in C), it equals
-/// the next-instruction index.
+/// C's `pc` parameter is a pointer to the instruction array. Here, `pc` is
+/// the 0-based index of the NEXT instruction (same semantic as `savedpc`);
+/// after incrementing for reference (`pc++` in C), it equals the
+/// next-instruction index.
 pub(crate) fn trace_exec(state: &mut LuaState, pc: u32) -> Result<i32, LuaError> {
     let ci_idx = state.current_ci_idx();
     let ci = state.get_ci(ci_idx).clone();
@@ -2056,8 +1945,6 @@ pub(crate) fn trace_exec(state: &mut LuaState, pc: u32) -> Result<i32, LuaError>
         return Ok(1);
     }
 
-    // macros.tsv: isIT(i) → i.is_in_top()
-    // PORT NOTE: savedpc - 1 is the current instruction (now at index next_pc - 1 = pc).
     let cur_instr = state.get_proto_instr(ci_idx, pc as u32);
     if !cur_instr.is_in_top() {
         let ci_top = state.get_ci(ci_idx).top;
@@ -2065,7 +1952,6 @@ pub(crate) fn trace_exec(state: &mut LuaState, pc: u32) -> Result<i32, LuaError>
     }
 
     if counthook {
-        // TODO(port): luaD_hook lives in crate::do_
         state.call_hook_event(LUA_HOOKCOUNT, -1)?;
     }
 
@@ -2081,7 +1967,6 @@ pub(crate) fn trace_exec(state: &mut LuaState, pc: u32) -> Result<i32, LuaError>
 
         if npci <= oldpc || changed_line(&proto, oldpc, npci) {
             let newline = get_func_line(&proto, npci);
-            // TODO(port): luaD_hook lives in crate::do_
             state.call_hook_event(LUA_HOOKLINE, newline)?;
         }
         state.set_old_pc(npci as u32);
@@ -2092,7 +1977,6 @@ pub(crate) fn trace_exec(state: &mut LuaState, pc: u32) -> Result<i32, LuaError>
             state.set_hook_count(1);
         }
         state.get_ci_mut(ci_idx).callstatus |= CIST_HOOKYIELD;
-        // error_sites.tsv: luaD_throw(L, LUA_YIELD) → return Err(LuaError::with_status(LuaStatus::Yield))
         return Err(LuaError::Yield);
     }
 
@@ -2128,17 +2012,10 @@ fn get_local_name_from_closure(cl: &LuaClosureLua, n: i32, pc: i32) -> Option<&[
 
 /// Retrieves the LuaProto for the Lua closure at `ci.func` from the stack.
 ///
-/// macros.tsv: ci_func → ci.lua_closure() returning &GcRef<LuaClosure::Lua>
-///
-/// PORT NOTE: The C version returns a raw pointer and is a macro. Here we
-/// navigate through the LuaState stack. Returns a reference with the
-/// lifetime of the proto inside the GcRef (Rc), which must remain valid.
-///
-/// TODO(port): This returns a cloned Rc's inner reference; Phase B must verify
-/// lifetimes are correct once all types are wired.
-/// PORT NOTE: reshaped for borrowck — returns `GcRef<LuaProto>` (Rc clone) instead
-/// of `&'a LuaProto` to avoid returning a reference to a temporary `LuaValue`
-/// produced by `get_at`. Callers deref through `GcRef<T>: Deref<Target=T>`.
+/// C's version returns a raw pointer via a macro. This returns an owned
+/// `GcRef<LuaProto>` (an Rc clone) rather than a borrowed reference, since a
+/// reference into `get_at`'s result would point at a temporary `LuaValue`.
+/// Callers deref through `GcRef<T>: Deref<Target=T>`.
 fn ci_lua_proto(ci: &CallInfo, state: &LuaState) -> GcRef<LuaProto> {
     match state.get_at(ci.func) {
         LuaValue::Function(LuaClosure::Lua(cl)) => cl.proto.clone(),

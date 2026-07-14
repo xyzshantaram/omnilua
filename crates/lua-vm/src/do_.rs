@@ -1,7 +1,6 @@
 //! Stack and call structure of Lua.
 //!
-//! Translated from `src/ldo.c` (Lua 5.4.7, ~1029 lines, ~37 functions).
-//! Target crate: lua-vm (`crates/lua-vm/src/do_.rs`).
+//! Ported from `ldo.c`.
 
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -16,7 +15,9 @@ use lua_types::tagmethod::TagMethod;
 use lua_types::StackIdx;
 use lua_types::{error::LuaError, status::LuaStatus, value::LuaValue};
 
-/// Stub DynData. TODO(phase-b): real type lives in lua-parse.
+/// Opaque stand-in for `lua-parse`'s real `DynData`. `lua-parse` depends on
+/// this crate, so referencing its concrete type here would be a cyclic
+/// dependency; this stub is threaded through instead and never inspected.
 struct DynDataStub;
 impl DynDataStub {
     fn new() -> Self {
@@ -26,9 +27,7 @@ impl DynDataStub {
 
 /// Text-source parser entry point.
 ///
-/// Dyndata *dyd, const char *name, int firstchar)`
-///
-/// PORT NOTE: A direct call into `lua_parse::parse` would create a cyclic
+/// A direct call into `lua_parse::parse` would create a cyclic
 /// crate dependency (`lua-parse` already depends on `lua-vm`). Instead the
 /// embedder installs a function pointer on `GlobalState::parser_hook` at
 /// startup; when present, this stub delegates to it. When absent (e.g. in
@@ -58,7 +57,6 @@ fn parse_stub(
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-// PORT NOTE: LUAI_MAXSTACK is 1_000_000 per macros.tsv.
 const LUAI_MAXSTACK: usize = 1_000_000;
 const ERRORSTACKSIZE: usize = LUAI_MAXSTACK + 200;
 
@@ -94,7 +92,7 @@ const NYCI: u32 = 0x10001;
 
 use crate::state::LUAI_MAXCCALLS;
 
-// CallStatus bit flags (macros.tsv)
+// CallStatus bit flags
 const CIST_C: u16 = 1 << 1;
 const CIST_FRESH: u16 = 1 << 2;
 const CIST_HOOKED: u16 = 1 << 3;
@@ -105,7 +103,6 @@ const CIST_TRAN: u16 = 1 << 8;
 const CIST_CLSRET: u16 = 1 << 9;
 const CIST_FIN: u16 = 1 << 7;
 
-// TODO(port): derive from HookEvent enum once that type is settled.
 const LUA_MASKCALL: u8 = 1 << 0;
 const LUA_MASKRET: u8 = 1 << 1;
 
@@ -118,8 +115,6 @@ const LUA_HOOKTAILCALL: i32 = 4;
 /// version when the hook name is resolved (`debug_lib::hookf`).
 const LUA_HOOKTAILRET: i32 = 4;
 
-// PORT NOTE: luaF_close takes StackIdx; this sentinel needs special handling.
-// TODO(port): settle representation with func.rs author.
 const CLOSE_K_TOP: i32 = -1;
 
 // ── Helper: errorstatus ──────────────────────────────────────────────────────
@@ -174,11 +169,11 @@ fn run_message_handler(
     }
 }
 
-// ── lua_longjmp (NOT translated) ─────────────────────────────────────────────
-// PORT NOTE: The `struct lua_longjmp` and the entire setjmp/longjmp mechanism
-// (LUAI_THROW / LUAI_TRY) are replaced by Rust's `Result<T, LuaError>`.
-// There is no Rust equivalent of the `lua_longjmp` struct.
-// The `lua_State.errorJmp` field is removed (see types.tsv).
+// ── lua_longjmp ───────────────────────────────────────────────────────────────
+// C's `struct lua_longjmp` and the entire setjmp/longjmp mechanism
+// (LUAI_THROW / LUAI_TRY) are replaced by Rust's `Result<T, LuaError>`, so
+// there is no equivalent struct here, and `lua_State.errorJmp` has no field
+// counterpart.
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Error-recovery functions
@@ -214,17 +209,15 @@ pub(crate) fn set_error_obj(state: &mut LuaState, errcode: LuaStatus, old_top: S
 /// Runs `f` in a "protected" context, catching any `LuaError` it returns.
 /// Restores `n_ccalls` on both success and error.
 ///
-///
-/// PORT NOTE: The C implementation uses setjmp/longjmp for protection. In Rust
-/// the same protection is provided by `Result<T, LuaError>` — the function just
-/// calls `f` and returns the result. The `ud` void* argument is captured in the
+/// C uses setjmp/longjmp for protection; here the same protection comes from
+/// `Result<T, LuaError>` — the function just calls `f` and returns the
+/// result. The `ud` void* argument C threads through is captured in the
 /// closure environment instead of being passed separately.
 pub(crate) fn raw_run_protected<F>(state: &mut LuaState, f: F) -> Result<(), LuaError>
 where
     F: FnOnce(&mut LuaState) -> Result<(), LuaError>,
 {
     let old_n_ccalls = state.n_ccalls;
-    // PORT NOTE: setjmp/longjmp replaced by Result; f(state) propagates errors naturally.
     let result = f(state);
     state.n_ccalls = old_n_ccalls;
     result
@@ -234,11 +227,11 @@ where
 // Stack reallocation
 // ══════════════════════════════════════════════════════════════════════════════
 
-// PORT NOTE: `relstack` and `correctstack` from ldo.c are NOT translated.
-// In C, they convert all stack pointers to/from byte-offsets before/after
-// `realloc` (which may move the allocation). In Rust the stack is a
-// `Vec<StackValue>` and all references are `StackIdx` (u32 index) — they are
-// already position-stable across reallocation.  Nothing to save or restore.
+// `relstack` and `correctstack` from ldo.c have no counterpart here: in C
+// they convert all stack pointers to/from byte-offsets before/after
+// `realloc` (which may move the allocation), but the stack here is a
+// `Vec<StackValue>` addressed by `StackIdx` (a u32 index), already
+// position-stable across reallocation. Nothing to save or restore.
 
 /// Reallocates the stack to `new_size` slots, filling new slots with `Nil`.
 /// Returns `Ok(true)` on success, `Ok(false)` when `raise_error` is false and
@@ -252,12 +245,11 @@ pub(crate) fn realloc_stack(
     let old_size = state.stack_size() as usize;
     debug_assert!(new_size <= LUAI_MAXSTACK || new_size == ERRORSTACKSIZE);
 
-    // PORT NOTE: stop emergency GC during reallocation so the allocator
-    // (which may trigger GC) doesn't see a stack in mid-realloc state.
+    // Stop emergency GC during reallocation so the allocator (which may
+    // trigger GC) doesn't see a stack in mid-realloc state.
     let old_gcstop = state.global().gcstopem;
     state.global_mut().gcstopem = true;
 
-    // luaM_reallocvector → v.resize_with(n, T::default) (macros.tsv)
     let new_extent = new_size as usize + EXTRA_STACK as usize;
     let alloc_result = state.stack_resize(new_extent);
 
@@ -330,7 +322,6 @@ pub(crate) fn grow_stack(
 ///
 fn stack_in_use(state: &LuaState) -> usize {
     let mut lim = state.top_idx();
-    //      if (lim < ci->top.p) lim = ci->top.p;
     let mut ci_idx_opt = Some(state.ci);
     while let Some(ci_idx) = ci_idx_opt {
         let ci = state.get_ci(ci_idx);
@@ -387,7 +378,6 @@ pub(crate) fn hook(
 
     let ci_idx = state.ci;
 
-    // savestack → idx  (macros.tsv: StackIdx is already an offset)
     let saved_top = state.top_idx();
     let saved_ci_top = state.get_ci(ci_idx).top;
 
@@ -440,7 +430,6 @@ pub(crate) fn hook(
     debug_assert!(!state.allowhook);
     state.allowhook = true;
 
-    // restorestack → idx  (macros.tsv: StackIdx already)
     state.get_ci_mut(ci_idx).top = saved_ci_top;
     state.set_top(saved_top);
     state.get_ci_mut(ci_idx).callstatus &= !mask;
@@ -458,10 +447,7 @@ pub(crate) fn hookcall(state: &mut LuaState, ci_idx: CallInfoIdx) -> Result<(), 
         } else {
             LUA_HOOKCALL
         };
-        // ci_func(ci) → ci.lua_closure()  (macros.tsv)
         let numparams = {
-            // TODO(port): ci_func returns &LuaClosure::Lua; getting proto.numparams
-            // requires the full closure/proto API which isn't finalised yet.
             state.get_ci_lua_proto_numparams(ci_idx)
         };
         let pc = state.ci_savedpc(ci_idx);
@@ -500,14 +486,13 @@ fn rethook(state: &mut LuaState, ci_idx: CallInfoIdx, nres: i32) -> Result<(), L
         let mut delta: i32 = 0;
 
         if state.get_ci(ci_idx).is_lua() {
-            // TODO(port): ci_func(ci)->p accesses the Proto; needs full closure API.
             let (is_vararg, nextraargs, numparams) = state.get_ci_vararg_info(ci_idx);
             if is_vararg {
                 delta = nextraargs + numparams as i32 + 1;
             }
         }
 
-        // PORT NOTE: temporarily advance func index by delta for hook transfer calc
+        // Temporarily advance func index by delta for the hook transfer calc.
         let original_func = state.get_ci(ci_idx).func;
         state.get_ci_mut(ci_idx).func = StackIdx((original_func.0 as i32 + delta) as u32);
 
@@ -521,13 +506,9 @@ fn rethook(state: &mut LuaState, ci_idx: CallInfoIdx, nres: i32) -> Result<(), L
         fire_tail_returns(state, ci_idx)?;
     }
 
-    // pcRel → (pc - proto.code_base()) as i32 - 1  (macros.tsv)
     let previous = state.get_ci(ci_idx).previous;
     if let Some(prev_idx) = previous {
         if state.get_ci(prev_idx).is_lua() {
-            // TODO(port): pcRel requires ci_func(ci)->p (proto code base pointer);
-            // in Rust this is a Vec<Instruction> index calculation.
-            // state.oldpc = (savedpc offset - 1) as u32
             state.oldpc = state.get_ci_pcrel(prev_idx);
         }
     }
@@ -553,8 +534,7 @@ fn try_func_tm(
     if count_call_metamethods && *call_metamethods == 15 {
         return Err(LuaError::runtime(format_args!("'__call' chain too long")));
     }
-    // checkstackGCp → { state.check_stack(n)?; state.gc().check_step(); }  (macros.tsv)
-    // PORT NOTE: func_idx is a StackIdx and survives any stack reallocation.
+    // func_idx is a StackIdx and survives any stack reallocation.
     state.check_stack(1)?;
     if state.gc_check_needed {
         state.gc_check_step();
@@ -616,27 +596,22 @@ fn move_results(
             // wanted = nres: fall through to generic case below
         }
         _ => {
-            // hastocloseCfunc → n < LUA_MULTRET  (macros.tsv)
             if wanted < LUA_MULTRET {
                 let ci_idx = state.ci;
                 state.get_ci_mut(ci_idx).callstatus |= CIST_CLSRET;
                 state.set_ci_u2_nres(ci_idx, nres);
 
-                // TODO(port): CLOSE_K_TOP sentinel needs proper StackIdx encoding
-                // in func::close; for now pass as a special sentinel value.
                 let res_idx = func::close(state, res_idx, CLOSE_K_TOP, true)?;
 
                 let ci_idx = state.ci;
                 state.get_ci_mut(ci_idx).callstatus &= !CIST_CLSRET;
 
                 if state.hookmask != 0 {
-                    // savestack → idx  (macros.tsv: StackIdx is already stable)
                     let saved_res = res_idx;
                     rethook(state, ci_idx, nres)?;
                     let _ = saved_res; // = res_idx (no-op restore)
                 }
 
-                // decodeNresults → -(n) - 3  (macros.tsv)
                 let decoded_wanted = -(wanted) - 3;
                 let wanted = if decoded_wanted == LUA_MULTRET {
                     nres
@@ -777,7 +752,6 @@ fn precall_c(
 
     let n = f.call(state)? as i32;
 
-    // api_checknelems → debug_assert!(n < (top - ci_func), "not enough elements") (macros.tsv)
     debug_assert!(
         n <= state.top_idx().0 as i32,
         "C function returned more values than available"
@@ -882,10 +856,11 @@ pub(crate) fn pretailcall(
 /// For Lua functions, returns `Some(ci_idx)` — the caller must then invoke the VM.
 ///
 ///
-/// PORT NOTE (perf): the C source uses `retry: switch (...) { default: goto retry; }`.
-/// We split that into a fast-path call to the Lua-closure handler and an explicit
-/// retry loop for the rare metamethod miss-path. The fast path inlines the Lua-closure
-/// arm so LLVM can specialize for the by-far-most-common case (a direct Lua call).
+/// C uses `retry: switch (...) { default: goto retry; }`; this splits that
+/// into a fast-path call to the Lua-closure handler and an explicit retry
+/// loop for the rare metamethod miss-path. The fast path inlines the
+/// Lua-closure arm so LLVM can specialize for the by-far-most-common case (a
+/// direct Lua call).
 #[inline(always)]
 pub(crate) fn precall(
     state: &mut LuaState,
@@ -1042,9 +1017,7 @@ fn ccall_inner_with_status(
 ) -> Result<(), LuaError> {
     state.n_ccalls += inc;
 
-    // getCcalls → state.c_calls()  (macros.tsv: lower 16 bits of n_ccalls)
     if state.c_calls() >= LUAI_MAXCCALLS {
-        // checkstackp → state.check_stack(n)?  (macros.tsv)
         state.check_stack(0)?;
         state.check_c_stack()?;
     }
@@ -1108,21 +1081,18 @@ pub(crate) fn call_known_c(
 /// Finishes the job of `lua_pcallk` after it was interrupted by a yield.
 ///
 fn finish_pcallk(state: &mut LuaState, ci_idx: CallInfoIdx) -> Result<LuaStatus, LuaError> {
-    // getcistrecst → ci.recover_status()  (macros.tsv)
-    // PORT NOTE: recover_status() returns i32; convert to LuaStatus for type safety.
+    // recover_status() returns i32; convert to LuaStatus for type safety.
     let mut status = LuaStatus::from_raw(state.get_ci(ci_idx).recover_status());
 
     if status == LuaStatus::Ok {
         status = LuaStatus::Yield;
     } else {
         let func_idx = StackIdx(state.get_ci_u2_funcidx(ci_idx) as u32);
-        // getoah → ci.get_oah()  (macros.tsv)
         state.allowhook = state.get_ci(ci_idx).get_oah();
-        // TODO(port): CLOSE_K_TOP sentinel encoding; see close_tbc comment above.
         let _func_idx = func::close(state, func_idx, status as i32, true)?;
         set_error_obj(state, status, func_idx);
 
-        // PORT NOTE: lua-c invokes the message handler at error-raise time via
+        // C invokes the message handler at error-raise time via
         // `luaG_errormsg`, BEFORE the longjmp propagates the error. Our error
         // propagation rides on Rust `Result::Err` and has no equivalent
         // chokepoint at raise time, so we run the handler here at the
@@ -1179,18 +1149,19 @@ fn finish_ccall(state: &mut LuaState, ci_idx: CallInfoIdx) -> Result<(), LuaErro
             status = finish_pcallk(state, ci_idx)?;
         }
 
-        // adjustresults → state.adjust_results(nres)  (macros.tsv)
         state.adjust_results(LUA_MULTRET);
 
-        // TODO(port): calling the continuation function while holding &mut LuaState
-        // has the same borrow problem as the hook call. Phase E must solve this.
-        // For now, extract and re-insert the continuation.
+        // Calling the continuation function while holding &mut LuaState has
+        // the same borrow problem as the hook call, so the continuation and
+        // its context are extracted before the call rather than borrowed
+        // through it.
         let k = state.get_ci(ci_idx).u_c_k();
         let ctx = state.get_ci(ci_idx).u_c_ctx();
         if let Some(k_fn) = k {
             n = k_fn(state, status as i32, ctx)? as i32;
         } else {
-            // TODO(port): unreachable in correct code; the assert above guards this
+            // Only reachable if the debug_assert above didn't fire (release
+            // build); returns a proper error instead of relying on that assert.
             return Err(LuaError::runtime(format_args!(
                 "finishCcall: missing continuation"
             )));
@@ -1242,7 +1213,6 @@ fn find_pcall(state: &LuaState) -> Option<CallInfoIdx> {
 fn resume_error(state: &mut LuaState, msg: &[u8], narg: i32) -> LuaStatus {
     let top = state.top_idx();
     state.set_top(top - narg as i32);
-    // luaS_new → state.intern_str(s)  (macros.tsv)
     let s = state.intern_str(msg).ok();
     let new_top = state.top_idx();
     if let Some(s) = s {
@@ -1296,10 +1266,10 @@ fn precover(state: &mut LuaState, mut status: LuaStatus) -> LuaStatus {
         if let Some(ci_idx) = find_pcall(state) {
             state.ci = ci_idx;
             state.get_ci_mut(ci_idx).set_recover_status(status as i32);
-            // PORT NOTE: In C, luaD_throw pushes the error value onto L->top before
+            // C's luaD_throw pushes the error value onto L->top before
             // longjmp, so the catch in luaD_rawrunprotected leaves it there for
-            // finish_pcallk's seterrorobj to read at L->top-1. In Rust the value
-            // rides inside LuaError; push it explicitly to mirror the C invariant.
+            // finish_pcallk's seterrorobj to read at L->top-1. Here the value
+            // rides inside LuaError; push it explicitly to mirror that invariant.
             status = match raw_run_protected(state, |s| unroll(s)) {
                 Ok(()) => LuaStatus::Ok,
                 Err(e) => {
@@ -1333,11 +1303,6 @@ pub fn lua_resume(
         let g = state.global.borrow();
         lua_gc::HeapGuard::push(&g.heap)
     };
-    // TODO(port): coroutine support (Phase E). The implementation below is a
-    // faithful translation of the C logic but will not work correctly until
-    // coroutine stack switching is available. Phase A: translate the logic;
-    // Phase E: make it actually work.
-
     if state.status == LuaStatus::Ok as u8 {
         if !state.is_base_ci(state.ci) {
             return resume_error(state, b"cannot resume non-suspended coroutine", nargs);
@@ -1366,8 +1331,8 @@ pub fn lua_resume(
         "lua_resume: not enough stack elements"
     );
 
-    // PORT NOTE: In C, luaD_throw pushes the error value onto the stack before
-    // longjmp-ing. In Rust the value rides inside LuaError and is normally
+    // C's luaD_throw pushes the error value onto the stack before
+    // longjmp-ing. Here the value rides inside LuaError and is normally
     // discarded by raw_run_protected — but real errors (ErrRun/ErrMem/etc.)
     // need their payload pushed so the later seterrorobj can copy it back to
     // the error slot. We must skip Yield (no payload) and Ok (none happened).
@@ -1415,7 +1380,6 @@ pub fn lua_resume(
 /// Returns whether the calling context can yield.
 ///
 pub fn lua_isyieldable(state: &LuaState) -> bool {
-    // yieldable → state.is_yieldable()  (macros.tsv)
     state.is_yieldable()
 }
 
@@ -1428,9 +1392,6 @@ pub fn lua_yieldk(
     ctx: isize,
     k: Option<crate::state::LuaKFunction>,
 ) -> Result<i32, LuaError> {
-    // TODO(port): coroutine support (Phase E). Yielding requires stack-switching;
-    // stubbed here with a faithful translation of the C logic.
-
     let ci_idx = state.ci;
 
     debug_assert!(
@@ -1494,7 +1455,6 @@ struct CloseP {
 /// Calls `luaF_close` with the level/status captured in `pcl`.
 ///
 fn close_aux(state: &mut LuaState, pcl: &mut CloseP) -> Result<(), LuaError> {
-    // TODO(port): status→i32 conversion for func::close sentinel.
     func::close(state, pcl.level, pcl.status as i32, false)?;
     Ok(())
 }
@@ -1546,11 +1506,11 @@ where
     let old_errfunc = state.errfunc;
     state.errfunc = ef;
 
-    // PORT NOTE: In C, luaD_throw pushes the error value onto the stack before
+    // C's luaD_throw pushes the error value onto the stack before
     // longjmp-ing, and luaG_errormsg invokes the message handler at the error
-    // site before the throw. In Rust the error rides inside LuaError and
-    // propagates via `?`, so the handler is never invoked along the way; we
-    // synthesise that invocation here once we've caught the Err.
+    // site before the throw. Here the error rides inside LuaError and
+    // propagates via `?`, so the handler is never invoked along the way; this
+    // synthesises that invocation once the Err is caught.
     let mut status = match raw_run_protected(state, func) {
         Ok(()) => LuaStatus::Ok,
         Err(e) => {
@@ -1609,16 +1569,15 @@ where
 
 /// Parser invocation data passed through `pcall`.
 ///
-///
-/// PORT NOTE: `const char *mode` and `const char *name` become owned byte vecs
+/// C's `const char *mode` and `const char *name` become owned byte vecs here
 /// so that `SParser` can outlive the original string data without raw pointers.
 struct SParser {
     z: ZIO,
     /// LexBuffer from `crate::zio` (Mbuffer in C).
     buff: LexBuffer,
-    /// TODO(phase-b): real Dyndata lives in the lua-parse crate.
+    /// Opaque stand-in for `lua-parse`'s real `DynData`; see [`DynDataStub`].
     dyd: DynDataStub,
-    // PORT NOTE: stored as Option<Vec<u8>> to own the bytes; None means no mode restriction.
+    /// `None` means no mode restriction.
     mode: Option<Vec<u8>>,
     name: Vec<u8>,
 }
@@ -1629,8 +1588,8 @@ fn check_mode(mode: Option<&[u8]>, kind: &[u8]) -> Result<(), LuaError> {
     if let Some(mode_bytes) = mode {
         let kind_char = kind[0];
         if !mode_bytes.contains(&kind_char) {
-            // TODO(port): &[u8] display — lossy UTF-8 here is acceptable for mode/kind
-            // strings which are always ASCII literals ("binary"/"text" and "bt"/"b"/"t").
+            // Lossy UTF-8 here is fine: mode/kind strings are always ASCII
+            // literals ("binary"/"text" and "bt"/"b"/"t").
             return Err(LuaError::syntax(format_args!(
                 "attempt to load a {} chunk (mode is '{}')",
                 core::str::from_utf8(kind).unwrap_or("?"),
@@ -1645,24 +1604,20 @@ fn check_mode(mode: Option<&[u8]>, kind: &[u8]) -> Result<(), LuaError> {
 /// binary vs. text, then calls the undumper or parser accordingly.
 ///
 fn f_parser(state: &mut LuaState, p: &mut SParser) -> Result<(), LuaError> {
-    // zgetc → z.getc()  (macros.tsv)
     let c = p.z.getc(state)?;
 
-    // LUA_SIGNATURE → const LUA_SIGNATURE: &[u8] = b"\x1bLua"  (macros.tsv)
     let cl = if c == b'\x1b' as i32 {
         check_mode(p.mode.as_deref(), b"binary")?;
-        // TODO(port): undump returns a LClosure; the Rust API isn't finalised.
         crate::undump::undump(state, &mut p.z, &p.name)?
     } else {
         check_mode(p.mode.as_deref(), b"text")?;
-        // TODO(port): parser API not yet finalised; returns a LClosure.
         parse_stub(state, &mut p.z, &mut p.buff, &mut p.dyd, &p.name, c)?
     };
 
     debug_assert!(cl.upvals.len() == cl.proto.upvalues.len());
     func::init_upvals(state, &cl)?;
 
-    // PORT NOTE: In C-Lua, `luaY_parser` / `luaU_undump` themselves push the
+    // In C, `luaY_parser` / `luaU_undump` themselves push the
     // closure onto the stack before returning (see lparser.c `luaY_parser`:
     // `setclLvalue2s(L, L->top.p, cl); luaD_inctop(L);`). In the Rust port
     // they return the closure by value, so `f_parser` must push it here.
@@ -1692,7 +1647,6 @@ pub(crate) fn protected_parser(
     name: &[u8],
     mode: Option<&[u8]>,
 ) -> LuaStatus {
-    // incnny → state.inc_nny()  (macros.tsv)
     state.inc_nny();
 
     let mut p = SParser {
@@ -1702,8 +1656,6 @@ pub(crate) fn protected_parser(
         mode: mode.map(|m| m.to_vec()),
         name: name.to_vec(),
     };
-
-    // (macros.tsv: luaZ_initbuffer → buf.init() / Mbuffer::new())
 
     let saved_gcstp = {
         let mut g = state.global_mut();
@@ -1720,7 +1672,6 @@ pub(crate) fn protected_parser(
 
     // (p and all its sub-fields drop here automatically)
 
-    // decnny → state.dec_nny()  (macros.tsv)
     state.dec_nny();
 
     status

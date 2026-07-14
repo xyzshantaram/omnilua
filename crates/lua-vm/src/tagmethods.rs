@@ -55,7 +55,8 @@ impl TagMethod {
     /// Convert a raw u8 discriminant to a `TagMethod`.
     /// Returns `TagMethod::N` (sentinel) if `v >= TM_N`.
     ///
-    /// PORT NOTE: reshaped for borrowck — C casts freely; Rust requires an explicit map.
+    /// C casts freely between the integer and the enum; here that requires
+    /// an explicit map.
     pub(crate) fn from_u8(v: u8) -> Self {
         match v {
             0 => TagMethod::Index,
@@ -94,18 +95,9 @@ pub(crate) const TM_N: usize = TagMethod::N as usize;
 
 // ── Type-name table (from ltm.h / ltm.c `luaT_typenames_`) ──────────────────
 
-//
-//   "no value",
-//   "nil", "boolean", udatatypename, "number",
-//   "string", "table", "function", udatatypename, "thread",
-//   "upvalue", "proto"
-// };
-//
 // Indexed as `luaT_typenames_[(x) + 1]` where x is the raw LuaType integer
 // (LUA_TNONE = -1, LUA_TNIL = 0, …, LUA_TPROTO = 10).
 // LUA_TOTALTYPES = LUA_TPROTO + 2 = 12 entries.
-//
-// PORT NOTE: C uses `const char*`; Rust uses `&'static [u8]` throughout.
 pub(crate) static TYPE_NAMES: &[&[u8]] = &[
     b"no value", // index 0 → LUA_TNONE  (-1 + 1)
     b"nil",      // index 1 → LUA_TNIL   ( 0 + 1)
@@ -139,14 +131,6 @@ pub(crate) fn type_name(t: LuaType) -> &'static [u8] {
 /// metamethod lookup.  After this call, `GlobalState.tmname[i]` holds the
 /// interned `LuaString` for metamethod `i`.
 pub(crate) fn init(state: &mut LuaState) -> Result<(), LuaError> {
-    //     "__index", "__newindex",
-    //     "__gc", "__mode", "__len", "__eq",
-    //     "__add", "__sub", "__mul", "__mod", "__pow",
-    //     "__div", "__idiv",
-    //     "__band", "__bor", "__bxor", "__shl", "__shr",
-    //     "__unm", "__bnot", "__lt", "__le",
-    //     "__concat", "__call", "__close"
-    // };
     const EVENT_NAMES: &[&[u8]] = &[
         b"__index",
         b"__newindex",
@@ -176,22 +160,20 @@ pub(crate) fn init(state: &mut LuaState) -> Result<(), LuaError> {
     ];
     debug_assert!(EVENT_NAMES.len() == TM_N);
 
-    // PORT NOTE: The C `tmname[TM_N]` is a fixed-size array on `global_State`;
-    // the Rust port uses `Vec<GcRef<LuaString>>` initialized empty in
-    // `lua_state_init`, so we must grow it to `TM_N` before indexed assignment.
+    // C's `tmname[TM_N]` is a fixed-size array on `global_State`; here
+    // `Vec<GcRef<LuaString>>` is initialized empty in `lua_state_init`, so it
+    // must grow to `TM_N` before indexed assignment.
     if state.global().tmname.len() < TM_N {
         let pad = state.intern_str(b"")?;
         state.global_mut().tmname.resize(TM_N, pad);
     }
 
-    //     G(L)->tmname[i] = luaS_new(L, luaT_eventname[i]);
-    //     luaC_fix(L, obj2gco(G(L)->tmname[i]));  /* never collect these names */
-    // }
     for (i, &name) in EVENT_NAMES.iter().enumerate() {
         let interned = state.intern_str(name)?;
         state.global_mut().tmname[i] = interned.clone();
-        // Pin the string so the GC never collects it.
-        // TODO(port): luaC_fix API on gc() is TBD; no-op in Phase A–C (Rc keeps it alive)
+        // Pin the string so the GC never collects it. `fix_object` is a
+        // no-op today; these names stay reachable through `GlobalState`
+        // regardless for the life of the state.
         state.gc().fix_object(&interned);
     }
     Ok(())
@@ -206,14 +188,6 @@ pub(crate) fn init(state: &mut LuaState) -> Result<(), LuaError> {
 /// neither the object nor its type has a metatable, or when the metatable
 /// does not contain the requested metamethod.
 pub(crate) fn get_tm_by_obj(state: &mut LuaState, o: &LuaValue, event: TagMethod) -> LuaValue {
-    //   case LUA_TTABLE:    mt = hvalue(o)->metatable; break;
-    //   case LUA_TUSERDATA: mt = uvalue(o)->metatable; break;
-    //   default:            mt = G(L)->mt[ttype(o)];
-    // }
-    //
-    // TODO(port): `GcRef<LuaTable>` access pattern (direct field vs borrow) is
-    // TBD pending the GcRef/RefCell decision in Phase B; using `.metatable()`
-    // accessor here as a placeholder.
     let mt: Option<GcRef<lua_types::value::LuaTable>> = match o {
         LuaValue::Table(t) => t.metatable(),
         LuaValue::UserData(u) => u.metatable(),
@@ -243,18 +217,17 @@ pub(crate) fn get_tm_by_obj(state: &mut LuaState, o: &LuaValue, event: TagMethod
 /// returns `Cow::Borrowed` pointing into the static `TYPE_NAMES` table —
 /// no allocation, no interning, no `LuaState` access required.
 ///
-/// PORT NOTE: C returns `const char*` — either a pointer into a GC-managed
-/// `LuaString` or a pointer into the static `luaT_typenames_` array.  Rust
-/// models this as `Cow<'static, [u8]>`: `Borrowed` for static names,
-/// `Owned` only when the metatable `__name` field overrides the default.
-/// Uses `LuaTable::get_str_bytes` (linear byte-scan) instead of
-/// `intern_str` + `get_short_str` so the lookup is infallible and requires
-/// no mutable state access.
+/// C returns `const char*` — either a pointer into a GC-managed `LuaString`
+/// or a pointer into the static `luaT_typenames_` array. This models that as
+/// `Cow<'static, [u8]>`: `Borrowed` for static names, `Owned` only when the
+/// metatable `__name` field overrides the default. Uses
+/// `LuaTable::get_str_bytes` (linear byte-scan) instead of `intern_str` +
+/// `get_short_str` so the lookup is infallible and requires no mutable state
+/// access.
 pub(crate) fn obj_type_name_cow(o: &LuaValue, honors_name: bool) -> Cow<'static, [u8]> {
     if matches!(o, LuaValue::LightUserData(_)) {
         return Cow::Borrowed(b"light userdata");
     }
-    //        (ttisfulluserdata(o) && (mt = uvalue(o)->metatable) != NULL))
     let mt: Option<GcRef<lua_types::value::LuaTable>> = match o {
         LuaValue::Table(t) => t.metatable(),
         LuaValue::UserData(u) => u.metatable(),
@@ -303,20 +276,13 @@ pub(crate) fn call_tm(
     p3: LuaValue,
 ) -> Result<(), LuaError> {
     let func = state.top_idx();
-    //
-    // PORT NOTE: In C these are direct writes into the EXTRA_STACK reserve
-    // area above the official top.  In Rust we use push() which manages
-    // capacity; the semantic result is identical.
+    // C writes these directly into the EXTRA_STACK reserve area above the
+    // official top. Here push() manages capacity instead; the semantic
+    // result is identical.
     state.push(f);
     state.push(p1);
     state.push(p2);
     state.push(p3);
-    //      luaD_call(L, func, 0);
-    //    else
-    //      luaD_callnoyield(L, func, 0);
-    //
-    // TODO(port): `do_call(func, nresults)` vs `call_from(func, nresults)` —
-    // exact Rust API name TBD; nargs is implicit as `top - func - 1`.
     if state.current_ci().is_lua_code() {
         state.do_call(func, 0)?;
     } else {
@@ -327,7 +293,6 @@ pub(crate) fn call_tm(
 
 // ── luaT_callTMres ───────────────────────────────────────────────────────────
 
-//                          const TValue *p2, StkId res)
 /// Call tag method `f` with two arguments, writing the single result into
 /// the stack slot at index `res`.
 ///
@@ -345,25 +310,16 @@ pub(crate) fn call_tm_res(
     p2: LuaValue,
     res: StackIdx,
 ) -> Result<(), LuaError> {
-    // savestack → StackIdx is already the stable byte-offset analogue; no-op.
-
     let func = state.top_idx();
     state.push(f);
     state.push(p1);
     state.push(p2);
 
-    //      luaD_call(L, func, 1);
-    //    else
-    //      luaD_callnoyield(L, func, 1);
-    //
-    // TODO(port): same `do_call` API question as in call_tm above.
     if state.current_ci().is_lua_code() {
         state.do_call(func, 1)?;
     } else {
         state.do_call_no_yield(func, 1)?;
     }
-
-    // restorestack → StackIdx is already stable; `res` is unchanged.
 
     // Pre-decrement top, then copy that slot to res.
     let result_val = state.pop();
@@ -595,22 +551,10 @@ pub(crate) fn try_bin_tm(
                 return result;
             }
         }
-        //   case TM_BAND: case TM_BOR: case TM_BXOR:
-        //   case TM_SHL: case TM_SHR: case TM_BNOT: {
-        //     if (ttisnumber(p1) && ttisnumber(p2))
-        //       luaG_tointerror(L, p1, p2);
-        //     else
-        //       luaG_opinterror(L, p1, p2, "perform bitwise operation on");
-        //   }
-        //   /* calls never return, but to avoid warnings: *//* FALLTHROUGH */
-        //   default:
-        //     luaG_opinterror(L, p1, p2, "perform arithmetic on");
-        // }
-        //
-        // PORT NOTE: the C switch has a dead "FALLTHROUGH" for bitwise cases
-        // because both branches of the inner if/else call noreturn functions.
-        // In Rust `match` has no implicit fallthrough; each arm is self-contained
-        // and explicitly returns `Err(...)`.
+        // C's switch has a dead "FALLTHROUGH" for bitwise cases because both
+        // branches of the inner if/else call noreturn functions. `match` has
+        // no implicit fallthrough; each arm here is self-contained and
+        // explicitly returns `Err(...)`.
         match event {
             TagMethod::BAnd
             | TagMethod::BOr
@@ -763,7 +707,7 @@ fn operand_metatable(
 /// 5.1 raised an error for ordered comparisons in this `Nil` case (the caller
 /// does so) and returned "not equal" for equality.
 ///
-/// PORT NOTE (#events51): 5.1 picks the left metatable's handler, returns it
+/// (#events51): 5.1 picks the left metatable's handler, returns it
 /// directly when both metatables are the same object, and otherwise keeps it
 /// only if the right metatable's handler is raw-equal (same function reference).
 /// 5.2+ consult left-then-right unconditionally, so this is gated to V51 by the
@@ -798,13 +742,12 @@ pub(crate) fn get_comp_tm_51(
 
 // ── luaT_callorderTM ─────────────────────────────────────────────────────────
 
-//                           TMS event)
 /// Call an order metamethod (`__lt` or `__le`) and return its boolean result.
 ///
 /// Returns `true` if the metamethod returned a truthy value.
 /// Raises `LuaError::order_error` if neither operand has the metamethod.
 ///
-/// PORT NOTE: `LUA_COMPAT_LT_LE` (deriving `__le` from `__lt`) is ON by default
+/// `LUA_COMPAT_LT_LE` (deriving `__le` from `__lt`) is ON by default
 /// in the reference `make macosx` builds of 5.1–5.4 and removed in 5.5. We match
 /// the default-built reference (the pinned oracle, per specs/oracle/CONTRACT.md),
 /// so the fallback is implemented and version-gated: derive for 5.1–5.4, raise
@@ -815,7 +758,7 @@ pub(crate) fn call_order_tm(
     p2: &LuaValue,
     event: TagMethod,
 ) -> Result<bool, LuaError> {
-    // PORT NOTE (#139): In 5.1, `luaV_lessthan`/`luaV_lessequal` check
+    // (#139): In 5.1, `luaV_lessthan`/`luaV_lessequal` check
     // `ttype(l) != ttype(r)` FIRST and raise `luaG_ordererror` before any TM
     // lookup, so the `__lt`/`__le` metamethod is consulted ONLY for same-Lua-type
     // operands. 5.2+ removed that guard and consults the TM for mixed types too.
@@ -833,7 +776,7 @@ pub(crate) fn call_order_tm(
         }
     }
 
-    // PORT NOTE (#events51): 5.1's `call_orderTM` requires both operands to
+    // (#events51): 5.1's `call_orderTM` requires both operands to
     // carry the SAME `__lt`/`__le` handler (`luaO_rawequalObj(tm1, tm2)`), and
     // raises `luaG_ordererror` otherwise — including when only one operand has
     // the metamethod. 5.2+ consult left-then-right unconditionally, so this is
@@ -860,23 +803,19 @@ pub(crate) fn call_order_tm(
         return Err(crate::debug::order_error(state, p1, p2));
     }
 
-    //      return !l_isfalse(s2v(L->top.p));
-    //
-    // PORT NOTE: In C, `L->top.p` is used as a scratch slot (written by
-    // callTMres then immediately read) in the EXTRA_STACK reserved area above
-    // the official stack top — the stack top is NOT officially advanced.
-    // In Rust we pass `state.top_idx()` as `res`; call_bin_tm → call_tm_res
-    // pushes 3 values, calls, pops the result back to res, and leaves top ==
-    // res (i.e. top unchanged relative to entry).  Reading get_at(res_idx)
-    // after this is safe because the slot was just written and top == res_idx.
-    //
-    // TODO(port): Verify in Phase B that no call path between call_bin_tm
-    // returning and the get_at read can disturb the scratch slot or reset top
-    // below res_idx.  The invariant holds as long as do_call with 1 result
-    // leaves exactly one value on the stack above func.
+    // C uses `L->top.p` as a scratch slot (written by callTMres then
+    // immediately read) in the EXTRA_STACK reserved area above the official
+    // stack top — the stack top is NOT officially advanced. Here
+    // `state.top_idx()` is passed as `res`; call_bin_tm -> call_tm_res pushes
+    // 3 values, calls, pops the result back to res, and leaves top == res
+    // (i.e. top unchanged relative to entry). Reading get_at(res_idx) after
+    // this is safe because the slot was just written and top == res_idx —
+    // an invariant that depends on do_call with 1 result always leaving
+    // exactly one value on the stack above func, and on no call path
+    // between call_bin_tm returning and this read disturbing the scratch
+    // slot or resetting top below res_idx.
     let res_idx = state.top_idx();
     if call_bin_tm(state, p1, p2, res_idx, event)? {
-        // l_isfalse(o) → matches!(o, LuaValue::Nil | LuaValue::Bool(false))
         let result = state.get_at(res_idx).clone();
         return Ok(!matches!(result, LuaValue::Nil | LuaValue::Bool(false)));
     }
@@ -983,22 +922,13 @@ pub(crate) fn adjust_varargs(
     let func_val = state.get_at(ci_func).clone();
     state.push(func_val);
 
-    //      setobjs2s(L, L->top.p++, ci->func.p + i);
-    //      setnilvalue(s2v(ci->func.p + i));  /* erase original parameter (for GC) */
-    //    }
     for i in 1..=nfixparams {
-        // TODO(port): StackIdx is u32; if ci_func + i overflows the u32 range
-        // this panics in debug.  In practice `i` is small (≤ 255 params), but
-        // add a saturating or checked add in Phase B.
         let src: StackIdx = ci_func + i as i32;
         let param_val = state.get_at(src).clone();
         state.push(param_val);
         state.set_at(src, LuaValue::Nil);
     }
 
-    // TODO(port): `actual + 1` may be negative if `actual < -1` (malformed call);
-    // casting to StackIdx (u32) would underflow.  In practice Lua guarantees
-    // actual >= 0 at this point, but add a debug_assert in Phase B.
     let offset = (actual + 1) as i32;
     state.call_info[ci_idx.as_usize()].func = state.call_info[ci_idx.as_usize()].func + offset;
     state.call_info[ci_idx.as_usize()].top = state.call_info[ci_idx.as_usize()].top + offset;
@@ -1134,39 +1064,28 @@ pub(crate) fn get_varargs(
     }
     let nextra: i32 = state.call_info[ci_idx.as_usize()].nextra_args();
 
-    //      wanted = nextra;  /* get all extra arguments available */
-    //      checkstackGCp(L, nextra, where);  /* ensure stack space */
-    //      L->top.p = where + nextra;  /* next instruction will need top */
-    //    }
     let wanted: i32 = if wanted < 0 {
         state.set_top(state.call_info[ci_idx.as_usize()].top);
         state.check_stack(nextra)?;
         state.gc_pre_collect_clear();
         state.gc().check_step();
-        // TODO(port): `where_idx + nextra as i32` may overflow if nextra
-        // is very large; checked add in Phase B.
         state.set_top(where_idx + nextra as i32);
         nextra
     } else {
         wanted
     };
 
-    //      setobjs2s(L, where + i, ci->func.p - nextra + i);
-    //
     // After adjustvarargs, the extra args live at positions
     // ci->func - nextra .. ci->func - 1.
     let ci_func: StackIdx = state.call_info[ci_idx.as_usize()].func;
     let copy_count = wanted.min(nextra);
     for i in 0..copy_count {
-        // TODO(port): subtraction on StackIdx (u32) underflows if nextra > ci_func.
-        // Invariant: ci_func >= nextra (enforced by adjustvarargs), but add
-        // a debug_assert in Phase B.
+        // Invariant: ci_func >= nextra, enforced by adjustvarargs.
         let src: StackIdx = ci_func - nextra as i32 + i as i32;
         let val = state.get_at(src).clone();
         state.set_at(where_idx + i as i32, val);
     }
 
-    //      setnilvalue(s2v(where + i));
     for i in copy_count..wanted {
         state.set_at(where_idx + i as i32, LuaValue::Nil);
     }

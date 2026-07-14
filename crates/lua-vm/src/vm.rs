@@ -1,4 +1,4 @@
-//! Lua virtual machine — port of `src/lvm.c` (1899 lines, 32 functions).
+//! Lua virtual machine — port of `lvm.c`.
 //!
 //! This module implements:
 //! - Number coercion helpers (tonumber_, flttointeger, tointegerns, tointeger)
@@ -17,7 +17,7 @@
 //! The C source uses `goto startfunc` / `goto returning` / `goto ret` across
 //! labelled points in `luaV_execute`. These are modelled with Rust's labelled
 //! loops (`'startfunc`, `'returning`, `'dispatch`) and `continue`/`break`
-//! on those labels.  See inline `PORT NOTE` comments.
+//! on those labels.
 
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -274,9 +274,8 @@ impl OpCode {
     }
 }
 
-/// TODO(phase-b): Instruction accessor extension trait. The real per-mode
-/// decode helpers live in `lua-types::opcode` once translated. Stubbed locally
-/// so call sites resolve; bodies are inferred from `lopcodes.h` macro shapes.
+/// Instruction accessor extension trait. Per-mode decode helpers, with
+/// bodies derived from `lopcodes.h` macro shapes.
 pub trait InstructionExt {
     fn opcode(&self) -> OpCode;
     fn arg_a(&self) -> i32;
@@ -467,9 +466,10 @@ impl InstructionExt for Instruction {
 ///   bit 3: A  (instruction writes register A)
 ///   bits 0-2: op format mode (iABC, iABx, iAsBx, iAx, isJ)
 ///
-/// PORT NOTE: lua-types does not yet expose the canonical `OP_MODES` table; this
-/// is a local stand-in keyed off the vm.rs `OpCode` stub so the four mode
-/// predicates above can answer correctly until the real table lands.
+/// lua-types does not yet expose the canonical `OP_MODES` table; this
+/// is a local stand-in keyed off the vm.rs `OpCode` copy so the four mode
+/// predicates above can answer correctly until the real table lands (see
+/// the `OpCode` duplication note above the `OpCode` definition).
 const OP_MODE_BYTES: [u8; NUM_OPCODES as usize] = [
     0x08, // Move
     0x0a, // LoadI
@@ -1132,14 +1132,12 @@ pub(crate) fn finish_set(
 /// Lexicographic string comparison that handles embedded NULs by segmenting.
 /// Returns negative / zero / positive like `strcmp`.
 ///
-/// PORT NOTE: C uses `strcoll` for locale-aware comparison within each NUL-free
-/// segment.  Rust's standard library has no locale support, so we use
-/// `slice::cmp` (byte-by-byte lexicographic order, equivalent to `memcmp`).
-/// This means locale-specific ordering (e.g. accented characters) differs from
-/// the C reference.  Mark as TODO for a later `libc::strcoll` bridge if needed.
+/// C uses `strcoll` for locale-aware comparison within each NUL-free
+/// segment. There is no locale support here, so `slice::cmp` is used instead
+/// (byte-by-byte lexicographic order, equivalent to `memcmp`). This means
+/// locale-specific ordering (e.g. accented characters) differs from the C
+/// reference.
 fn str_cmp(s1: &[u8], s2: &[u8]) -> std::cmp::Ordering {
-    // TODO(port): C uses strcoll per-segment; here we use byte-lexicographic
-    // order.  This affects locale-sensitive string comparisons.
     let mut s1 = s1;
     let mut s2 = s2;
     loop {
@@ -1760,9 +1758,11 @@ pub(crate) fn shiftl(x: i64, y: i64) -> i64 {
 
 // ─── Closure creation ────────────────────────────────────────────────────────
 
-/// StkId base, StkId ra)`
 /// Create a new Lua closure from prototype `p`, initialise its upvalues,
 /// and push it onto the stack at `ra`.
+///
+/// Forwards to the `LuaState` method of the same name, which has access to
+/// the enclosing closure's upvals and the child proto from the current frame.
 fn push_closure(
     state: &mut LuaState,
     proto_idx: usize, // index into current closure's proto.p[]
@@ -1770,9 +1770,6 @@ fn push_closure(
     base: StackIdx,
     ra: StackIdx,
 ) -> Result<(), LuaError> {
-    // TODO(port): pushclosure needs access to the enclosing closure's upvals and
-    // the child proto from the current frame.  This stub forwards to a LuaState
-    // method that has the required context.
     state.push_closure(proto_idx, ci, base, ra)
 }
 
@@ -1912,12 +1909,12 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
     );
     let tfor_55 = state.global().lua_version == lua_types::LuaVersion::V55;
 
-    // PORT NOTE: `startfunc:` is the entry point that (re)sets `trap`.
+    // Corresponds to C's `startfunc:` label — the entry point that (re)sets `trap`.
     'startfunc: loop {
         trap = state.hook_mask() != 0;
 
-        // PORT NOTE: `returning:` is the re-entry after a Lua call returns.
-        // Re-enters 'returning without resetting trap.
+        // Corresponds to C's `returning:` label — the re-entry after a Lua
+        // call returns, without resetting trap.
         'returning: loop {
             let ci_slot = ci.as_usize();
             let func_idx = state.call_info[ci_slot].func;

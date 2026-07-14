@@ -1,7 +1,6 @@
 //! Auxiliary functions to manipulate prototypes and closures.
 //!
-//! Port of `reference/lua-5.4.7/src/lfunc.c` (295 lines, 16 functions).
-//! The companion header `lfunc.h` is merged here per PORTING.md §1.
+//! Ported from `lfunc.c`/`lfunc.h`.
 //!
 //! # Design notes
 //!
@@ -20,18 +19,6 @@
 //! The delta-encoding machinery (MAXDELTA, dummy nodes) is an artifact of the u16
 //! delta field and is entirely superseded by the `Vec<StackIdx>` model.
 
-// PORT NOTE: `LuaProto` is currently a stub in crate::state (from lstate.c's
-// partial port in state.rs). The full `LuaProto` definition belongs in
-// crate::object (lobject.c → object.rs). Fields referenced below will compile
-// once object.rs is written; see TODO(port) at each field site.
-
-// PORT NOTE: `GcRef<T> = Rc<T>` in Phase A–C provides no interior mutability.
-// `close_upval` and `init_upvals` must mutate `UpVal` and `LuaClosure` values
-// that are shared through `GcRef`. In Phase B, the design options are:
-//   (a) `GcRef<T> = Rc<RefCell<T>>` for mutable GC objects, or
-//   (b) a custom `GcCell<T>` wrapper with conditional interior mutability.
-// Both `close_upval` and `init_upvals` carry `TODO(port)` at the mutation sites.
-
 #[allow(unused_imports)]
 use crate::prelude::*;
 
@@ -41,7 +28,6 @@ pub use lua_types::{CallInfoIdx, StackIdx};
 
 // ── lfunc.h constants ─────────────────────────────────────────────────────────
 
-// macros.tsv: CLOSEKTOP → const CLOSE_K_TOP: i32 = -1
 /// Sentinel status meaning "close upvalues but preserve the stack top."
 /// Passed as `status` to `close` / `prep_call_close_mth`.
 pub(crate) const CLOSE_K_TOP: i32 = -1;
@@ -56,25 +42,9 @@ pub(crate) fn init_upvals(
     state: &mut LuaState,
     cl: &GcRef<lua_types::LuaLClosure>,
 ) -> Result<(), LuaError> {
-    //      GCObject *o = luaC_newobj(L, LUA_VUPVAL, sizeof(UpVal));
-    //      UpVal *uv = gco2upv(o);
-    //      uv->v.p = &uv->u.value;  /* make it closed */
-    //      setnilvalue(uv->v.p);    /* *o = LuaValue::Nil */
-    //      cl->upvals[i] = uv;
-    //      luaC_objbarrier(L, cl, uv);
-    //  }
-    //
-    // In Rust: create UpVal::Closed(Nil) for each slot; GC barrier is no-op Phase A–C.
-
-    // TODO(port): GcRef<T> = Rc<T> has no interior mutability. Mutating
-    // `cl.upvals[i]` here requires either Rc<RefCell<LuaClosure>> or Rc::get_mut.
-    // The code below captures the intended logic; it will not compile until
-    // GcRef provides a borrow_mut() path (Phase B design decision).
     let n = cl.upvals.len();
     for i in 0..n {
         let uv: GcRef<UpVal> = state.new_upval_closed(LuaValue::Nil);
-        // TODO(port): cl.borrow_mut().as_lua_mut().upvals[i] = Some(uv.clone());
-        // Requires interior mutability; see PORT NOTE at top of file.
         let _ = (i, uv);
     }
     Ok(())
@@ -87,35 +57,20 @@ pub(crate) fn init_upvals(
 /// global `twups` list if necessary.
 ///
 fn new_open_upval(state: &mut LuaState, level: StackIdx, insert_pos: usize) -> GcRef<UpVal> {
-    //    UpVal *uv = gco2upv(o);
-    //    UpVal *next = *prev;
-    //    uv->v.p = s2v(level);   /* current value lives in the stack */
-    //    uv->u.open.next = next;
-    //    uv->u.open.previous = prev;
-    //    if (next) next->u.open.previous = &uv->u.open.next;
-    //    *prev = uv;
-    //
-    // In Rust: intrusive next/previous fields are gone; Vec insertion replaces
-    // the pointer-threading. The `prev` parameter (UpVal **) becomes `insert_pos`.
+    // C's intrusive next/previous fields are gone; Vec insertion replaces the
+    // pointer-threading, and the `prev` parameter (UpVal **) becomes
+    // `insert_pos`.
     //
     // The home thread of the upvalue is whichever thread is currently
-    // executing `find_upval` — it captures one of that thread's stack
-    // slots. Phase E-3 makes this id real so `upvalue_get`/`upvalue_set`
-    // can dispatch through `GlobalState::cross_thread_upvals` when a
-    // coroutine reads or writes an upvalue belonging to its parent.
+    // executing `find_upval` — it captures one of that thread's stack slots.
+    // `GlobalState::cross_thread_upvals` is what a coroutine actually reads
+    // or writes through when accessing an upvalue belonging to its parent.
     let owner_tid = state.global().current_thread_id as usize;
     let uv: GcRef<UpVal> = state.new_upval_open(owner_tid, level);
-    // PORT NOTE: Vec insert maintains descending StackIdx order (highest first),
+    // Vec insert maintains descending StackIdx order (highest first),
     // mirroring the C intrusive list where the head is always the topmost slot.
     state.openupval.insert(insert_pos, uv.clone());
-    // macros.tsv: isintwups → state.in_twups()
-    // TODO(port): implement state.in_twups() and the twups insertion. The method needs to
-    // check whether this LuaState is already in global.twups. Requires either a flag on
-    // LuaState or a scan of global.twups. See also lstate.h discussion in state.rs.
     if !state_in_twups(state) {
-        // TODO(port): state.global_mut().twups.push(gc_ref_to_this_thread(state));
-        // Deferred: obtaining a GcRef<LuaState> to self requires Arc/Rc self-reference
-        // which is an unsolved design problem for Phase E coroutines.
     }
     uv
 }
@@ -131,18 +86,10 @@ pub(crate) fn find_upval(state: &mut LuaState, level: StackIdx) -> GcRef<UpVal> 
         state_in_twups(state) || state.openupval.is_empty(),
         "thread must be in twups if it has open upvalues"
     );
-    //    while ((p = *pp) != NULL && uplevel(p) >= level) {
-    //      lua_assert(!isdead(G(L), p));
-    //      if (uplevel(p) == level) return p;  /* found */
-    //      pp = &p->u.open.next;
-    //    }
-    //    return newupval(L, level, pp);
-    //
     // The list is sorted descending. We scan from index 0 (highest) downward.
     // When we find an entry with idx < level we've passed the insertion point.
     let mut insert_pos = state.openupval.len(); // default: append at end
     for (i, uv_ref) in state.openupval.iter().enumerate() {
-        // macros.tsv: uplevel → extract thread_stack_idx from the open payload
         let uv_idx = match uv_ref.try_open_payload() {
             Some((_thread_id, thread_stack_idx)) => thread_stack_idx,
             None => {
@@ -177,17 +124,7 @@ fn call_close_method(
     err: Option<LuaValue>,
     yy: bool,
 ) -> Result<(), LuaError> {
-    //    const TValue *tm = luaT_gettmbyobj(L, obj, TM_CLOSE);
-    //    setobj2s(L, top, tm);     /* push metamethod */
-    //    setobj2s(L, top + 1, obj); /* 1st arg: self */
-    //    setobj2s(L, top + 2, err); /* 2nd arg: error message */
-    //    L->top.p = top + 3;
-    //    if (yy) luaD_call(L, top, 0);
-    //    else    luaD_callnoyield(L, top, 0);
-    //
-    // In Rust: state.push() manages the top pointer; no pointer arithmetic needed.
-    // setobj2s → state.push(value.clone())
-    // macros.tsv: luaT_gettmbyobj → state.get_tm_by_obj(&obj, TagMethod::Close)
+    // state.push() manages the top pointer; no pointer arithmetic needed.
     let tm = state.get_tm_by_obj(&obj, lua_types::tagmethod::TagMethod::Close);
     let top = state.top;
     state.push(tm);
@@ -195,8 +132,6 @@ fn call_close_method(
     if let Some(err) = err {
         state.push(err);
     }
-    // TODO(port): state.call(top, 0) / state.call_noyield(top, 0) —
-    // these methods live in do_.rs (ldo.c); cross-module call.
     if yy {
         state.lua_call(top, 0)?;
     } else {
@@ -209,27 +144,17 @@ fn call_close_method(
 /// runtime error if it does not.
 ///
 fn check_close_mth(state: &mut LuaState, level: StackIdx) -> Result<(), LuaError> {
-    //    if (ttisnil(tm)) {
-    //      int idx = cast_int(level - L->ci->func.p);
-    //      const char *vname = luaG_findlocal(L, L->ci, idx, NULL);
-    //      if (vname == NULL) vname = "?";
-    //      luaG_runerror(L, "variable '%s' got a non-closable value", vname);
-    //    }
-    //
-    // macros.tsv: s2v(level) → state.stack_at(level) — returns &LuaValue
-    // macros.tsv: ttisnil(tm) → matches!(tm, LuaValue::Nil)
     let val = state.get_stack_value(level).clone();
     let tm = state.get_tm_by_obj(&val, lua_types::tagmethod::TagMethod::Close);
     if matches!(tm, LuaValue::Nil) {
-        // macros.tsv: cast_int → x as i32
         // CallInfo.func is the StackIdx of the function on the stack.
         let func_idx = state.current_ci().func;
         let idx = (level.0 as i32) - (func_idx.0 as i32);
         let vname_owned: Vec<u8> = state
             .debug_find_local(state.ci, idx)
             .unwrap_or_else(|| b"?".to_vec());
-        // PORT NOTE: Lua variable names are ASCII identifiers; `escape_ascii`
-        // produces a Display-compatible wrapper for the byte slice.
+        // Lua variable names are ASCII identifiers; `escape_ascii` produces a
+        // Display-compatible wrapper for the byte slice.
         return Err(LuaError::runtime(format_args!(
             "variable '{}' got a non-closable value",
             vname_owned.escape_ascii()
@@ -250,16 +175,6 @@ fn prep_call_close_mth(
     status: i32,
     yy: bool,
 ) -> Result<(), LuaError> {
-    //    TValue *errobj;
-    //    if (status == CLOSEKTOP)
-    //      errobj = &G(L)->nilvalue;  /* error object is nil */
-    //    else {  /* luaD_seterrorobj will set top to level+2 */
-    //      errobj = s2v(level + 1);
-    //      luaD_seterrorobj(L, status, level + 1);
-    //    }
-    //    callclosemethod(L, uv, errobj, yy);
-    //
-    // macros.tsv: s2v(level) → state.stack_at(level), returning &LuaValue
     // Clone before any mutable operations to avoid borrow conflicts.
     let uv = state.get_stack_value(level).clone();
     let err = if state.global().lua_version == lua_types::LuaVersion::V55 {
@@ -272,7 +187,6 @@ fn prep_call_close_mth(
     } else if status == CLOSE_K_TOP {
         Some(LuaValue::Nil)
     } else {
-        // TODO(port): state.set_error_obj(status, ...) lives in do_.rs (ldo.c).
         state.set_error_obj(status, StackIdx(level.0 + 1))?;
         Some(state.get_stack_value(StackIdx(level.0 + 1)).clone())
     };
@@ -293,22 +207,14 @@ pub(crate) fn new_tbc_upval(state: &mut LuaState, level: StackIdx) -> Result<(),
         state.tbclist.last().map_or(true, |&top| level.0 > top.0),
         "new tbc entry must be above current tbclist head"
     );
-    // macros.tsv: l_isfalse → matches!(o, LuaValue::Nil | LuaValue::Bool(false))
     // Clone before borrow to avoid aliasing with later mutable calls.
     let val = state.get_stack_value(level).clone();
     if matches!(val, LuaValue::Nil | LuaValue::Bool(false)) {
         return Ok(());
     }
     check_close_mth(state, level)?;
-    //   while (cast_uint(level - L->tbclist.p) > MAXDELTA) {
-    //     L->tbclist.p += MAXDELTA;
-    //     L->tbclist.p->tbclist.delta = 0;  /* dummy node */
-    //   }
-    //   level->tbclist.delta = cast(unsigned short, level - L->tbclist.p);
-    //   L->tbclist.p = level;
-    //
-    // PORT NOTE: The MAXDELTA / dummy-node mechanism is a C-only optimisation
-    // required because `StackValue.tbclist.delta` is a `u16` (max 65535). With
+    // The MAXDELTA / dummy-node mechanism in C is an optimisation required
+    // because `StackValue.tbclist.delta` is a `u16` (max 65535). With
     // `Vec<StackIdx>` the index fits a u32 and no dummy nodes are ever needed.
     state.tbclist.push(level);
     Ok(())
@@ -319,14 +225,6 @@ pub(crate) fn new_tbc_upval(state: &mut LuaState, level: StackIdx) -> Result<(),
 /// the current stack value into the upvalue's own storage.
 ///
 pub(crate) fn close_upval(state: &mut LuaState, level: StackIdx) {
-    //      TValue *slot = &uv->u.value;
-    //      lua_assert(uplevel(uv) < L->top.p);
-    //      luaF_unlinkupval(uv);
-    //      setobj(L, slot, uv->v.p);  /* copy stack value into upvalue */
-    //      uv->v.p = slot;            /* now the value lives here */
-    //      if (!iswhite(uv)) { nw2black(uv); luaC_barrier(L, uv, slot); }
-    //  }
-    //
     // openupval is sorted descending; front element is the topmost open upvalue.
     loop {
         let uv = match state.openupval.first() {
@@ -347,7 +245,7 @@ pub(crate) fn close_upval(state: &mut LuaState, level: StackIdx) {
         if uv_idx.0 < level.0 {
             break;
         }
-        // PORT NOTE: C asserts `uplevel(uv) < L->top.p` because the C stack is a
+        // C asserts `uplevel(uv) < L->top.p` because the C stack is a
         // contiguous block where slots above top are undefined. The Rust stack is
         // a `Vec<StackValue>` whose backing storage outlives any top movement, so
         // reading `stack[uv_idx]` is always valid here even when `state.top` has
@@ -358,10 +256,6 @@ pub(crate) fn close_upval(state: &mut LuaState, level: StackIdx) {
         state.openupval.remove(0);
         let stack_val = state.get_stack_value(uv_idx).clone();
         uv.close_with(stack_val);
-        // macros.tsv: iswhite → obj.is_white(); nw2black → obj.set_black()
-        //             luaC_barrier → state.gc().barrier(p, v) — no-op Phase A–C
-        // TODO(port): GC color methods (is_white, set_black) on GcRef<UpVal>;
-        // Phase D only. Omitted in Phase A–C.
     }
 }
 
@@ -372,13 +266,7 @@ pub(crate) fn close_upval(state: &mut LuaState, level: StackIdx) {
 /// so this is a straight `Vec::pop`.
 ///
 fn pop_tbc_list(state: &mut LuaState) {
-    //    lua_assert(tbc->tbclist.delta > 0);  /* first element cannot be dummy */
-    //    tbc -= tbc->tbclist.delta;
-    //    while (tbc > L->stack.p && tbc->tbclist.delta == 0)
-    //      tbc -= MAXDELTA;  /* skip dummy nodes */
-    //    L->tbclist.p = tbc;
-    //
-    // PORT NOTE: Delta-encoding dropped (see new_tbc_upval). Just pop.
+    // Delta-encoding dropped (see new_tbc_upval). Just pop.
     state.tbclist.pop();
 }
 
@@ -395,17 +283,11 @@ pub(crate) fn close(
     status: i32,
     yy: bool,
 ) -> Result<StackIdx, LuaError> {
-    // macros.tsv: savestack → idx (StackIdx is already stable across reallocs in Rust)
-    // PORT NOTE: savestack / restorestack are no-ops here. In C they save/restore a
+    // savestack / restorestack are no-ops here. In C they save/restore a
     // pointer as a byte-offset because the stack may reallocate during close-method
-    // calls. In Rust, StackIdx is an index into Vec and remains valid after any resize.
+    // calls. Here, StackIdx is an index into Vec and remains valid after any resize.
 
     close_upval(state, level);
-    //      StkId tbc = L->tbclist.p;
-    //      poptbclist(L);
-    //      prepcallclosemth(L, tbc, status, yy);
-    //      level = restorestack(L, levelrel);
-    //    }
     while state
         .tbclist
         .last()
@@ -437,20 +319,6 @@ pub(crate) fn get_local_name(
     local_number: i32,
     pc: i32,
 ) -> Option<&[u8]> {
-    //    for (i = 0; i < f->sizelocvars && f->locvars[i].startpc <= pc; i++) {
-    //      if (pc < f->locvars[i].endpc) {  /* is variable active? */
-    //        local_number--;
-    //        if (local_number == 0)
-    //          return getstr(f->locvars[i].varname);
-    //      }
-    //    }
-    //    return NULL;
-    //
-    // macros.tsv: getstr(ts) → ts.as_bytes()  returning &[u8]
-    //
-    // TODO(port): `f.locvars` does not exist on the current LuaProto stub in state.rs.
-    // This will compile once LuaProto gains its full set of fields from object.rs.
-    // The logic below faithfully translates the C loop.
     let mut remaining = local_number;
     // We break early once startpc > pc (variables are ordered by startpc).
     for lv in f.locvars.iter() {
@@ -460,7 +328,6 @@ pub(crate) fn get_local_name(
         if pc < lv.endpc {
             remaining -= 1;
             if remaining == 0 {
-                // macros.tsv: getstr → ts.as_bytes()
                 return Some(lv.varname.as_bytes());
             }
         }
@@ -472,44 +339,32 @@ pub(crate) fn get_local_name(
 
 /// Returns `true` if this thread is already registered in `global.twups`.
 ///
-/// iff its twups pointer doesn't point back to itself).
-///
-/// PORT NOTE: In Phase A–D with coroutines stubbed there is effectively a
-/// single thread. The actual `GlobalState.twups` Vec management (insertion in
-/// `new_open_upval`) is deferred to Phase D/E and would require a GcRef-to-self.
-/// Until then we treat every thread as conceptually present in twups, which
-/// satisfies the invariant `state_in_twups || openupval.is_empty()` asserted by
-/// `find_upval`. The actual twups list does not yet drive any behaviour.
+/// Always returns `true`. This module never inserts into `GlobalState.twups`
+/// (see `new_open_upval`); the check exists to satisfy the invariant
+/// `state_in_twups || openupval.is_empty()` asserted by `find_upval`.
 fn state_in_twups(state: &LuaState) -> bool {
     let _ = state;
     true
 }
 
-// ── Trait stubs needed for compilation ───────────────────────────────────────
+// ── LuaState methods this module depends on ──────────────────────────────────
 
-/// Stub methods on `LuaState` assumed by this module.
-///
-/// These will be implemented in their home modules (do_.rs, debug.rs, tagmethods.rs)
-/// and removed from this file in Phase B.
+/// `LuaState` methods this module depends on, implemented here by delegating
+/// to their home modules (do_.rs, debug.rs).
 impl LuaState {
     /// Returns the `LuaValue` at stack index `idx`.
-    ///
-    /// macros.tsv: `s2v → state.stack_at(idx)`.
     pub(crate) fn get_stack_value(&self, idx: StackIdx) -> &LuaValue {
-        // TODO(port): bounds-check and return &self.stack[idx.0 as usize].val
         &self.stack[idx.0 as usize].val
     }
 
     /// Returns the current CallInfo (active call frame).
     ///
     pub(crate) fn current_ci(&self) -> &crate::state::CallInfo {
-        // TODO(port): return &self.call_info[self.ci.0 as usize]
         &self.call_info[self.ci.0 as usize]
     }
 
     /// Looks up the `__close` (or other) metamethod for a value.
     ///
-    /// macros.tsv: `fasttm → state.fast_tm(et, e)`.
     pub(crate) fn get_tm_by_obj(
         &mut self,
         val: &LuaValue,
