@@ -12,29 +12,7 @@
 //!   5. Reference `lgc.c`'s `reallymarkobject` for the C original's approach
 
 use crate::state::{FinalizerObject, GlobalState, LuaState};
-use crate::string::{LuaStringImpl, LuaUserDataImpl};
 use lua_gc::{Marker, Trace};
-
-/// The byte buffer is a Rust `Rc<[u8]>` (not GC-managed); no fields to mark.
-impl Trace for LuaStringImpl {
-
-    fn type_name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
-    fn trace(&self, _m: &mut Marker) {}
-}
-
-/// `metatable` and `uv` are `Option<()>` / `Vec<()>` placeholders with no GC
-/// edges to walk; full userdata is `lua_types::value::LuaUserData` instead.
-impl Trace for LuaUserDataImpl {
-
-    fn type_name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
-    fn trace(&self, _m: &mut Marker) {}
-}
 
 impl Trace for FinalizerObject {
 
@@ -204,12 +182,6 @@ impl Trace for GlobalState {
             }
         }
 
-        // `strt` (the internal LuaStringImpl intern table) is a weak table in
-        // C; entries are cleared during the atomic weak-table pass
-        // (`clearbykeys`), not marked as roots. There is no incremental
-        // weak-sweep here, but `strt` is keyed by byte-content rather than by
-        // `Gc` identity, so a dangling entry there is silently recreated by
-        // the next `intern_str` — no UAF, unlike `interned_lt`.
         // `fixedgc` holds objects pre-marked fixed/black at allocation
         // (`luaC_fix`); the mark phase never re-visits them, and
         // `dyn Collectable` does not implement `Trace` here.

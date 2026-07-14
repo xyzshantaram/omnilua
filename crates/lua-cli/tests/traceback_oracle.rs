@@ -109,6 +109,7 @@ fn reference_binary(version: &str) -> Option<PathBuf> {
 fn full_version(version: &str) -> &'static str {
     match version {
         "5.1" => "5.1.5",
+        "5.2" => "5.2.4",
         "5.3" => "5.3.6",
         "5.4" => "5.4.7",
         "5.5" => "5.5.0",
@@ -975,6 +976,205 @@ fn warn_subsystem_via_cli() {
                 stdout,
                 String::from_utf8_lossy(&rout.stdout),
                 "[warn/{v}] stdout must match reference"
+            );
+        }
+    }
+}
+
+/// Issue #277 item 1: `get_upval_name` (the port of `varinfo`/`getupvalname`)
+/// used to compute the real upvalue name via `upval_name` and then discard
+/// it, hardcoding the literal string `"upvalue"`. Separately, its match test
+/// compared only the numeric `StackIdx` of a candidate upvalue against the
+/// erroring register, ignoring which thread the upvalue is homed on.
+///
+/// Neither bug is reachable on its own within a single thread: an open
+/// upvalue of the running closure always refers to an ancestor frame *on the
+/// same stack*, so its index can never equal one of the current frame's own
+/// register indices. The only way to reach a match at all is a closure
+/// created on one thread that runs on another (e.g. a function capturing a
+/// main-thread local, invoked inside `coroutine.resume`) whose independent
+/// index space happens to coincide numerically with the upvalue's home-thread
+/// index.
+///
+/// Here `f`'s only upvalue `up` is open on the main thread; `f` runs inside a
+/// coroutine whose own local `x` happens to land on that same numeric
+/// `StackIdx`. Before the fix this misattributed `x` (a plain local) as
+/// `(upvalue 'upvalue')`; the reference — and the fixed port — say
+/// `(local 'x')`.
+#[test]
+fn cross_thread_upvalue_name_not_misattributed() {
+    const PROG: &str = "local up\n\
+        local co = coroutine.create(function()\n  \
+        local a,b,c,x = nil,nil,nil,nil\n  \
+        return up, x.y\n\
+        end)\n\
+        local ok, err = coroutine.resume(co)\n\
+        print(ok, err)\n";
+    for &v in &["5.1", "5.2", "5.3", "5.4", "5.5"] {
+        let out = lua_rs()
+            .env("LUA_RS_VERSION", v)
+            .arg("-e")
+            .arg(PROG)
+            .output()
+            .expect("spawn lua-rs -e");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            stdout.contains("local 'x'"),
+            "[xthread-upval/{v}] expected `local 'x'`, got stdout `{stdout}`"
+        );
+        assert!(
+            !stdout.contains("upvalue"),
+            "[xthread-upval/{v}] must not misattribute as upvalue, got stdout `{stdout}`"
+        );
+
+        if let Some(refbin) = reference_binary(v) {
+            let rout = Command::new(&refbin)
+                .arg("-e")
+                .arg(PROG)
+                .output()
+                .expect("spawn reference");
+            assert_eq!(
+                String::from_utf8_lossy(&rout.stdout).trim_end(),
+                stdout.trim_end(),
+                "[xthread-upval/{v}] stdout must match reference"
+            );
+            assert_eq!(
+                out.status.code(),
+                rout.status.code(),
+                "[xthread-upval/{v}] exit code must match reference"
+            );
+        }
+    }
+}
+
+/// Spawn `lua-rs -e 'debug.debug()'` (or the reference binary when `refbin` is
+/// `Some`) under `version`, feed `stdin_lines` to the interactive REPL, and
+/// return `(normalized stderr, exit code)`.
+fn run_debug_repl(
+    version: &str,
+    refbin: Option<&std::path::Path>,
+    stdin_lines: &str,
+) -> (String, Option<i32>) {
+    let mut cmd = match refbin {
+        Some(bin) => Command::new(bin),
+        None => lua_rs(),
+    };
+    if refbin.is_none() {
+        cmd.env("LUA_RS_VERSION", version);
+    }
+    let mut child = cmd
+        .arg("-e")
+        .arg("debug.debug()")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn debug.debug() REPL");
+    child
+        .stdin
+        .take()
+        .expect("stdin handle")
+        .write_all(stdin_lines.as_bytes())
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait debug.debug() REPL");
+    (normalize(&out.stderr, ""), out.status.code())
+}
+
+/// Issue #277 item 3: `debug.debug`'s REPL used to catch a failed
+/// `load`/`pcall` and print the generic literal `"(error in debug command)"`
+/// instead of the real error text. The reference (`ldblib.c`'s `db_debug`)
+/// prints `luaL_tolstring(L, -1, NULL)` — the actual error object, stringified
+/// — followed by a newline, with no extra decoration.
+///
+/// Covers three ways a command line can fail: a runtime error from a loaded
+/// chunk, a syntax error from `load` itself, and (issue #277 follow-up) a
+/// non-string error object, whose stringification is era-split. The
+/// syntax-error case caught a second, entangled bug while fixing this: the REPL
+/// unconditionally chained into `protected_call` after `load_buffer`, even when
+/// `load_buffer` reported a non-`Ok` status (a syntax error leaves its message
+/// on the stack rather than returning `Err`, matching `luaL_loadbuffer`'s
+/// convention) — so it called whatever the failed load left behind (the message
+/// string) and reported "attempt to call a string value" instead of the syntax
+/// error.
+///
+/// The era split (Codex review of PR #284): `db_debug` uses `luaL_tolstring` on
+/// 5.4/5.5 (honors `__tostring` → prints `CUSTOM`) but plain `lua_tostring` on
+/// 5.1-5.3 (a non-string error object is NULL → printed as `(null)`).
+#[test]
+fn debug_repl_renders_real_error_text() {
+    for &v in &["5.1", "5.2", "5.3", "5.4", "5.5"] {
+        let modern = matches!(v, "5.4" | "5.5");
+
+        let (runtime_err, runtime_code) = run_debug_repl(v, None, "error(\"boom\")\ncont\n");
+        assert!(
+            runtime_err.contains("(debug command):1: boom"),
+            "[debugrepl/{v}] runtime error must render the real message, got `{runtime_err}`"
+        );
+        assert!(
+            !runtime_err.contains("error in debug command"),
+            "[debugrepl/{v}] must not print the old generic placeholder, got `{runtime_err}`"
+        );
+
+        let (syntax_err, syntax_code) = run_debug_repl(v, None, ")(\ncont\n");
+        assert!(
+            syntax_err.contains("unexpected symbol near ')'"),
+            "[debugrepl/{v}] syntax error must render the real message, got `{syntax_err}`"
+        );
+        assert!(
+            !syntax_err.contains("attempt to call a string value"),
+            "[debugrepl/{v}] must not fall through to calling the error message as a function, got `{syntax_err}`"
+        );
+
+        // Non-string error object with a `__tostring` metamethod: era-split.
+        const TOSTR_PROG: &str =
+            "error(setmetatable({},{__tostring=function() return 'CUSTOM' end}))\ncont\n";
+        let (tostr_err, tostr_code) = run_debug_repl(v, None, TOSTR_PROG);
+        if modern {
+            assert!(
+                tostr_err.contains("CUSTOM"),
+                "[debugrepl/{v}] 5.4+ must honor __tostring on the error object, got `{tostr_err}`"
+            );
+        } else {
+            assert!(
+                tostr_err.contains("(null)"),
+                "[debugrepl/{v}] 5.1-5.3 use lua_tostring, so a non-string error object is `(null)`, got `{tostr_err}`"
+            );
+            assert!(
+                !tostr_err.contains("CUSTOM"),
+                "[debugrepl/{v}] 5.1-5.3 must NOT call __tostring (lua_tostring, not luaL_tolstring), got `{tostr_err}`"
+            );
+        }
+
+        if let Some(refbin) = reference_binary(v) {
+            let (ref_runtime_err, ref_runtime_code) =
+                run_debug_repl(v, Some(&refbin), "error(\"boom\")\ncont\n");
+            assert_eq!(
+                runtime_err, ref_runtime_err,
+                "[debugrepl/{v}] runtime-error stderr must match reference"
+            );
+            assert_eq!(
+                runtime_code, ref_runtime_code,
+                "[debugrepl/{v}] runtime-error exit code must match reference"
+            );
+
+            let (ref_syntax_err, ref_syntax_code) = run_debug_repl(v, Some(&refbin), ")(\ncont\n");
+            assert_eq!(
+                syntax_err, ref_syntax_err,
+                "[debugrepl/{v}] syntax-error stderr must match reference"
+            );
+            assert_eq!(
+                syntax_code, ref_syntax_code,
+                "[debugrepl/{v}] syntax-error exit code must match reference"
+            );
+
+            let (ref_tostr_err, ref_tostr_code) = run_debug_repl(v, Some(&refbin), TOSTR_PROG);
+            assert_eq!(
+                tostr_err, ref_tostr_err,
+                "[debugrepl/{v}] __tostring-error stderr must match reference"
+            );
+            assert_eq!(
+                tostr_code, ref_tostr_code,
+                "[debugrepl/{v}] __tostring-error exit code must match reference"
             );
         }
     }

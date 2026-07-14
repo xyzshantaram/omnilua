@@ -495,15 +495,29 @@ fn default_package_path_is_version_exact() {
           /usr/local/lib/lua/5.2/?.lua;/usr/local/lib/lua/5.2/?/init.lua;./?.lua"
             .to_vec()
     );
-    for (v, vdir) in [(LuaVersion::V53, "5.3"), (LuaVersion::V54, "5.4"), (LuaVersion::V55, "5.5")] {
-        let expected = format!(
-            "/usr/local/share/lua/{vdir}/?.lua;/usr/local/share/lua/{vdir}/?/init.lua;\
-             /usr/local/lib/lua/{vdir}/?.lua;/usr/local/lib/lua/{vdir}/?/init.lua;\
-             ./?.lua;./?/init.lua"
-        );
+    for (v, expected) in [
+        (
+            LuaVersion::V53,
+            b"/usr/local/share/lua/5.3/?.lua;/usr/local/share/lua/5.3/?/init.lua;\
+              /usr/local/lib/lua/5.3/?.lua;/usr/local/lib/lua/5.3/?/init.lua;\
+              ./?.lua;./?/init.lua" as &[u8],
+        ),
+        (
+            LuaVersion::V54,
+            b"/usr/local/share/lua/5.4/?.lua;/usr/local/share/lua/5.4/?/init.lua;\
+              /usr/local/lib/lua/5.4/?.lua;/usr/local/lib/lua/5.4/?/init.lua;\
+              ./?.lua;./?/init.lua",
+        ),
+        (
+            LuaVersion::V55,
+            b"/usr/local/share/lua/5.5/?.lua;/usr/local/share/lua/5.5/?/init.lua;\
+              /usr/local/lib/lua/5.5/?.lua;/usr/local/lib/lua/5.5/?/init.lua;\
+              ./?.lua;./?/init.lua",
+        ),
+    ] {
         assert_eq!(
             eval_str_with_hooks(v, HostHooks::new().env(no_env_hook), "return package.path"),
-            expected.into_bytes(),
+            expected,
             "{v:?}"
         );
     }
@@ -518,17 +532,27 @@ fn default_package_cpath_is_version_exact() {
         eval_str_with_hooks(LuaVersion::V51, HostHooks::new().env(no_env_hook), "return package.cpath"),
         b"./?.so;/usr/local/lib/lua/5.1/?.so;/usr/local/lib/lua/5.1/loadall.so".to_vec()
     );
-    for (v, vdir) in [
-        (LuaVersion::V52, "5.2"),
-        (LuaVersion::V53, "5.3"),
-        (LuaVersion::V54, "5.4"),
-        (LuaVersion::V55, "5.5"),
+    for (v, expected) in [
+        (
+            LuaVersion::V52,
+            b"/usr/local/lib/lua/5.2/?.so;/usr/local/lib/lua/5.2/loadall.so;./?.so" as &[u8],
+        ),
+        (
+            LuaVersion::V53,
+            b"/usr/local/lib/lua/5.3/?.so;/usr/local/lib/lua/5.3/loadall.so;./?.so",
+        ),
+        (
+            LuaVersion::V54,
+            b"/usr/local/lib/lua/5.4/?.so;/usr/local/lib/lua/5.4/loadall.so;./?.so",
+        ),
+        (
+            LuaVersion::V55,
+            b"/usr/local/lib/lua/5.5/?.so;/usr/local/lib/lua/5.5/loadall.so;./?.so",
+        ),
     ] {
-        let expected =
-            format!("/usr/local/lib/lua/{vdir}/?.so;/usr/local/lib/lua/{vdir}/loadall.so;./?.so");
         assert_eq!(
             eval_str_with_hooks(v, HostHooks::new().env(no_env_hook), "return package.cpath"),
-            expected.into_bytes(),
+            expected,
             "{v:?}"
         );
     }

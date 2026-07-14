@@ -311,3 +311,156 @@ fn gethook_with_no_hook_is_nil_all_versions() {
         assert_eq!(eval_str(v, probe), "nil", "gethook (no hook) diverged under {v:?}");
     }
 }
+
+// ── cross-thread getinfo (issue #277 item 2) ────────────────────────────────
+
+/// `debug.getinfo(co, level, ...)` from the main thread against a coroutine
+/// suspended (via `coroutine.yield`) inside a function: `currentline`/`what`/
+/// `namewhat` must describe `co`'s suspended frame, not the caller's. This
+/// path already worked (`DebugThreadTarget::Other` routes through
+/// `crate::coro_lib::borrow_thread_rooted`); pinned here as a regression lock
+/// alongside the function-argument form below, which did not.
+#[test]
+fn getinfo_level_on_suspended_coroutine_all_versions() {
+    let probe = "local co = coroutine.create(function()\n\
+                   local x = 42\n\
+                   coroutine.yield()\n\
+                   return x\n\
+                 end)\n\
+                 coroutine.resume(co)\n\
+                 local info = debug.getinfo(co, 1, 'nSl')\n\
+                 return tostring(info.currentline)..'|'..tostring(info.what)\n\
+                   ..'|'..tostring(info.namewhat)";
+    for v in ALL_VERSIONS {
+        assert_eq!(
+            eval_str(v, probe),
+            "3|Lua|",
+            "cross-thread getinfo(co, level, ...) diverged under {v:?}"
+        );
+    }
+}
+
+/// `debug.getinfo(co, function, ...)` — the function-argument form targeting a
+/// different, reachable thread. This used to panic (`get_info: function
+/// expected` in `lua-vm/src/debug.rs`): the cross-thread branch was a
+/// documented no-op that pushed nothing before `get_debug_info` ran, so it
+/// found no function on top of the stack it read from. Fixed by treating
+/// function-form info as thread-INDEPENDENT — the function value is pushed onto
+/// the CURRENT `state` and inspected there for every target thread, since a
+/// closure's proto info does not depend on which thread nominated it. (An
+/// earlier revision borrowed the target thread and paniced with "RefCell
+/// already borrowed" when the target was an actively-suspended ancestor
+/// mid-resume; see `getinfo_function_argument_on_active_ancestor_all_versions`.)
+#[test]
+fn getinfo_function_argument_cross_thread_on_suspended_coroutine_all_versions() {
+    let probe = "local function target(a, b)\n\
+                   return a + b\n\
+                 end\n\
+                 local co = coroutine.create(function()\n\
+                   coroutine.yield()\n\
+                 end)\n\
+                 coroutine.resume(co)\n\
+                 local info = debug.getinfo(co, target, 'nS')\n\
+                 return tostring(info.what)..'|'..tostring(info.name)\n\
+                   ..'|'..tostring(info.namewhat)";
+    for v in ALL_VERSIONS {
+        assert_eq!(
+            eval_str(v, probe),
+            "Lua|nil|",
+            "cross-thread getinfo(co, function, ...) diverged under {v:?}"
+        );
+    }
+}
+
+/// `debug.getinfo(ancestor, function, "SfL")` where `ancestor` is a coroutine
+/// that is *actively suspended mid-resume* (it resumed a child, and the child
+/// runs this query). Codex review of PR #284 found the first cross-thread fix
+/// still panicked here: `borrow_thread_rooted(ancestor)` hit "RefCell already
+/// borrowed" because the resume chain already holds `ancestor`'s `RefCell`
+/// mutably up the call stack. The final fix makes the function form never
+/// borrow the nominated thread (function info is thread-independent), which both
+/// resolves the panic and returns the correct proto info. All references
+/// succeed here, so ours must too.
+#[test]
+fn getinfo_function_argument_on_active_ancestor_all_versions() {
+    let probe = "local function target(a, b)\n\
+                   return a + b\n\
+                 end\n\
+                 local parent\n\
+                 local result\n\
+                 local child = coroutine.create(function()\n\
+                   local info = debug.getinfo(parent, target, 'SfL')\n\
+                   result = tostring(info.what)..'|'..tostring(info.func == target)\n\
+                     ..'|'..tostring(type(info.activelines))\n\
+                 end)\n\
+                 parent = coroutine.create(function()\n\
+                   coroutine.resume(child)\n\
+                 end)\n\
+                 coroutine.resume(parent)\n\
+                 return result";
+    for v in ALL_VERSIONS {
+        assert_eq!(
+            eval_str(v, probe),
+            "Lua|true|table",
+            "getinfo(active-ancestor, function, ...) diverged under {v:?}"
+        );
+    }
+}
+
+// ── version-gated getinfo defaults + accepted options (issue #277, Codex) ────
+
+/// The default option string (when `what` is omitted) is version-gated,
+/// mirroring `db_getinfo`'s `luaL_optstring` default: 5.1 lacks the tail-call
+/// (`t`) and transfer (`r`) fields (`flnSu`), 5.2/5.3 add `t`/istailcall
+/// (`flnStu`), 5.4/5.5 add `r`/ftransfer+ntransfer (`flnSrtu`; 5.5 additionally
+/// exposes `extraargs`). Pinned by asserting the presence/absence of the
+/// era-specific keys.
+#[test]
+fn getinfo_default_options_are_version_gated() {
+    let probe = "local i = debug.getinfo(1)\n\
+                 return tostring(i.istailcall ~= nil)..'|'\n\
+                   ..tostring(i.nparams ~= nil)..'|'\n\
+                   ..tostring(i.ftransfer ~= nil)..'|'\n\
+                   ..tostring(i.extraargs ~= nil)";
+    let expected = |v: LuaVersion| match v {
+        // istailcall | nparams | ftransfer | extraargs
+        LuaVersion::V51 => "false|false|false|false",
+        LuaVersion::V52 | LuaVersion::V53 => "true|true|false|false",
+        LuaVersion::V54 => "true|true|true|false",
+        LuaVersion::V55 => "true|true|true|true",
+        _ => "true|true|true|true",
+    };
+    for v in ALL_VERSIONS {
+        assert_eq!(
+            eval_str(v, probe),
+            expected(v),
+            "getinfo default-option fields diverged under {v:?}"
+        );
+    }
+}
+
+/// The `t` option (istailcall) is a 5.2 addition; on 5.1 `debug.getinfo(f,"t")`
+/// raises `invalid option`. The `r` option (ftransfer/ntransfer) is a 5.4
+/// addition; on 5.1-5.3 `debug.getinfo(f,"r")` raises `invalid option`. Both
+/// are enforced in the VM's `aux_get_info` option switch.
+#[test]
+fn getinfo_t_and_r_options_are_version_gated() {
+    let t_probe = "local ok, err = pcall(debug.getinfo, function() end, 't')\n\
+                   return tostring(ok)..'|'..tostring(ok or err:match('invalid option') ~= nil)";
+    let r_probe = "local ok, err = pcall(debug.getinfo, function() end, 'r')\n\
+                   return tostring(ok)..'|'..tostring(ok or err:match('invalid option') ~= nil)";
+    for v in ALL_VERSIONS {
+        let t_ok = !matches!(v, LuaVersion::V51);
+        assert_eq!(
+            eval_str(v, t_probe),
+            format!("{t_ok}|true"),
+            "getinfo 't' option gating diverged under {v:?}"
+        );
+        let r_ok = matches!(v, LuaVersion::V54 | LuaVersion::V55);
+        assert_eq!(
+            eval_str(v, r_probe),
+            format!("{r_ok}|true"),
+            "getinfo 'r' option gating diverged under {v:?}"
+        );
+    }
+}
