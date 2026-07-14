@@ -472,6 +472,9 @@ const WHITE0BIT: u8 = 0;
 const STRCACHE_N: usize = 53;
 const STRCACHE_M: usize = 2;
 
+/// `registry[LUA_RIDX_MAINTHREAD]`'s integer key (`lua.h`'s `LUA_RIDX_MAINTHREAD`).
+const LUA_RIDX_MAINTHREAD: i64 = 1;
+
 // ─── GcKind enum ─────────────────────────────────────────────────────────────
 
 /// Garbage collector operating mode.
@@ -5783,22 +5786,81 @@ fn free_stack(state: &mut LuaState) {
     state.stack.shrink_to_fit();
 }
 
+/// Populate the registry table's fixed slots and the globals/loaded shadow
+/// fields.
+///
+/// Mirrors C's `init_registry`, which sets `registry[LUA_RIDX_MAINTHREAD] =
+/// L` and `registry[LUA_RIDX_GLOBALS] = <new globals table>`. The first
+/// entry has a direct equivalent here: `GlobalState::main_thread_value` is
+/// a `GcRef<LuaThread>` — a lightweight identity handle (just a `u64` id),
+/// not the actual `LuaState` — built once in `new_state` specifically so it
+/// can be shared without the self-referential-`Rc` problem that would come
+/// from storing a `GcRef<LuaState>` pointing at the state's own
+/// `GlobalState`. The second entry is not mirrored into the table: this
+/// port keeps `globals`/`loaded` as direct `GlobalState` fields instead of
+/// registry entries (see their field docs) for faster lookups on the hot
+/// path.
+///
+/// Runs before the caller has necessarily chosen a non-default
+/// [`lua_types::LuaVersion`] (`new_state` always constructs with
+/// `LuaVersion::default()`), so this populates the mainthread slot for
+/// whatever version is current at this point — correct as-is for every
+/// caller that never overrides the version, and corrected again by
+/// [`set_mainthread_registry_slot`] once a version-selecting entry point
+/// (`bootstrap_state`, the CLI) finalizes the real one.
 fn init_registry(state: &mut LuaState) -> Result<(), LuaError> {
     let registry = state.new_table();
 
-    state.global_mut().l_registry = LuaValue::Table(registry.clone());
+    state.global_mut().l_registry = LuaValue::Table(registry);
 
-    // The registry's LUA_RIDX_MAINTHREAD slot is never populated: it would
-    // need a GcRef<LuaState> pointing at the main thread's own LuaState,
-    // which is self-referential and not GcRef-tracked. Left as Nil.
+    set_mainthread_registry_slot(state)?;
 
-    // `GlobalState::globals`/`GlobalState::loaded` are direct fields rather
-    // than registry entries; see their field docs.
     let globals = state.new_table();
     state.global_mut().globals = LuaValue::Table(globals);
     let loaded = state.new_table();
     state.global_mut().loaded = LuaValue::Table(loaded);
 
+    Ok(())
+}
+
+/// Place the main thread at its version-correct `registry` index, clearing
+/// whichever index does not apply to the current [`lua_types::LuaVersion`].
+///
+/// The registry convenience indices were added in Lua 5.2 — 5.1 has no
+/// `LUA_RIDX_MAINTHREAD`/`LUA_RIDX_GLOBALS` at all, so `registry[1]` stays
+/// `Nil` there (verified against `reference/lua-5.1.5`: `debug.getregistry()`
+/// exists but has no numeric keys). 5.2/5.3/5.4 use index 1
+/// (`LUA_RIDX_MAINTHREAD` in their `lua.h`). 5.5 renumbered
+/// `LUA_RIDX_MAINTHREAD` to 3 and additionally reserves `registry[1] =
+/// false` (`reference/lua-5.5.0/src/lstate.c`'s `init_registry`) — a
+/// reserved slot for a future index, not the mainthread.
+///
+/// Idempotent and safe to call more than once for the same state (it always
+/// clears both slots before setting the one that applies), so callers that
+/// finalize the version after `new_state` (`bootstrap_state`, the CLI) can
+/// call it again to correct whatever `init_registry` set up for the
+/// pre-override default.
+pub fn set_mainthread_registry_slot(state: &mut LuaState) -> Result<(), LuaError> {
+    let registry = match state.global().l_registry.clone() {
+        LuaValue::Table(t) => t,
+        _ => return Ok(()),
+    };
+    let main_thread_value = state.global().main_thread_value.clone();
+    let version = state.global().lua_version;
+
+    registry.raw_set_int(state, 1, LuaValue::Nil)?;
+    registry.raw_set_int(state, 3, LuaValue::Nil)?;
+
+    match version {
+        lua_types::LuaVersion::V51 => {}
+        lua_types::LuaVersion::V55 => {
+            registry.raw_set_int(state, 1, LuaValue::Bool(false))?;
+            registry.raw_set_int(state, 3, LuaValue::Thread(main_thread_value))?;
+        }
+        _ => {
+            registry.raw_set_int(state, LUA_RIDX_MAINTHREAD, LuaValue::Thread(main_thread_value))?;
+        }
+    }
     Ok(())
 }
 
@@ -6389,6 +6451,49 @@ mod tests {
 
     fn test_noop_cclosure(_: &mut LuaState) -> Result<usize, LuaError> {
         Ok(0)
+    }
+
+    /// Issue #275 item 2: `registry[LUA_RIDX_MAINTHREAD]` must resolve to
+    /// the main thread, matching C's `init_registry` (`setthvalue(L,
+    /// &registry->array[LUA_RIDX_MAINTHREAD - 1], L)`), for every version
+    /// that has the slot — and be absent/relocated for the versions that
+    /// don't, per `reference/lua-5.1.5` (no numeric registry keys) and
+    /// `reference/lua-5.5.0/src/lstate.c` (index 3, with `registry[1] =
+    /// false` reserved). Exercises all five versions in turn: the
+    /// default-constructed state (V54, index 1), V51 (no slot at all), V55
+    /// (index 3, with `registry[1] == false`), and V52 (like V54).
+    #[test]
+    fn registry_mainthread_slot_matches_version() {
+        let mut state = new_state().expect("state should initialize");
+        let _heap_guard = {
+            let g = state.global();
+            lua_gc::HeapGuard::push(&g.heap)
+        };
+
+        let registry = match state.global().l_registry.clone() {
+            LuaValue::Table(t) => t,
+            other => panic!("l_registry should be a table, got {other:?}"),
+        };
+        let main_thread_value = state.global().main_thread_value.clone();
+        let expected = LuaValue::Thread(main_thread_value);
+
+        assert_eq!(registry.get_int(1), expected);
+        assert_eq!(registry.get_int(3), LuaValue::Nil);
+
+        state.global_mut().lua_version = lua_types::LuaVersion::V51;
+        set_mainthread_registry_slot(&mut state).expect("V51 slot update should succeed");
+        assert_eq!(registry.get_int(1), LuaValue::Nil);
+        assert_eq!(registry.get_int(3), LuaValue::Nil);
+
+        state.global_mut().lua_version = lua_types::LuaVersion::V55;
+        set_mainthread_registry_slot(&mut state).expect("V55 slot update should succeed");
+        assert_eq!(registry.get_int(1), LuaValue::Bool(false));
+        assert_eq!(registry.get_int(3), expected);
+
+        state.global_mut().lua_version = lua_types::LuaVersion::V52;
+        set_mainthread_registry_slot(&mut state).expect("V52 slot update should succeed");
+        assert_eq!(registry.get_int(1), expected);
+        assert_eq!(registry.get_int(3), LuaValue::Nil);
     }
 
     #[test]
