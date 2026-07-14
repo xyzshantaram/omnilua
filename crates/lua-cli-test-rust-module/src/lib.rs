@@ -1,6 +1,6 @@
-//! Phase D-3.5 acceptance-test fixture: a Rust-native Lua module exposed as a
-//! `cdylib` so the `dynlib_*_hook` path through `package.loadlib` can be
-//! exercised end-to-end.
+//! Acceptance-test fixture: a Rust-native Lua module exposed as a `cdylib`
+//! so the `dynlib_*_hook` path through `package.loadlib` can be exercised
+//! end-to-end.
 //!
 //! The exported symbol matches this build's Rust-native module ABI:
 //!
