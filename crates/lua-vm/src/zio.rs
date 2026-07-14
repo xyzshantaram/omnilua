@@ -5,23 +5,14 @@
 //! - [`LexBuffer`]: a growable `Vec<u8>` byte buffer with the named interface
 //!   that C code accessed through the `luaZ_*buffer*` macro family.
 //!
-//! The lzio header is merged here per PORTING.md §1 ("Headers merge into the
-//! consuming `.rs`").  All macros defined in `lzio.h` are translated at their
-//! call sites and collected as methods or constants in this module.
-//!
-//! # C source files
-//! - `reference/lua-5.4.7/src/lzio.c`  (68 lines, 3 functions)
-//! - `reference/lua-5.4.7/src/lzio.h`  (66 lines, struct + macros; merged)
+//! `lzio.h`'s macros are translated at their call sites and collected as
+//! methods or constants in this module.
 
-// TODO(port): import path for LuaState will need adjustment once the
-// crate-internal module graph is settled in Phase B.  Using a local path
-// for now; may become `use lua_types::state::LuaState` or similar.
 use crate::state::LuaState;
 use lua_types::error::LuaError;
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
-// macros.tsv: EOZ → const EOZ: i32 = -1
 /// End-of-stream sentinel returned by [`ZIO::getc`] and [`ZIO::fill`].
 pub(crate) const EOZ: i32 = -1;
 
@@ -42,77 +33,56 @@ pub type ChunkReader = Box<dyn FnMut(&mut LuaState) -> Result<Option<Vec<u8>>, L
 /// Corresponds to `Mbuffer` in `lzio.h`.  The C struct tracked `buffer`,
 /// `n` (used length), and `buffsize` (allocated capacity) as three separate
 /// fields with manual realloc.  In Rust all three are implicit in `Vec<u8>`.
-///
-/// # C mapping (types.tsv)
-/// ```text
-/// Mbuffer     → LexBuffer
-/// .buffer     → Vec<u8>   (heap storage)
-/// .n          → Vec::len()
-/// .buffsize   → Vec::capacity()
-/// ```
 pub struct LexBuffer {
     buffer: Vec<u8>,
 }
 
 impl LexBuffer {
-    // macros.tsv: luaZ_initbuffer → buf.init()  (most call sites just construct)
     /// Construct an empty `LexBuffer`.  Corresponds to the `luaZ_initbuffer` macro.
     pub fn new() -> Self {
         LexBuffer { buffer: Vec::new() }
     }
 
-    // macros.tsv: luaZ_buffer → buf.as_mut_slice()
     /// Return the buffer contents as a mutable byte slice.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.buffer
     }
 
-    // macros.tsv: luaZ_sizebuffer → buf.capacity()
     /// Return the buffer's current allocation capacity in bytes.
     pub fn capacity(&self) -> usize {
         self.buffer.capacity()
     }
 
-    // macros.tsv: luaZ_bufflen → buf.len()
     /// Return the number of valid bytes currently stored in the buffer.
     pub fn len(&self) -> usize {
         self.buffer.len()
     }
 
-    // macros.tsv: luaZ_buffremove → buf.truncate_by(i)
     /// Shorten the live contents by `i` bytes without releasing capacity.
     pub fn truncate_by(&mut self, i: usize) {
         let new_len = self.buffer.len().saturating_sub(i);
         self.buffer.truncate(new_len);
     }
 
-    // macros.tsv: luaZ_resetbuffer → buf.clear()
     /// Reset the live length to zero without releasing capacity.
     pub fn clear(&mut self) {
         self.buffer.clear();
     }
 
-    //      ((buff)->buffer = luaM_reallocvchar(L, (buff)->buffer, \
-    //                          (buff)->buffsize, size), \
-    //       (buff)->buffsize = size)
-    // macros.tsv: luaZ_resizebuffer → buf.resize(state, size)?
     /// Resize the buffer to exactly `size` bytes, filling new bytes with `0`.
     ///
     /// Returns `Err(LuaError::Memory)` on allocation failure.
     ///
-    /// PORT NOTE: the C macro routes through `luaM_reallocvchar` and Lua's
-    /// custom allocator.  Phase A uses `Vec::resize` with Rust's global
-    /// allocator; OOM propagation via the custom allocator is a Phase D concern.
-    // PERF(port): luaM_reallocvchar — Vec::resize may over-allocate relative
-    // to the exact-fit C behaviour; profile in Phase B.
+    /// C's `luaZ_resizebuffer` macro routes through `luaM_reallocvchar` and
+    /// Lua's custom allocator; here `Vec::resize` uses Rust's global allocator,
+    /// and OOM propagation via a custom allocator is not implemented.
     pub fn resize(&mut self, _state: &mut LuaState, size: usize) -> Result<(), LuaError> {
         self.buffer.resize(size, 0u8);
         Ok(())
     }
 
-    // macros.tsv: luaZ_freebuffer → (Rust Drop handles deallocation; drop the call)
-    // PORT NOTE: `Drop for Vec` releases the heap allocation automatically.
-    // Call sites that use `luaZ_freebuffer` can simply let the `LexBuffer` drop.
+    // `Drop for Vec` releases the heap allocation automatically. Call sites
+    // that use `luaZ_freebuffer` can simply let the `LexBuffer` drop.
 }
 
 impl Default for LexBuffer {
@@ -130,27 +100,17 @@ impl Default for LexBuffer {
 /// raw `lua_Reader` function pointer.  In Rust:
 ///
 /// - `lua_State *L` is removed from the struct; callers hold `&mut LuaState`
-///   directly and pass it to fallible methods (per types.tsv).
-/// - `void *data` is folded into the reader closure (per types.tsv).
+///   directly and pass it to fallible methods.
+/// - `void *data` is folded into the reader closure.
 /// - `const char *p` (raw pointer into the reader's internal buffer) becomes a
 ///   `usize` index into the owned `current_chunk` field.
-///
-/// # C mapping (types.tsv)
-/// ```text
-/// Zio           → ZIO
-/// .n            → usize         (bytes still unread in current_chunk)
-/// .p            → usize         (cursor index; was const char *)
-/// .reader+.data → ChunkReader   (combined)
-/// .L            → re-threaded as &mut LuaState parameters (the reader needs
-///                 it to call back into Lua), matching C's stored z->L.
-/// ```
 pub struct ZIO {
     n: usize,
-    // PORT NOTE: raw pointer replaced by index into `current_chunk`.
+    // Raw pointer replaced by index into `current_chunk`.
     p: usize,
-    // PORT NOTE: C reader function pointer + void *data collapsed into one
-    // closure. C stored `lua_State *L` in the ZIO; the Rust port threads it
-    // through fill/getc/read instead so the borrow checker sees the access.
+    // C's reader function pointer + void *data collapsed into one closure. C
+    // stored `lua_State *L` in the ZIO; here it's threaded through
+    // fill/getc/read instead so the borrow checker sees the access.
     reader: ChunkReader,
     // Owned current chunk returned by the reader.  Not present as a separate
     // field in C (C held a raw pointer into the reader's own internal buffer).
@@ -158,7 +118,6 @@ pub struct ZIO {
 }
 
 impl ZIO {
-    // macros.tsv: LUAI_FUNC → pub(crate)
     /// Initialise a `ZIO` with the given reentrant reader callback.
     ///
     /// Corresponds to `luaZ_init` in `lzio.c`.  The C parameters `reader` and
@@ -194,31 +153,13 @@ impl ZIO {
         std::mem::replace(self, ZIO::from_bytes(Vec::new()))
     }
 
-    // macros.tsv: LUAI_FUNC → pub(crate)
     /// Refill the internal buffer by invoking the reader callback; return the
     /// first byte of the new chunk as an `i32`, or [`EOZ`] if no more data is
     /// available.
     ///
-    /// # C source
-    /// ```c
-    ///
-    /// //   size_t size;
-    /// //   lua_State *L = z->L;
-    /// //   const char *buff;
-    /// //   lua_unlock(L);
-    /// //   buff = z->reader(L, z->data, &size);
-    /// //   lua_lock(L);
-    /// //   if (buff == NULL || size == 0)
-    /// //     return EOZ;
-    /// //   z->n = size - 1;  /* discount char being returned */
-    /// //   z->p = buff;
-    /// //   return cast_uchar(*(z->p++));
-    /// // }
-    /// ```
-    ///
-    /// PORT NOTE: `lua_unlock`/`lua_lock` are no-ops in the default build and
-    /// are dropped per macros.tsv.  `cast_uchar` → `as u8` per macros.tsv.
-    /// A reader error propagates as `Err` (C longjmps out of the reader).
+    /// `lua_unlock`/`lua_lock` are no-ops in the default C build and have no
+    /// equivalent call here. A reader error propagates as `Err` (C longjmps
+    /// out of the reader).
     pub(crate) fn fill(&mut self, state: &mut LuaState) -> Result<i32, LuaError> {
         let chunk_opt = (self.reader)(state)?;
 
@@ -229,7 +170,6 @@ impl ZIO {
                 self.n = chunk.len() - 1;
                 self.current_chunk = chunk;
                 self.p = 0;
-                // cast_uchar → as u8  per macros.tsv
                 let byte = self.current_chunk[self.p] as u8;
                 self.p += 1;
                 Ok(byte as i32)
@@ -237,22 +177,16 @@ impl ZIO {
         }
     }
 
-    // macros.tsv: zgetc → z.getc()  returning i32 (next byte or EOZ)
     /// Return the next byte from the stream as an `i32`, or [`EOZ`] at
     /// end-of-stream.
     ///
     /// This is the hot-path inline method corresponding to the `zgetc` macro.
     /// When bytes remain in the current chunk no allocation occurs.
     ///
-    /// # C source (macro)
-    /// ```c
-    ///
-    /// ```
-    ///
-    /// PORT NOTE: The C macro uses `(z)->n-- > 0` which reads n, tests it, then
-    /// decrements.  When n == 0 the test is false (0 > 0) so fill is called
-    /// without decrementing.  The Rust translation preserves this: `if self.n > 0`
-    /// followed by an explicit `self.n -= 1`.
+    /// C's macro uses `(z)->n-- > 0`, which reads n, tests it, then
+    /// decrements; when n == 0 the test is false (0 > 0) so fill is called
+    /// without decrementing. This preserves that: `if self.n > 0` followed by
+    /// an explicit `self.n -= 1`.
     #[inline]
     pub fn getc(&mut self, state: &mut LuaState) -> Result<i32, LuaError> {
         if self.n > 0 {
@@ -265,38 +199,13 @@ impl ZIO {
         }
     }
 
-    // macros.tsv: LUAI_FUNC → pub(crate)
     /// Read exactly `buf.len()` bytes into `buf`.
     ///
     /// Returns the number of bytes that could **not** be read: `0` means
     /// complete success; a non-zero value means end-of-stream was reached with
     /// that many bytes still outstanding.
     ///
-    /// # C source
-    /// ```c
-    ///
-    /// //   while (n) {
-    /// //     size_t m;
-    /// //     if (z->n == 0) {  /* no bytes in buffer? */
-    /// //       if (luaZ_fill(z) == EOZ)  /* try to read more */
-    /// //         return n;  /* no more input; return number of missing bytes */
-    /// //       else {
-    /// //         z->n++;  /* luaZ_fill consumed first byte; put it back */
-    /// //         z->p--;
-    /// //       }
-    /// //     }
-    /// //     m = (n <= z->n) ? n : z->n;  /* min. between n and z->n */
-    /// //     memcpy(b, z->p, m);
-    /// //     z->n -= m;
-    /// //     z->p += m;
-    /// //     b = (char *)b + m;
-    /// //     n -= m;
-    /// //   }
-    /// //   return 0;
-    /// // }
-    /// ```
-    ///
-    /// PORT NOTE: C's `void *b` + explicit `n` become Rust's `&mut [u8]`, whose
+    /// C's `void *b` + explicit `n` become Rust's `&mut [u8]`, whose
     /// length encodes the requested byte count.  `memcpy` becomes
     /// `copy_from_slice`.  The advancing pointer `b = (char *)b + m` is
     /// replaced by a `dst` index into `buf`.
