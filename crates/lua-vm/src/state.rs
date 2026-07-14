@@ -13,7 +13,6 @@ use std::cell::RefCell;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 
-use crate::string::StringPool;
 pub use lua_types::error::LuaError;
 pub use lua_types::{CallInfoIdx, StackIdx};
 
@@ -1642,8 +1641,6 @@ pub struct GlobalState {
 
     pub lastatomic: usize,
 
-    pub strt: StringPool,
-
     pub l_registry: LuaValue,
 
     /// External Rust handles root their referents here while they are live.
@@ -1810,8 +1807,7 @@ pub struct GlobalState {
 
     pub strcache: [[GcRef<LuaString>; STRCACHE_M]; STRCACHE_N],
 
-    /// Stable intern map for the public [`LuaString`] type. Distinct from
-    /// `strt` (which keys internal `LuaStringImpl`) because the parser and
+    /// Stable intern map for the public [`LuaString`] type. The parser and
     /// stdlib need pointer-equality across `intern_str` calls so
     /// `GcRef::ptr_eq` can resolve variable identity. Without this map each
     /// call allocates a fresh `GcRef` and locals/upvalues fail to resolve.
@@ -5880,10 +5876,42 @@ pub fn set_mainthread_registry_slot(state: &mut LuaState) -> Result<(), LuaError
 /// on identity/tagging of a pre-created string (see `lua_lex::init`'s doc),
 /// and every reserved word is re-interned anyway the first time it is
 /// scanned. The call is unnecessary, not missing.
+/// Pre-allocated out-of-memory message, built once at startup so the GC can
+/// always hand back a valid error string even when the allocator is failing.
+const MEMERR_MSG: &[u8] = b"not enough memory";
+
+/// Build the bootstrap out-of-memory message and pre-fill every API string
+/// cache slot with it.
+///
+/// Must run once during bootstrap, before any allocation can fail. Goes
+/// through [`LuaState::intern_str`] — the same interning path every other
+/// Lua string in the VM uses — rather than a separate bootstrap-only string
+/// table, so `GlobalState::memerrmsg` is an ordinary member of
+/// `GlobalState::interned_lt` and the `GcRef::ptr_eq` identity check in
+/// `api::lua_error` keeps working unchanged.
+///
+/// C fixes the message in the GC (`luaC_fix`, marking it non-collectable);
+/// there is no equivalent call here (`state.gc().fix_object` is a no-op —
+/// see its doc in state.rs). The message instead stays alive for the life
+/// of the process simply because `GlobalState::memerrmsg` holds a
+/// permanent strong reference to it.
+fn init_memerrmsg(state: &mut LuaState) -> Result<(), LuaError> {
+    let memerrmsg = state.intern_str(MEMERR_MSG)?;
+    state.global_mut().memerrmsg = memerrmsg.clone();
+
+    for i in 0..STRCACHE_N {
+        for j in 0..STRCACHE_M {
+            state.global_mut().strcache[i][j] = memerrmsg.clone();
+        }
+    }
+
+    Ok(())
+}
+
 fn lua_open(state: &mut LuaState) -> Result<(), LuaError> {
     stack_init(state);
     init_registry(state)?;
-    crate::string::init(state)?;
+    init_memerrmsg(state)?;
     crate::tagmethods::init(state)?;
     state.global_mut().gcstp = 0;
     state.global().heap.unpause();
@@ -5953,8 +5981,6 @@ fn close_state(state: &mut LuaState) {
         crate::api::run_close_finalizers(state);
         state.gc().free_all_objects();
     }
-
-    state.global_mut().strt = StringPool::default();
 
     free_stack(state);
 
@@ -6148,7 +6174,7 @@ pub fn new_state() -> Option<LuaState> {
 
     // Build a dummy LuaString for memerrmsg and strcache initialization.
     // This is a chicken-and-egg problem: GlobalState.memerrmsg needs to be initialized
-    // before luaS_init, but luaS_init creates the memerrmsg.
+    // before init_memerrmsg runs, but init_memerrmsg is what creates the real one.
     // The heap is created ahead of the GlobalState literal so these two
     // pre-state allocations (the placeholder string and the main thread
     // value) can live on its heap-owned uncollected list instead of falling
@@ -6192,7 +6218,6 @@ pub fn new_state() -> Option<LuaState> {
         gc_debt: 0,
         gc_estimate: 0,
         lastatomic: 0,
-        strt: StringPool::default(),
         l_registry: LuaValue::Nil,
         external_roots: ExternalRootSet::default(),
         globals: LuaValue::Nil,
@@ -6542,6 +6567,31 @@ mod tests {
             state.stack.len(),
             expected_size + EXTRA_STACK,
             "reset_thread should shrink the stack back down, matching C's luaE_resetthread"
+        );
+    }
+
+    #[test]
+    fn memerrmsg_is_the_same_object_a_matching_intern_str_call_returns() {
+        let mut state = new_state().expect("state should initialize");
+        let _heap_guard = {
+            let g = state.global();
+            lua_gc::HeapGuard::push(&g.heap)
+        };
+
+        let memerrmsg = state.global().memerrmsg.clone();
+        let interned = state
+            .intern_str(crate::string::MAX_SHORT_LEN.to_string().as_bytes())
+            .expect("interning a short string should not fail");
+        assert!(!GcRef::ptr_eq(&memerrmsg, &interned));
+
+        let same_bytes = state
+            .intern_str(memerrmsg.as_bytes())
+            .expect("interning the memerrmsg bytes should not fail");
+        assert!(
+            GcRef::ptr_eq(&memerrmsg, &same_bytes),
+            "memerrmsg must be a member of the same intern table as every other \
+             short string, matching upstream Lua's `eqshrstr` identity semantics \
+             (a script string spelling the OOM message aliases memerrmsg)"
         );
     }
 

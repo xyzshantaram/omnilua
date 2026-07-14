@@ -939,7 +939,9 @@ fn aux_get_info(
                 }
             }
             b't' => {
-                if let Some(ci) = ci {
+                if state.global().lua_version == lua_types::LuaVersion::V51 {
+                    status = false;
+                } else if let Some(ci) = ci {
                     ar.istailcall = ci.callstatus & CIST_TAIL != 0;
                     ar.extraargs = ci.call_metamethods;
                 } else {
@@ -957,16 +959,27 @@ fn aux_get_info(
                     ar.name = name;
                 }
             }
-            b'r' => match ci {
-                Some(ci) if ci.callstatus & CIST_TRAN != 0 => {
-                    ar.ftransfer = ci.transfer_ftransfer();
-                    ar.ntransfer = ci.transfer_ntransfer();
+            b'r' => {
+                if matches!(
+                    state.global().lua_version,
+                    lua_types::LuaVersion::V51
+                        | lua_types::LuaVersion::V52
+                        | lua_types::LuaVersion::V53
+                ) {
+                    status = false;
+                } else {
+                    match ci {
+                        Some(ci) if ci.callstatus & CIST_TRAN != 0 => {
+                            ar.ftransfer = ci.transfer_ftransfer();
+                            ar.ntransfer = ci.transfer_ntransfer();
+                        }
+                        _ => {
+                            ar.ftransfer = 0;
+                            ar.ntransfer = 0;
+                        }
+                    }
                 }
-                _ => {
-                    ar.ftransfer = 0;
-                    ar.ntransfer = 0;
-                }
-            },
+            }
             b'L' | b'f' => {}
             _ => {
                 status = false;
@@ -1431,26 +1444,36 @@ fn in_stack(ci: &CallInfo, val_idx: StackIdx) -> i32 {
 /// Lua closure at `ci`. If so, sets `*name` and returns `Some("upvalue")`.
 ///
 /// C compares `c->upvals[i]->v.p == o` (pointer identity on open upvalues or
-/// the closed slot). Here, open upvalues hold a `StackIdx`, compared directly
-/// against `val_idx`; closed upvalues cannot be identified by stack position,
-/// so they are not matched here.
-fn get_upval_name<'a>(
+/// the closed slot); each thread's stack is a separate allocation, so that
+/// comparison can never straddle two threads. Here, open upvalues hold a
+/// `(thread_id, StackIdx)` pair, and `val_idx` is only ever a slot on the
+/// currently running thread (`state.cached_thread_id`), so both the thread id
+/// and the index must match — comparing the index alone would let an upvalue
+/// homed on a different, unrelated thread falsely match a same-numbered
+/// register here. Closed upvalues cannot be identified by stack position, so
+/// they are not matched here.
+///
+/// `name` is an owned `Vec<u8>` rather than `&[u8]`, matching `find_local`:
+/// the name is borrowed from `ci_lua_proto`'s owned `GcRef<LuaProto>`, which
+/// drops at function end, so there is no caller lifetime the slice could be
+/// tied to.
+fn get_upval_name(
     ci: &CallInfo,
     val_idx: StackIdx,
-    name: &mut &'a [u8],
-    state: &'a LuaState,
+    name: &mut Vec<u8>,
+    state: &LuaState,
 ) -> Option<&'static [u8]> {
     let proto = ci_lua_proto(ci, state);
     let lua_cl = match state.get_at(ci.func) {
         LuaValue::Function(LuaClosure::Lua(cl)) => cl.clone(),
         _ => return None,
     };
+    let current_thread = state.cached_thread_id;
     for (i, upval_slot) in lua_cl.upvals.iter().enumerate() {
         let upval = upval_slot.get();
-        if let Some((_thread_id, idx)) = upval.try_open_payload() {
-            if idx == val_idx {
-                let _ = upval_name(&proto, i);
-                *name = b"upvalue";
+        if let Some((thread_id, idx)) = upval.try_open_payload() {
+            if thread_id as u64 == current_thread && idx == val_idx {
+                *name = upval_name(&proto, i).to_vec();
                 return Some(b"upvalue");
             }
         }
@@ -1498,10 +1521,10 @@ fn var_info_parts(state: &LuaState, val_idx: StackIdx) -> (Option<Vec<u8>>, Opti
     let mut name_owned: Vec<u8> = b"?".to_vec();
 
     if ci.is_lua() {
-        let mut up_name: &[u8] = b"?";
+        let mut up_name: Vec<u8> = b"?".to_vec();
         kind = get_upval_name(&ci, val_idx, &mut up_name, state);
         if kind.is_some() {
-            name_owned = up_name.to_vec();
+            name_owned = up_name;
         } else {
             let reg = in_stack(&ci, val_idx);
             if reg >= 0 {
