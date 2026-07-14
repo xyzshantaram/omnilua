@@ -1,27 +1,21 @@
-//! Phase-D `Trace` implementations for GC-rooted types defined in this
-//! crate. Types in `lua-types` (LuaValue, LuaString, UpVal) have their
-//! Trace impls in `lua-types/src/trace_impls.rs` because of Rust's orphan
-//! rule.
+//! `Trace` implementations for GC-rooted types defined in this crate. Types
+//! in `lua-types` (LuaValue, LuaString, UpVal) have their Trace impls in
+//! `lua-types/src/trace_impls.rs` because of Rust's orphan rule.
 //!
-//! Each impl below is a `todo!("phase-d: trace X")` stub. The
-//! panic-driven mega-loop surfaces each one when a runtime path triggers
-//! `Heap::full_collect`. Each agent works on ONE type — no family
-//! expansion (Trace impls have subtle invariants).
-//!
-//! Implementation guidance for agents:
+//! Guidance for adding a new impl (Trace impls have subtle invariants, so
+//! change one type at a time):
 //!   1. Read the type definition; enumerate every field
 //!   2. For every `Gc<T>`, `GcRef<T>`, or container (Vec/Option/HashMap)
 //!      thereof, call `m.mark(field)` or `field.trace(m)` appropriately
 //!   3. Skip non-GC fields (primitives, `String`, `Vec<u8>`)
 //!   4. Skip "intentionally not traced" fields (weak refs)
-//!   5. Reference `reference/lua-5.4.7/src/lgc.c`'s `reallymarkobject`
+//!   5. Reference `lgc.c`'s `reallymarkobject` for the C original's approach
 
 use crate::state::{FinalizerObject, GlobalState, LuaState};
 use crate::string::{LuaStringImpl, LuaUserDataImpl};
 use lua_gc::{Marker, Trace};
 
-/// Phase-B internal richer LuaString. The byte buffer is a Rust `Rc<[u8]>`
-/// (not GC-managed); no fields to mark.
+/// The byte buffer is a Rust `Rc<[u8]>` (not GC-managed); no fields to mark.
 impl Trace for LuaStringImpl {
 
     fn type_name(&self) -> &'static str {
@@ -31,9 +25,8 @@ impl Trace for LuaStringImpl {
     fn trace(&self, _m: &mut Marker) {}
 }
 
-/// Phase-B internal userdata. Both `metatable` and `uv` are currently
-/// `Option<()>` / `Vec<()>` stubs — no GC edges to walk yet. Becomes
-/// real when userdata machinery lands post-D-1.
+/// `metatable` and `uv` are `Option<()>` / `Vec<()>` placeholders with no GC
+/// edges to walk; full userdata is `lua_types::value::LuaUserData` instead.
 impl Trace for LuaUserDataImpl {
 
     fn type_name(&self) -> &'static str {
@@ -80,14 +73,14 @@ impl Trace for LuaState {
             uv.trace(m);
         }
 
-        // PORT NOTE: `global` (Rc<RefCell<GlobalState>>) is reached from the
-        // heap's root via GlobalState::trace; tracing it from each thread
-        // would re-enter the root and is explicitly excluded.
-        // PORT NOTE: `call_info` entries carry pc offsets and stack indices
-        // but no direct GcRef fields. The active closure is reached through
-        // the stack slot at `ci.func`, already covered by the stack walk.
-        // PORT NOTE: `tbclist` holds StackIdx values only; the to-be-closed
-        // objects themselves live on the stack and are traced there.
+        // `global` (Rc<RefCell<GlobalState>>) is reached from the heap's root
+        // via GlobalState::trace; tracing it from each thread would re-enter
+        // the root and is explicitly excluded.
+        // `call_info` entries carry pc offsets and stack indices but no direct
+        // GcRef fields. The active closure is reached through the stack slot
+        // at `ci.func`, already covered by the stack walk.
+        // `tbclist` holds StackIdx values only; the to-be-closed objects
+        // themselves live on the stack and are traced there.
     }
 }
 
@@ -118,12 +111,9 @@ impl Trace for GlobalState {
             value.trace(m);
         }
 
-        // PORT NOTE (phase-b-reconcile): The lua-types LuaTable placeholder is
-        // storage-less, so `globals` and `loaded` cannot live inside the registry
-        // table (see `init_registry`). They are kept as direct GlobalState fields
-        // and must be traced explicitly as roots; once the placeholder reconciles
-        // with vm::LuaTable, these become reachable via `l_registry` and the two
-        // lines below disappear.
+        // `globals` and `loaded` are kept as direct GlobalState fields rather
+        // than inside the registry table (see `init_registry`), so they must
+        // be traced explicitly as roots here.
         self.globals.trace(m);
         self.loaded.trace(m);
 
@@ -214,17 +204,17 @@ impl Trace for GlobalState {
             }
         }
 
-        // PORT NOTE: `strt` (the internal LuaStringImpl intern table) is a
-        // weak table in C; entries are cleared during the atomic weak-table
-        // pass (`clearbykeys`), not marked as roots. The current port has no
-        // incremental weak-sweep, but `strt` is keyed by byte-content rather
-        // than by `Gc` identity, so a dangling entry there is silently
-        // recreated by the next `intern_str` — no UAF, unlike `interned_lt`.
-        // PORT NOTE: `fixedgc` holds objects pre-marked fixed/black at
-        // allocation (`luaC_fix`); the mark phase never re-visits them, and
+        // `strt` (the internal LuaStringImpl intern table) is a weak table in
+        // C; entries are cleared during the atomic weak-table pass
+        // (`clearbykeys`), not marked as roots. There is no incremental
+        // weak-sweep here, but `strt` is keyed by byte-content rather than by
+        // `Gc` identity, so a dangling entry there is silently recreated by
+        // the next `intern_str` — no UAF, unlike `interned_lt`.
+        // `fixedgc` holds objects pre-marked fixed/black at allocation
+        // (`luaC_fix`); the mark phase never re-visits them, and
         // `dyn Collectable` does not implement `Trace` here.
-        // PORT NOTE: `allgc`, `finobj`, `gray`, `grayagain`, `tobefnz`,
-        // `weak`, `ephemeron`, `allweak` are GC bookkeeping lists owned by
-        // `heap` — they are the universe of allocated objects, not roots.
+        // `allgc`, `finobj`, `gray`, `grayagain`, `tobefnz`, `weak`,
+        // `ephemeron`, `allweak` are GC bookkeeping lists owned by `heap` —
+        // they are the universe of allocated objects, not roots.
     }
 }
