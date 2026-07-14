@@ -2147,6 +2147,16 @@ use lua_types::tagmethod::TagMethod;
 /// All stack-pointer fields in C (`StkIdRel`, `StkId`) become `StackIdx` (u32
 /// index into `stack: Vec<StackValue>`).  The C intrusive `CallInfo` linked list
 /// becomes `call_info: Vec<CallInfo>` indexed by `CallInfoIdx`.
+///
+/// No `extra_space` field: C's `LUA_EXTRASPACE` reserves a small, fixed-size
+/// raw memory region immediately before `lua_State` for embedder bookkeeping,
+/// addressable via `lua_getextraspace` without a registry lookup — a niche
+/// embedding feature (issue #275 item 3). This port has no equivalent field
+/// or accessor; an embedder that needs per-thread scratch storage should use
+/// the registry (`Lua::create_registry_value`/`set_named_registry_value`) or
+/// a side table keyed by thread identity instead. Tracked as a known
+/// unsupported embedding feature in `docs/EMBEDDING_API_IMPLEMENTATION.md`'s
+/// Known Limits.
 pub struct LuaState {
     // ── Thread status ──
 
@@ -6028,10 +6038,6 @@ pub fn new_thread(state: &mut LuaState, initial_body: Option<LuaValue>) -> Resul
     // is a non-`Clone` `Box<dyn FnMut(...)>`, so only the mask/counts above
     // are copied; sharing the closure would need an `Arc<Mutex<...>>`.
     new_thread.reset_hook_count();
-
-    // There is no `LuaState.extra_space` field, so `lua_getextraspace` (the
-    // C API for per-thread embedder-owned extra space) has no equivalent
-    // here.
 
     stack_init(&mut new_thread);
 
