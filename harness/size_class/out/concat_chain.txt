@@ -1,7 +1,7 @@
-fibonacci.lua OK: 57028870
+concat_chain.lua OK: len=20674500
 # size_class_histogram
-workload : harness/bench/workloads/fibonacci.lua
-peak live bytes (proxy for peak RSS) : 66257 bytes (0.06 MiB)
+workload : harness/bench/workloads/concat_chain.lua
+peak live bytes (proxy for peak RSS) : 62535 bytes (0.06 MiB)
 pointer width : 64 bits
 
 ## macOS libmalloc size-class probes (malloc_good_size, authoritative)
@@ -79,14 +79,14 @@ pointer width : 64 bits
 
 ## GcBox<T> sizes vs the size-class table (GcHeader = 24 B)
 type             payld   GcBox   class   prevcls   cross(B)    step(B)    peakpop
-LuaTable            72      96      96        80         16         16         21
-LuaString           24      48      48        32         16         16        206
-UpVal               32      56      64        48          8         16          2
-LuaLClosure         24      48      48        32         16         16        206
-LuaCClosure         40      64      64        48         16         16         12
-LuaProto           208     232     240       224          8         16          2
+LuaTable            72      96      96        80         16         16         22
+LuaString           24      48      48        32         16         16        211
+UpVal               32      56      64        48          8         16          0
+LuaLClosure         24      48      48        32         16         16        211
+LuaCClosure         40      64      64        48         16         16          9
+LuaProto           208     232     240       224          8         16          0
 LuaUserData         88     112     112        96         16         16          3
-LuaThread            8      32      32        16         16         16        148
+LuaThread            8      32      32        16         16         16        145
 LuaState           176     200     208       192          8         16          1
 
 legend: class=libmalloc class cap for GcBox; prevcls=next-smaller class cap;
@@ -98,17 +98,20 @@ LuaValue = 16 B, TableNode = 40 B, TableInner = 48 B
 
 ## peak-moment live histogram (size buckets with >=8 live objects)
     size  good_size   peak_count peak_bytes(good)
-       3         16           16              256
+       1         16            8              128
+       2         16            9              144
+       3         16           21              336
        4         16           39              624
-       5         16           40              640
+       5         16           44              704
        6         16           35              560
-       7         16           17              272
-       8         16           13              208
+       7         16           19              304
+       8         16           11              176
        9         16            9              144
-      10         16           10              160
-      32         32          148             4736
-      48         48          206             9888
-      64         64           12              768
-      96         96           21             2016
+      10         16           12              192
+      24         32            9              288
+      32         32          145             4640
+      48         48          211            10128
+      64         64            9              576
+      96         96           22             2112
 
-tracked good-size bytes across printed buckets: 20272 (0.02 MiB)
+tracked good-size bytes across printed buckets: 21056 (0.02 MiB)

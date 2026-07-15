@@ -80,13 +80,13 @@ pointer width : 64 bits
 ## GcBox<T> sizes vs the size-class table (GcHeader = 24 B)
 type             payld   GcBox   class   prevcls   cross(B)    step(B)    peakpop
 LuaTable            72      96      96        80         16         16         22
-LuaString           24      48      48        32         16         16     100213
-UpVal               32      56      64        48          8         16     100001
-LuaLClosure         24      48      48        32         16         16     100213
-LuaCClosure         40      64      64        48         16         16         14
+LuaString           24      48      48        32         16         16     100194
+UpVal               32      56      64        48          8         16      99985
+LuaLClosure         24      48      48        32         16         16     100194
+LuaCClosure         40      64      64        48         16         16         12
 LuaProto           208     232     240       224          8         16          3
 LuaUserData         88     112     112        96         16         16          3
-LuaThread            8      32      32        16         16         16        149
+LuaThread            8      32      32        16         16         16        147
 LuaState           176     200     208       192          8         16          1
 
 legend: class=libmalloc class cap for GcBox; prevcls=next-smaller class cap;
@@ -98,14 +98,19 @@ LuaValue = 16 B, TableNode = 40 B, TableInner = 48 B
 
 ## peak-moment live histogram (size buckets with >=8 live objects)
     size  good_size   peak_count peak_bytes(good)
-       0         16          158             2528
-       8         16       100049          1600784
-      24         32            9              288
-      32         32          149             4768
-      48         48       100213          4810224
-      56         64       100001          6400064
-      64         64           14              896
+       3         16           15              240
+       4         16           40              640
+       5         16           41              656
+       6         16           35              560
+       7         16           17              272
+       8         16        99999          1599984
+       9         16            9              144
+      10         16           10              160
+      32         32          147             4704
+      48         48       100194          4809312
+      56         64        99985          6399040
+      64         64           12              768
       96         96           22             2112
-(>65536 B overflow bucket: 3 live allocations)
+(>8192 B overflow bucket: 3 live allocations)
 
-tracked good-size bytes across printed buckets: 12821664 (12.23 MiB)
+tracked good-size bytes across printed buckets: 12818592 (12.22 MiB)

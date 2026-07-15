@@ -81,8 +81,14 @@ fn prev_class_cap(size: usize) -> usize {
     }
 }
 
-const GRANULARITY: usize = 8;
-const NUM_BUCKETS: usize = 8192; // covers 0..64 KiB at 8-byte granularity
+/// Exact-byte histogram: one bucket per request size. Keying on the exact
+/// `Layout::size()` (not an 8-byte range) means "bucket 56" is *exactly* the
+/// 56-byte requests, so a `GcBox<T>` whose `size_of` is 56 shares its bucket
+/// only with other exactly-56-byte allocations — not the [56,63] range. This
+/// removes the range-aggregation ambiguity (codex R1 finding #2). Attribution
+/// is still by size, not by type; workload structure supplies the type.
+const GRANULARITY: usize = 1;
+const NUM_BUCKETS: usize = 8192; // exact sizes 0..8192 B; larger -> overflow
 
 #[allow(clippy::declare_interior_mutable_const)]
 const ZERO_U32: AtomicU32 = AtomicU32::new(0);
@@ -94,6 +100,11 @@ static SNAP: [AtomicU32; NUM_BUCKETS] = [ZERO_U32; NUM_BUCKETS];
 /// Live count of allocations larger than the tracked range.
 static LIVE_OVERFLOW: AtomicU32 = AtomicU32::new(0);
 static SNAP_OVERFLOW: AtomicU32 = AtomicU32::new(0);
+/// Peak-bytes value at which the last snapshot was taken; used to throttle
+/// snapshotting to once per `SNAP_DELTA` growth so the exact-size copy stays
+/// cheap without missing the true peak by more than the delta.
+static SNAP_AT: AtomicUsize = AtomicUsize::new(0);
+const SNAP_DELTA: usize = 4096;
 /// Set true while `main` is emitting the report, so its own allocations are
 /// not folded into the workload histogram.
 static REPORTING: AtomicUsize = AtomicUsize::new(0);
@@ -119,15 +130,19 @@ fn record_alloc(size: usize) {
             LIVE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
         }
     }
-    let now = LIVE_BYTES.fetch_add(size as isize, Ordering::Relaxed) + size as isize;
-    if now as usize > PEAK_BYTES.load(Ordering::Relaxed) {
-        PEAK_BYTES.store(now as usize, Ordering::Relaxed);
-        // Snapshot the whole live histogram at this new peak. No allocation
-        // happens here (fixed static arrays), so this is safe inside the hook.
-        for i in 0..NUM_BUCKETS {
-            SNAP[i].store(LIVE[i].load(Ordering::Relaxed), Ordering::Relaxed);
+    let now = (LIVE_BYTES.fetch_add(size as isize, Ordering::Relaxed) + size as isize) as usize;
+    if now > PEAK_BYTES.load(Ordering::Relaxed) {
+        PEAK_BYTES.store(now, Ordering::Relaxed);
+        // Snapshot the whole live histogram at this new peak, throttled to once
+        // per SNAP_DELTA of growth. No allocation happens here (fixed static
+        // arrays), so this is safe inside the allocator hook.
+        if now >= SNAP_AT.load(Ordering::Relaxed) + SNAP_DELTA {
+            SNAP_AT.store(now, Ordering::Relaxed);
+            for i in 0..NUM_BUCKETS {
+                SNAP[i].store(LIVE[i].load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            SNAP_OVERFLOW.store(LIVE_OVERFLOW.load(Ordering::Relaxed), Ordering::Relaxed);
         }
-        SNAP_OVERFLOW.store(LIVE_OVERFLOW.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 }
 

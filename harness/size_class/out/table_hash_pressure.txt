@@ -83,10 +83,10 @@ LuaTable            72      96      96        80         16         16         2
 LuaString           24      48      48        32         16         16     165753
 UpVal               32      56      64        48          8         16          1
 LuaLClosure         24      48      48        32         16         16     165753
-LuaCClosure         40      64      64        48         16         16         14
+LuaCClosure         40      64      64        48         16         16         13
 LuaProto           208     232     240       224          8         16          1
 LuaUserData         88     112     112        96         16         16          3
-LuaThread            8      32      32        16         16         16     123752
+LuaThread            8      32      32        16         16         16     123750
 LuaState           176     200     208       192          8         16          1
 
 legend: class=libmalloc class cap for GcBox; prevcls=next-smaller class cap;
@@ -98,12 +98,20 @@ LuaValue = 16 B, TableNode = 40 B, TableInner = 48 B
 
 ## peak-moment live histogram (size buckets with >=8 live objects)
     size  good_size   peak_count peak_bytes(good)
-       0         16       165701          2651216
-       8         16           43              688
-      32         32       123752          3960064
+       1         16            8              128
+       2         16           23              368
+       3         16          196             3136
+       4         16         1842            29472
+       5         16        18039           288624
+       6         16       145575          2329200
+       7         16           18              288
+       8         16           12              192
+       9         16            9              144
+      10         16           10              160
+      32         32       123750          3960000
       48         48       165753          7956144
-      64         64           14              896
+      64         64           13              832
       96         96           23             2208
-(>65536 B overflow bucket: 5 live allocations)
+(>8192 B overflow bucket: 5 live allocations)
 
-tracked good-size bytes across printed buckets: 14571216 (13.90 MiB)
+tracked good-size bytes across printed buckets: 14570896 (13.90 MiB)

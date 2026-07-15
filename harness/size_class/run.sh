@@ -18,9 +18,11 @@ mkdir -p "$OUT"
 
 WORKLOADS=("$@")
 if [ ${#WORKLOADS[@]} -eq 0 ]; then
-    # closure_ops + binarytrees are the #113 tall poles; the rest are controls
-    # / representativeness checks.
-    WORKLOADS=(closure_ops binarytrees table_hash_pressure gc_pressure fibonacci)
+    # closure_ops + binarytrees are the #113 tall poles; concat_chain +
+    # string_format_mixed + table_hash_pressure complete the five-row
+    # done-condition set (docs/ISSUE_BURNDOWN_SPEC.md); the rest are controls.
+    WORKLOADS=(closure_ops binarytrees table_hash_pressure concat_chain \
+               string_format_mixed gc_pressure fibonacci)
 fi
 
 echo "building size_class_histogram (release) ..."
