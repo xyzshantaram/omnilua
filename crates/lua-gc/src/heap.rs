@@ -1598,6 +1598,24 @@ impl Heap {
     /// and the heap will never drop. Collector-internal bookkeeping only
     /// ever holds `Weak<Heap>` (`HeapRef`) for this reason.
     pub fn new() -> std::rc::Rc<Self> {
+        Self::build(
+            std::env::var_os("LUA_RS_GC_STRESS").is_some_and(|v| v == "1"),
+            std::env::var_os("LUA_RS_GC_QUARANTINE").is_some_and(|v| v == "1"),
+        )
+    }
+
+    /// Construct a heap with quarantine mode forced on, bypassing the
+    /// `LUA_RS_GC_QUARANTINE` env var. Test-only: the stale-handle tripwires
+    /// (`stale_handle_tripwire`) only read a swept box's parked header under
+    /// quarantine, so exercising them deterministically needs quarantine on
+    /// for *this* heap without mutating process-global env state (which races
+    /// across parallel `cargo test` threads).
+    #[doc(hidden)]
+    pub fn new_quarantined() -> std::rc::Rc<Self> {
+        Self::build(false, true)
+    }
+
+    fn build(stress: bool, quarantine: bool) -> std::rc::Rc<Self> {
         std::rc::Rc::new(Self {
             head: Cell::new(None),
             finobj: Cell::new(None),
@@ -1615,8 +1633,8 @@ impl Heap {
             allocation_tokens: RefCell::new(IdentityHashMap::default()),
             next_allocation_token: Cell::new(1),
             threshold: Cell::new(64 * 1024), // initial threshold: 64 KB
-            stress: std::env::var_os("LUA_RS_GC_STRESS").is_some_and(|v| v == "1"),
-            quarantine: std::env::var_os("LUA_RS_GC_QUARANTINE").is_some_and(|v| v == "1"),
+            stress,
+            quarantine,
             quarantined: Cell::new(None),
             uncollected: Cell::new(None),
             closed: Cell::new(false),
