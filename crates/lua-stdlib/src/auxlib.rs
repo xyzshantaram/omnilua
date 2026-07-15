@@ -30,10 +30,6 @@ const LEVELS1: i32 = 10;
 /// Number of stack frames to show in the second part of a traceback.
 const LEVELS2: i32 = 11;
 
-/// Index (1-based) in the reference table that heads the free-list of recycled
-/// references. Placed after the last predefined registry key.
-const FREELIST_REF: i64 = 3; // LUA_RIDX_GLOBALS (2) + 1
-
 /// Pseudo-reference returned by `lua_ref` when the pushed value was `nil`.
 pub const LUA_REFNIL: i32 = -1;
 
@@ -962,30 +958,76 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 // ── Reference system ──────────────────────────────────────────────────────────
 
+/// The `luaL_ref`/`luaL_unref` free-list head index within the reference
+/// table `t` — the slot C-Lua's `lauxlib.c` calls `FREELIST_REF` (5.1) or
+/// `freelist` (5.2+). Version-gated because the value moved twice across the
+/// C line; every arm below is verified against source, not memory (issue
+/// #291):
+///
+/// - **5.1** — `#define FREELIST_REF 0` (`lua.org/source/5.1/lauxlib.c.html`;
+///   not vendored under `reference/` per issue #282's note, fetched from
+///   lua.org for this fix).
+/// - **5.2** — `#define freelist 0` (`lua.org/source/5.2/lauxlib.c.html`).
+/// - **5.3** — `#define freelist 0` (`reference/lua-5.3.6/src/lauxlib.c`).
+///   Index 0 is safe on any table, registry or otherwise — no `LUA_RIDX_*`
+///   predefined key is ever 0.
+/// - **5.4** — moved to `#define freelist (LUA_RIDX_LAST + 1)`
+///   (`reference/lua-5.4.7/src/lauxlib.c`), i.e. `LUA_RIDX_GLOBALS`(2) + 1 =
+///   **3**.
+/// - **5.5** — hardcodes index **1** directly, no named macro
+///   (`reference/lua-5.5.0/src/lauxlib.c`: `lua_rawgeti(L, t, 1)` /
+///   `lua_rawseti(L, t, 1)`), because 5.5 renumbered `LUA_RIDX_MAINTHREAD` to
+///   3 (`lua.h`), freeing slot 1 for this purpose.
+///
+/// This port previously hardcoded **3** (the 5.4 value) for every version.
+/// That was invisible because `lua_ref`/`lua_unref` have zero callers today,
+/// but it was wrong for four of five versions — only 5.4 matched — and on
+/// 5.5 it collided outright with `LUA_RIDX_MAINTHREAD`
+/// (`set_versioned_registry_slots`, `lua-vm/src/state.rs`, from #275). Fixed
+/// here as cheap insurance ahead of the mechanism ever getting a caller.
+fn freelist_ref(version: lua_types::LuaVersion) -> i64 {
+    match version {
+        lua_types::LuaVersion::V51 => 0,
+        lua_types::LuaVersion::V52 => 0,
+        lua_types::LuaVersion::V53 => 0,
+        lua_types::LuaVersion::V54 => 3,
+        lua_types::LuaVersion::V55 => 1,
+        _ => 3,
+    }
+}
+
 /// Store the value at the top of the stack in table `t` and return a unique
 /// integer reference. If the value is `nil`, returns `LUA_REFNIL` without
 /// modifying the table.
 ///
+/// The free-list head at [`freelist_ref`]'s index counts as "initialized"
+/// once it holds a `Number`, matching 5.5's explicit `LUA_TNUMBER` check
+/// (`reference/lua-5.5.0/src/lauxlib.c`) rather than 5.1-5.4's plain `nil`
+/// check: 5.5's `set_versioned_registry_slots` pre-seeds `registry[1]` with
+/// `false` (not `nil`) as the free-list's "uninitialized" sentinel, and a
+/// `nil`-only check would misread that sentinel as already-initialized. The
+/// two checks agree on 5.1-5.4 (the head there is always either `nil` or a
+/// `Number`), so a single version-free comparison covers every version.
 pub fn lua_ref(state: &mut LuaState, t: i32) -> Result<i32, LuaError> {
     if state.type_at(-1) == LuaType::Nil {
         state.pop_n(1);
         return Ok(LUA_REFNIL);
     }
     let t = state.abs_index(t);
+    let freelist = freelist_ref(state.global().lua_version);
     let ref_val: i32;
-    if state.raw_get_i(t, FREELIST_REF)? == LuaType::Nil {
-        ref_val = 0; // list is empty
+    if state.raw_get_i(t, freelist)? != LuaType::Number {
+        ref_val = 0;
         state.push(LuaValue::Int(0));
-        state.raw_set_i(t, FREELIST_REF)?;
+        state.raw_set_i(t, freelist)?;
     } else {
-        debug_assert!(state.type_at(-1) == LuaType::Number);
         ref_val = state.to_integer_x(-1).unwrap_or(0) as i32;
     }
-    state.pop_n(1); // remove element from stack
+    state.pop_n(1);
     let next_ref: i32;
     if ref_val != 0 {
         state.raw_get_i(t, ref_val as i64)?;
-        state.raw_set_i(t, FREELIST_REF)?;
+        state.raw_set_i(t, freelist)?;
         next_ref = ref_val;
     } else {
         next_ref = (state.raw_len(t) as i32) + 1;
@@ -999,11 +1041,12 @@ pub fn lua_ref(state: &mut LuaState, t: i32) -> Result<i32, LuaError> {
 pub fn lua_unref(state: &mut LuaState, t: i32, r: i32) -> Result<(), LuaError> {
     if r >= 0 {
         let t = state.abs_index(t);
-        state.raw_get_i(t, FREELIST_REF)?;
+        let freelist = freelist_ref(state.global().lua_version);
+        state.raw_get_i(t, freelist)?;
         debug_assert!(state.type_at(-1) == LuaType::Number);
         state.raw_set_i(t, r as i64)?;
         state.push(LuaValue::Int(r as i64));
-        state.raw_set_i(t, FREELIST_REF)?;
+        state.raw_set_i(t, freelist)?;
     }
     Ok(())
 }
@@ -1423,3 +1466,35 @@ impl<'a> std::fmt::Display for BStr<'a> {
 use std::fmt::Write as _;
 
 // ── LuaDebug Default ─────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lua_types::LuaVersion;
+
+    /// The `freelist_ref` mapping (issue #291), pinned per-version against
+    /// each C release's `lauxlib.c` (see `freelist_ref`'s doc comment for the
+    /// exact source citations): 0 on 5.1/5.2/5.3, 3 on 5.4, 1 on 5.5. This is
+    /// a unit test on the mapping function only — `lua_ref`/`lua_unref`
+    /// themselves have zero callers in this codebase, so there is nothing to
+    /// drive an end-to-end probe with.
+    #[test]
+    fn freelist_ref_is_version_exact() {
+        assert_eq!(freelist_ref(LuaVersion::V51), 0);
+        assert_eq!(freelist_ref(LuaVersion::V52), 0);
+        assert_eq!(freelist_ref(LuaVersion::V53), 0);
+        assert_eq!(freelist_ref(LuaVersion::V54), 3);
+        assert_eq!(freelist_ref(LuaVersion::V55), 1);
+    }
+
+    /// 5.5's free-list index must not collide with `LUA_RIDX_MAINTHREAD`,
+    /// which `set_versioned_registry_slots` (`lua-vm/src/state.rs`, #275)
+    /// places at registry index 3 on 5.5. This is the concrete bug #291
+    /// reported: the port previously hardcoded `FREELIST_REF = 3` for every
+    /// version, which collided outright on 5.5.
+    #[test]
+    fn freelist_ref_does_not_collide_with_5_5_mainthread_slot() {
+        const V55_MAINTHREAD_REGISTRY_SLOT: i64 = 3;
+        assert_ne!(freelist_ref(LuaVersion::V55), V55_MAINTHREAD_REGISTRY_SLOT);
+    }
+}
