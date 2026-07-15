@@ -821,6 +821,31 @@ impl GcHeader {
     }
 }
 
+/// Compile-time header-layout pins (issue #113 W1). Unlike the `#[test]`
+/// versions these are checked on *every* build for the current target, so the
+/// wasm32 16 B header is guarded on a real wasm build, not only when the test
+/// suite is cross-compiled. `GcHeader` is `color + age + flags + pad +
+/// size(u32) + next`: 24 B on 64-bit (16 B fat `next`, align 8) / 16 B on
+/// wasm32 (8 B fat `next`, align 4).
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::size_of::<GcHeader>() == 24);
+    assert!(std::mem::align_of::<GcHeader>() == 8);
+};
+#[cfg(target_pointer_width = "32")]
+const _: () = {
+    assert!(std::mem::size_of::<GcHeader>() == 16);
+};
+
+/// Compile-time pin on a representative `GcBox` layout (24-byte header +
+/// an 8-byte payload): the header diet's byte-neutrality is only meaningful
+/// if the composed box size holds too, and a `const` block checks it on
+/// every real build for the target rather than only under the test suite.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<GcBox<u64>>() == 32);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(std::mem::size_of::<GcBox<u64>>() == 24);
+
 /// A heap-allocated, GC-tracked value plus its header.
 #[repr(C)]
 pub struct GcBox<T: ?Sized> {
@@ -1598,6 +1623,25 @@ impl Heap {
     /// and the heap will never drop. Collector-internal bookkeeping only
     /// ever holds `Weak<Heap>` (`HeapRef`) for this reason.
     pub fn new() -> std::rc::Rc<Self> {
+        Self::build(
+            std::env::var_os("LUA_RS_GC_STRESS").is_some_and(|v| v == "1"),
+            std::env::var_os("LUA_RS_GC_QUARANTINE").is_some_and(|v| v == "1"),
+        )
+    }
+
+    /// Construct a heap with quarantine mode forced on, bypassing the
+    /// `LUA_RS_GC_QUARANTINE` env var. Test-only: the use-after-sweep tripwire
+    /// (the `HDR_FREED` `debug_assert` in `Gc::as_box` / `Marker::mark_box`)
+    /// only fires because quarantine *parks* swept boxes instead of freeing
+    /// them, so exercising it deterministically needs quarantine on for *this*
+    /// heap without mutating process-global env state (which races across
+    /// parallel `cargo test` threads). Used by `stale_handle_kit`.
+    #[doc(hidden)]
+    pub fn new_quarantined() -> std::rc::Rc<Self> {
+        Self::build(false, true)
+    }
+
+    fn build(stress: bool, quarantine: bool) -> std::rc::Rc<Self> {
         std::rc::Rc::new(Self {
             head: Cell::new(None),
             finobj: Cell::new(None),
@@ -1615,8 +1659,8 @@ impl Heap {
             allocation_tokens: RefCell::new(IdentityHashMap::default()),
             next_allocation_token: Cell::new(1),
             threshold: Cell::new(64 * 1024), // initial threshold: 64 KB
-            stress: std::env::var_os("LUA_RS_GC_STRESS").is_some_and(|v| v == "1"),
-            quarantine: std::env::var_os("LUA_RS_GC_QUARANTINE").is_some_and(|v| v == "1"),
+            stress,
+            quarantine,
             quarantined: Cell::new(None),
             uncollected: Cell::new(None),
             closed: Cell::new(false),
@@ -3161,6 +3205,18 @@ impl Heap {
     /// cannot hit this (`free_all_objects` clears every registry that holds
     /// handles); giving boxes a checkable owner identity at `downgrade` time
     /// is the #252-follow-up ownership redesign, out of scope here.
+    ///
+    /// **Internal capability (issue #267 residual).** This takes `&self`, so
+    /// nothing in the type system stops purely-safe code from calling it while a
+    /// `Gc`/`&T` is still live. The deref-free no-guard guards (#267) do not
+    /// touch this case — closing it needs an API-shape change (exclusive/`&mut`
+    /// teardown or an access guard instead of `&T`) or slot-indexed handles
+    /// (spec option B), tracked as the follow-up. This is safe only under the
+    /// guard/rooting discipline the VM enforces internally; `Heap`/`drop_all`
+    /// are **not** part of omniLua's public embedding surface (the `omnilua`
+    /// facade drives teardown by dropping a rooted `Lua` handle and does not
+    /// re-export `Heap`). This doc is a legibility note, not a safety boundary —
+    /// direct `lua-gc` dependents own the invariant themselves.
     pub fn drop_all(&self) {
         /// Restores `tearing_down` on scope exit — including panic unwind —
         /// but only for the outermost `drop_all` frame (`armed`), so a
@@ -4253,14 +4309,21 @@ mod tests {
     /// Header-size regression for #113 Wave 1. Removing the `gray_next`
     /// grayagain fat pointer shrinks `GcHeader` from **40 B to 24 B on
     /// 64-bit** (`color + age + flags + pad + size(u32) + next(16)`), align 8.
-    /// The wasm32 figure is 24 -> 16 B (an 8-B fat pointer), but that is NOT
-    /// asserted here — a native test cannot observe the wasm32 layout, so the
-    /// assertion is gated to 64-bit targets; the wasm32 size is pinned by the
-    /// W2 `const` assert per the spec.
+    /// The wasm32 figure is 24 -> 16 B (an 8-B fat pointer), pinned at
+    /// compile time by the `const` size asserts beside the `GcHeader`
+    /// definition; this runtime test is the 64-bit companion. Issue #267 left
+    /// the header shape untouched (its owner-tag experiment was reverted after
+    /// the codex review found it unsound), so the offset-3 byte stays padding.
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn gcheader_is_24_bytes_after_grayagain_diet() {
         assert_eq!(std::mem::size_of::<GcHeader>(), 24);
+        assert_eq!(std::mem::align_of::<GcHeader>(), 8);
+        assert_eq!(
+            std::mem::size_of::<GcBox<u64>>(),
+            32,
+            "a GcBox<u64> stays header(24) + value(8) with no growth"
+        );
     }
 
     #[test]
