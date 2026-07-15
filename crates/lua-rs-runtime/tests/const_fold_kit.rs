@@ -266,7 +266,8 @@ fn low2_folded_bytecode_matches_bare_literal() {
         parts[#parts+1] = "int="   .. (eq(function() local x <const> = 42;          return x end, function() return 42 end)          and "1" or "0")
         parts[#parts+1] = "bigint=".. (eq(function() local x <const> = 1000000;      return x end, function() return 1000000 end)     and "1" or "0")
         parts[#parts+1] = "string=".. (eq(function() local s <const> = "kitmarker";  return s end, function() return "kitmarker" end) and "1" or "0")
-        parts[#parts+1] = "float=" .. (eq(function() local x <const> = 3.5;           return x end, function() return 3.5 end)         and "1" or "0")
+        parts[#parts+1] = "float=" .. (eq(function() local x <const> = 3.0;           return x end, function() return 3.0 end)         and "1" or "0")
+        parts[#parts+1] = "floatk=".. (eq(function() local x <const> = 3.5;           return x end, function() return 3.5 end)         and "1" or "0")
         parts[#parts+1] = "true="  .. (eq(function() local x <const> = true;          return x end, function() return true end)        and "1" or "0")
         parts[#parts+1] = "false=" .. (eq(function() local x <const> = false;         return x end, function() return false end)       and "1" or "0")
         parts[#parts+1] = "nil="   .. (eq(function() local x <const> = nil;           return x end, function() return nil end)         and "1" or "0")
@@ -276,7 +277,7 @@ fn low2_folded_bytecode_matches_bare_literal() {
     for v in [V54, V55] {
         assert_eq!(
             eval_str(v, code),
-            "int=1 bigint=1 string=1 float=1 true=1 false=1 nil=1 noncst=0",
+            "int=1 bigint=1 string=1 float=1 floatk=1 true=1 false=1 nil=1 noncst=0",
             "folded bytecode must match the bare literal's shape ({v:?})"
         );
     }
