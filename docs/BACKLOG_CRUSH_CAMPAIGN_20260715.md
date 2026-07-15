@@ -104,4 +104,23 @@ on any canary/official flip; codex fix-rounds capped at ~3 with triage
 
 ## Outcome log (updated as tickets resolve)
 
-- (pending)
+- **#282 — CLOSED, no code.** All five gaps were already resolved by #273's
+  completion; re-verified against live reference binaries. Editing correct
+  code is pure risk.
+- **#291 — FIXED (#293).** Version-gated FREELIST_REF; the fix corrected the
+  ticket's own wrong assumption (real per-version values 0/0/0/3/1, verified
+  against each lauxlib.c). Unreachable path (luaL_ref has no callers) — cheap
+  insurance.
+- **#113 — analysis DONE (#296), one candidate identified.** size_class_histogram
+  tool + ranked findings: `GcBox<UpVal>` 56→48 is the ONLY box that both
+  crosses a libmalloc class and has population (~100k on closure_ops, ~4–6%
+  slot-byte projection). Everything else fills its class exactly → the rest
+  of the GcBox diet is parked; remaining RSS gap is buffer representation (a
+  separate track). Candidate 1 → Wave B, arbiter-gated (drop-if-neutral).
+- **#267 — PARTIAL mitigation (#294, in fix-round).** The cheap C/D fix
+  closes the no-guard release UAFs (F1/F3/F4) deref-free + byte-neutral —
+  Codex-confirmed sound. The HDR_FREED tripwire + owner_gen attempt at the
+  foreign/stale-after-sweep cases was NUKED (Codex: it re-derefs a freed
+  header — a new UAF in the check). Those cases genuinely need option B
+  (slot-indexed handles) → filed as **#295**. #267 reframed as
+  partially-mitigated, not fully closed.
