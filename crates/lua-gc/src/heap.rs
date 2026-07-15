@@ -3268,6 +3268,17 @@ impl Heap {
     /// cannot hit this (`free_all_objects` clears every registry that holds
     /// handles); giving boxes a checkable owner identity at `downgrade` time
     /// is the #252-follow-up ownership redesign, out of scope here.
+    ///
+    /// **Internal capability (issue #267).** This takes `&self`, so nothing in
+    /// the type system stops purely-safe code from calling it while a `Gc`/`&T`
+    /// is still live — that is the residual the deref-free guards and the
+    /// `HDR_FREED`/`owner_gen` tripwire cannot close in release (closing it needs
+    /// exclusive/`&mut` teardown or slot-indexed handles, spec option B). It is
+    /// safe only under the guard/rooting discipline the VM enforces internally.
+    /// `Heap`/`drop_all` are **not** part of omniLua's public embedding surface:
+    /// the `omnilua` facade drives teardown through dropping a rooted `Lua`
+    /// handle and does not re-export `Heap`. Direct `lua-gc` dependents own this
+    /// invariant themselves.
     pub fn drop_all(&self) {
         /// Restores `tearing_down` on scope exit — including panic unwind —
         /// but only for the outermost `drop_all` frame (`armed`), so a

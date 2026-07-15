@@ -13,6 +13,28 @@
 //! created plus the target's heap allocation token. They upgrade only while
 //! that identity/token pair remains live. Handles to legacy uncollected boxes
 //! still upgrade forever, matching their process-lifetime allocation model.
+//!
+//! # Internal GC capability, not the embedding surface (issue #267)
+//!
+//! `GcRef` is a raw, `Copy`, guard-scoped GC capability: it carries no owner
+//! identity of its own, and its operations assume an active `HeapGuard` for the
+//! heap that owns the box. Holding a `GcRef` (or an issued `&T` from its
+//! `Deref`) across the owning heap's `drop_all`/`close`, or operating it under a
+//! *different* heap, is a use-after-free that safe code must not do. The
+//! guard-scoped operations here fail loudly on the reachable misuse shapes —
+//! `downgrade`/`account_buffer` panic deref-free with no active guard, and
+//! [`lua_gc::Heap::stale_handle_tripwire`] catches swept/foreign boxes under
+//! quarantine — but the raw type cannot make arbitrary handle lifetimes safe in
+//! release without slot-indexed handles (spec option B).
+//!
+//! **`GcRef` is therefore an implementation-crate (`lua-types`/`lua-gc`)
+//! capability, not omniLua's public embedding surface.** Embedders never name
+//! it: the `omnilua` facade exposes only rooted handles (its `Value` /
+//! `RootedValue`, which own a `Lua`, root through a slab key, and return a
+//! stale-handle error on cross-state or post-teardown use) and deliberately does
+//! not re-export raw `Gc`/`GcRef`/`Heap`. Keep it that way — routing embedders
+//! through the rooted handle is what makes the "a handle must not outlive its
+//! heap" invariant real.
 
 use lua_gc::{Gc, HeapRef, Trace};
 
