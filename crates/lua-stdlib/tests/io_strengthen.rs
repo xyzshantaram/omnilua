@@ -36,7 +36,7 @@
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use omnilua::{HostHooks, Lua, LuaError, LuaFileHandle, LuaVersion};
+use omnilua::{HostHooks, Lua, LuaFileHandle, LuaVersion};
 
 // ── A minimal real-filesystem file handle for the test embedding ─────────────
 
@@ -112,7 +112,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-fn test_file_open_hook(_filename: &[u8], mode: &[u8]) -> Result<Box<dyn LuaFileHandle>, LuaError> {
+fn test_file_open_hook(_filename: &[u8], mode: &[u8]) -> io::Result<Box<dyn LuaFileHandle>> {
     let path = SCRATCH_PATH
         .with(|p| p.borrow().clone())
         .expect("scratch path must be set before io.open in a test");
@@ -126,8 +126,7 @@ fn test_file_open_hook(_filename: &[u8], mode: &[u8]) -> Result<Box<dyn LuaFileH
             .create(true)
             .truncate(true)
             .open(&path)
-    }
-    .map_err(|e| LuaError::runtime(format_args!("open failed: {e}")))?;
+    }?;
     Ok(Box::new(TestFsFile {
         inner: file,
         pushback: None,

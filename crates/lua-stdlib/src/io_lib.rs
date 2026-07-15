@@ -408,6 +408,32 @@ fn check_mode_popen(mode: &[u8]) -> bool {
     matches!(mode, b"r" | b"w")
 }
 
+/// Render an `io::Error` the way C's `strerror(errno)` would: the plain
+/// platform message, with no trailing `" (os error N)"`.
+///
+/// `std::io::Error`'s `Display` impl always appends that suffix for an
+/// OS-backed error (`Repr::Os`), which is the exact wrong-message half of
+/// issue #301 (the reference's `luaL_fileresult` prints bare `strerror(en)`).
+/// `raw_os_error()` returns `Some(code)` only when the error was actually
+/// constructed from a raw OS code, in which case the suffix is guaranteed
+/// present in the stable, long-documented format Rust's stdlib emits — so
+/// stripping it is a deterministic un-format, not a guess. Errors with no
+/// raw OS code (e.g. "no filesystem hook registered") pass through unchanged.
+fn strerror_text(err: &io::Error) -> String {
+    let full = err.to_string();
+    match err.raw_os_error() {
+        Some(code) => {
+            let suffix = format!(" (os error {code})");
+            debug_assert!(
+                full.ends_with(&suffix),
+                "std io::Error Display format changed; expected suffix {suffix:?} in {full:?}"
+            );
+            full.strip_suffix(&suffix).unwrap_or(&full).to_string()
+        }
+        None => full,
+    }
+}
+
 /// Push success (`true`) or failure (`fail`, msg, errno) per `luaL_fileresult`.
 ///
 /// On success: `lua_pushboolean(L, 1); return 1`. On failure C runs
@@ -416,7 +442,12 @@ fn check_mode_popen(mode: &[u8]) -> bool {
 /// (5.1-5.5), so the first failure value is `nil`, never `false`. Tests that
 /// compare the failure handle to `nil` (e.g. `io.open(missing) == nil`) rely on
 /// this exact value.
-fn file_result(
+///
+/// The message and errno come straight off `os_err` via [`strerror_text`] and
+/// `raw_os_error()` — callers must pass through the original `io::Error` from
+/// the host hook unmodified, never re-wrap it as `ErrorKind::Other` (#301:
+/// re-wrapping drops `raw_os_error()`, surfacing as errno 0 downstream).
+pub(crate) fn file_result(
     state: &mut LuaState,
     success: bool,
     fname: Option<&[u8]>,
@@ -427,7 +458,7 @@ fn file_result(
         return Ok(1);
     }
     state.push(LuaValue::Nil);
-    let msg = os_err.to_string();
+    let msg = strerror_text(&os_err);
     match fname {
         Some(name) => {
             let mut s = Vec::with_capacity(name.len() + 2 + msg.len());
@@ -554,10 +585,7 @@ fn opencheck(state: &mut LuaState, fname: &[u8], mode: &[u8]) -> Result<(), LuaE
             LuaError::runtime(format_args!(
                 "cannot open file '{}' ({})",
                 fname.escape_ascii(),
-                match e.message_bytes() {
-                    Some(b) => String::from_utf8_lossy(b).into_owned(),
-                    None => format!("{:?}", &e),
-                }
+                strerror_text(&e)
             ))
         })?,
         None => {
@@ -721,16 +749,7 @@ pub fn io_open(state: &mut LuaState) -> Result<usize, LuaError> {
                 cell.borrow_mut().file = Some(fh);
                 Ok(1)
             }
-            Err(e) => {
-                let os_err = io::Error::new(
-                    io::ErrorKind::Other,
-                    match e.message_bytes() {
-                        Some(b) => String::from_utf8_lossy(b).into_owned(),
-                        None => format!("{:?}", &e),
-                    },
-                );
-                file_result(state, false, Some(&filename), os_err)
-            }
+            Err(os_err) => file_result(state, false, Some(&filename), os_err),
         },
         None => {
             let os_err =
@@ -851,16 +870,7 @@ pub fn io_tmpfile(state: &mut LuaState) -> Result<usize, LuaError> {
             cell.borrow_mut().file = Some(fh);
             Ok(1)
         }
-        Err(e) => {
-            let os_err = io::Error::new(
-                io::ErrorKind::Other,
-                match e.message_bytes() {
-                    Some(b) => String::from_utf8_lossy(b).into_owned(),
-                    None => format!("{:?}", &e),
-                },
-            );
-            file_result(state, false, None, os_err)
-        }
+        Err(os_err) => file_result(state, false, None, os_err),
     }
 }
 

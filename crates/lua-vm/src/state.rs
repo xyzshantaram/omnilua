@@ -1225,8 +1225,16 @@ pub type FileLoaderHook = fn(filename: &[u8]) -> Result<Vec<u8>, LuaError>;
 ///
 /// `mode` is a Lua fopen-style mode string (e.g. `b"r"`, `b"w"`, `b"a"`,
 /// `b"r+"`, etc.). The hook must honour at least `r`, `w`, and `a`.
+///
+/// The error type is `std::io::Error`, not `LuaError`: `io::Error` is the only
+/// type in this boundary that can carry `raw_os_error()` end to end.
+/// `lua-stdlib`'s `io.open`/`io.input`/`io.output` read the errno straight off
+/// this error and render the message with `strerror`-shaped text, matching
+/// C-Lua's `luaL_fileresult`/`luaL_error(..., strerror(errno))`. Converting to
+/// `LuaError` here (as earlier revisions did) discards `raw_os_error()`, which
+/// was issue #301 (errno 0 + a verbose Rust `Display` message reaching Lua).
 pub type FileOpenHook =
-    fn(filename: &[u8], mode: &[u8]) -> Result<Box<dyn lua_types::LuaFileHandle>, LuaError>;
+    fn(filename: &[u8], mode: &[u8]) -> std::io::Result<Box<dyn lua_types::LuaFileHandle>>;
 
 /// Function-pointer signature for writing bytes to a host-provided output
 /// stream, installed on [`GlobalState::stdout_hook`] or
@@ -1302,14 +1310,21 @@ pub type PopenHook =
 ///
 /// `std::fs` is banned outside `lua-cli`, so `lua-stdlib`'s `os.remove`
 /// reaches the filesystem via this hook. Returns `Ok(())` on success.
-pub type FileRemoveHook = fn(filename: &[u8]) -> Result<(), LuaError>;
+///
+/// The error type is `std::io::Error` so `os.remove`'s failure triple
+/// (`nil, msg, errno`) can report the real `raw_os_error()` — see
+/// [`FileOpenHook`]'s doc for why `LuaError` cannot carry it (#301).
+pub type FileRemoveHook = fn(filename: &[u8]) -> std::io::Result<()>;
 
 /// Function-pointer signature for renaming a file, installed on
 /// [`GlobalState::file_rename_hook`] by the embedder.
 ///
 /// `std::fs` is banned outside `lua-cli`, so `lua-stdlib`'s `os.rename`
 /// reaches the filesystem via this hook. Returns `Ok(())` on success.
-pub type FileRenameHook = fn(from: &[u8], to: &[u8]) -> Result<(), LuaError>;
+///
+/// The error type is `std::io::Error`, for the same reason as
+/// [`FileRemoveHook`] (#301).
+pub type FileRenameHook = fn(from: &[u8], to: &[u8]) -> std::io::Result<()>;
 
 /// Reason a shell command terminated, returned by [`OsExecuteHook`].
 ///

@@ -25,6 +25,8 @@
 //! (or `std`) for native/sandboxed/WASM hosts; only their arg-handling and
 //! error-shape are reference-pinned, never their effects.
 
+use std::io;
+
 use crate::state_stub::{LuaState, LuaStateStubExt as _};
 use lua_types::{LuaError, LuaExit, LuaType, LuaValue};
 use lua_vm::state::OsExecuteReason;
@@ -668,29 +670,23 @@ pub(crate) fn os_execute(state: &mut LuaState) -> Result<usize, LuaError> {
     }
 }
 
+/// Removes the file or empty directory at the given path. C: `os_remove`.
 ///
-/// Removes the file or empty directory at the given path.
-/// Returns `true` on success, or `nil, errmsg` on failure.
+/// `std::fs` is banned in `lua-stdlib`; the filesystem is reached via
+/// `GlobalState::file_remove_hook`, installed by the embedder (`lua-cli`).
+/// The reference's `os_remove` is `luaL_fileresult(L, remove(fn) == 0, fn)` —
+/// a 3-value failure triple (`nil, msg, errno`) with the filename prefixed
+/// on every supported version (5.1-5.5) — so failure is delegated to
+/// [`crate::io_lib::file_result`] to share that exact shape/errno handling
+/// with `io.open` (#301: this hook used to return `LuaError`, which cannot
+/// carry `raw_os_error()`, and only pushed a 2-value `(nil, msg)` result).
 pub(crate) fn os_remove(state: &mut LuaState) -> Result<usize, LuaError> {
     let filename: Vec<u8> = state.check_arg_string(1)?.to_vec();
-    // `std::fs` is banned in lua-stdlib; delegate to the embedder hook.
     let hook = state.global().file_remove_hook;
     match hook {
         Some(remove_fn) => match remove_fn(&filename) {
-            Ok(()) => {
-                state.push(LuaValue::Bool(true));
-                Ok(1)
-            }
-            Err(e) => {
-                state.push(LuaValue::Nil);
-                let msg = match e.message_bytes() {
-                    Some(b) => b.to_vec(),
-                    None => format!("{:?}", &e).into_bytes(),
-                };
-                let s = state.intern_str(&msg)?;
-                state.push(LuaValue::Str(s));
-                Ok(2)
-            }
+            Ok(()) => crate::io_lib::file_result(state, true, None, io::Error::last_os_error()),
+            Err(os_err) => crate::io_lib::file_result(state, false, Some(&filename), os_err),
         },
         None => {
             state.push(LuaValue::Nil);
@@ -700,36 +696,42 @@ pub(crate) fn os_remove(state: &mut LuaState) -> Result<usize, LuaError> {
     }
 }
 
+/// Renames (moves) a file from the first path to the second. C: `os_rename`.
 ///
-/// Renames (moves) a file from the first path to the second.
-/// Returns `true` on success, or `nil, errmsg` on failure.
+/// `std::fs` is banned in `lua-stdlib`; the filesystem is reached via
+/// `GlobalState::file_rename_hook`, installed by the embedder (`lua-cli`).
+/// The reference's `os_rename` is `luaL_fileresult(L, rename(...) == 0, fn)`
+/// — a 3-value failure triple, shared with `os.remove`/`io.open` via
+/// [`crate::io_lib::file_result`] (#301). The `fn` (filename-prefix) argument
+/// is version-gated: verified against every reference binary (5.1-5.5),
+/// only Lua 5.1's `os_rename` passes `fromname` as the prefix; 5.2 onward
+/// pass `NULL` (bare `strerror` text, no prefix).
 pub(crate) fn os_rename(state: &mut LuaState) -> Result<usize, LuaError> {
     let fromname: Vec<u8> = state.check_arg_string(1)?.to_vec();
     let toname: Vec<u8> = state.check_arg_string(2)?.to_vec();
-    // `std::fs` is banned in lua-stdlib; delegate to the embedder hook.
     let hook = state.global().file_rename_hook;
     match hook {
-        Some(rename_fn) => match rename_fn(&fromname, &toname) {
-            Ok(()) => {
-                state.push(LuaValue::Bool(true));
-                return Ok(1);
+        Some(rename_fn) => {
+            let fname_prefix = matches!(state.global().lua_version, lua_types::LuaVersion::V51)
+                .then(|| fromname.clone());
+            match rename_fn(&fromname, &toname) {
+                Ok(()) => {
+                    crate::io_lib::file_result(state, true, None, io::Error::last_os_error())
+                }
+                Err(os_err) => crate::io_lib::file_result(
+                    state,
+                    false,
+                    fname_prefix.as_deref(),
+                    os_err,
+                ),
             }
-            Err(e) => {
-                state.push(LuaValue::Nil);
-                let msg = match e.message_bytes() {
-                    Some(b) => b.to_vec(),
-                    None => format!("{:?}", &e).into_bytes(),
-                };
-                let s = state.intern_str(&msg)?;
-                state.push(LuaValue::Str(s));
-                return Ok(2);
-            }
-        },
-        None => {}
+        }
+        None => {
+            state.push(LuaValue::Nil);
+            state.push_string(b"os.rename: no filesystem hook registered")?;
+            Ok(2)
+        }
     }
-    state.push(LuaValue::Nil);
-    state.push_string(b"os.rename: no filesystem hook registered")?;
-    Ok(2)
 }
 
 ///

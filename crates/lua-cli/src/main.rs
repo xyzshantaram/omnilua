@@ -302,7 +302,11 @@ impl Drop for FsFile {
     }
 }
 
-fn file_remove_hook(filename: &[u8]) -> Result<(), LuaError> {
+/// Removes a file or empty directory, preserving `raw_os_error()` end to end
+/// (#301). `lua-stdlib`'s `os.remove` renders the `strerror`-shaped message
+/// and real errno itself via `io_lib::file_result`; this hook must not
+/// pre-format a message or re-wrap the error, or the errno is lost.
+fn file_remove_hook(filename: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     let path: std::path::PathBuf = {
         use std::os::unix::ffi::OsStrExt;
@@ -311,22 +315,16 @@ fn file_remove_hook(filename: &[u8]) -> Result<(), LuaError> {
     #[cfg(not(unix))]
     let path: std::path::PathBuf = {
         let s = std::str::from_utf8(filename)
-            .map_err(|_| LuaError::runtime(format_args!("filename is not valid UTF-8")))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "filename is not valid UTF-8"))?;
         std::path::PathBuf::from(s)
     };
-    std::fs::remove_file(&path)
-        .or_else(|_| std::fs::remove_dir(&path))
-        .map_err(|err| {
-            LuaError::runtime(format_args!(
-                "cannot remove '{}': {}",
-                String::from_utf8_lossy(filename),
-                err
-            ))
-        })
+    std::fs::remove_file(&path).or_else(|_| std::fs::remove_dir(&path))
 }
 
-fn file_rename_hook(from: &[u8], to: &[u8]) -> Result<(), LuaError> {
-    fn to_path(bytes: &[u8]) -> Result<std::path::PathBuf, LuaError> {
+/// Renames a file, preserving `raw_os_error()` end to end (#301). See
+/// [`file_remove_hook`] for why no message is pre-formatted here.
+fn file_rename_hook(from: &[u8], to: &[u8]) -> io::Result<()> {
+    fn to_path(bytes: &[u8]) -> io::Result<std::path::PathBuf> {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
@@ -334,36 +332,24 @@ fn file_rename_hook(from: &[u8], to: &[u8]) -> Result<(), LuaError> {
         }
         #[cfg(not(unix))]
         {
-            let s = std::str::from_utf8(bytes)
-                .map_err(|_| LuaError::runtime(format_args!("filename is not valid UTF-8")))?;
+            let s = std::str::from_utf8(bytes).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "filename is not valid UTF-8")
+            })?;
             Ok(std::path::PathBuf::from(s))
         }
     }
     let from_path = to_path(from)?;
     let to_path_buf = to_path(to)?;
-    std::fs::rename(&from_path, &to_path_buf).map_err(|err| {
-        LuaError::runtime(format_args!(
-            "cannot rename '{}' to '{}': {}",
-            String::from_utf8_lossy(from),
-            String::from_utf8_lossy(to),
-            err
-        ))
-    })
+    std::fs::rename(&from_path, &to_path_buf)
 }
 
-fn file_open_hook(filename: &[u8], mode: &[u8]) -> Result<Box<dyn LuaFileHandle>, LuaError> {
+/// Opens a file, preserving `raw_os_error()` end to end (#301). See
+/// [`file_remove_hook`] for why no message is pre-formatted here.
+fn file_open_hook(filename: &[u8], mode: &[u8]) -> io::Result<Box<dyn LuaFileHandle>> {
     if filename == b"/dev/full" {
         return Ok(Box::new(DevFullFile { errored: false }));
     }
-    FsFile::open(filename, mode)
-        .map(|f| Box::new(f) as Box<dyn LuaFileHandle>)
-        .map_err(|err| {
-            LuaError::runtime(format_args!(
-                "cannot open '{}': {}",
-                String::from_utf8_lossy(filename),
-                err
-            ))
-        })
+    FsFile::open(filename, mode).map(|f| Box::new(f) as Box<dyn LuaFileHandle>)
 }
 
 fn stdout_hook(bytes: &[u8]) -> io::Result<()> {
