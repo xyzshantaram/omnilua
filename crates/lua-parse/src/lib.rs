@@ -558,7 +558,6 @@ pub struct LexState {
     /// locals, but they do not occupy VM registers. Keep that bookkeeping
     /// separate from `FuncState::nactvar` so codegen remains register-stable.
     pub scope_barriers: Vec<ScopeBarrier>,
-    pub global_function_names: Vec<GcRef<LuaString>>,
 }
 
 const PARSER_MAX_C_CALLS: u32 = 200;
@@ -3283,8 +3282,15 @@ fn new_upvalue(
 
 /// Searches the active local variables of `fs` for one named `n`, scanning
 /// from the most-recently-declared backwards so that the innermost shadowing
-/// declaration wins. On a hit it initializes `var` and returns its [`ExprKind`]
-/// encoded as `i32`; on a miss it returns `-1`.
+/// declaration wins. On a hit it initializes `var` (its [`ExprKind`] is readable
+/// from `var.k`) and returns the WITHIN-FUNCTION local index `i` of the found
+/// declaration; on a miss it returns `-1`.
+///
+/// The returned index (rather than the kind) is what the caller needs: it feeds
+/// [`scope_level_of_local_in`] so the 5.5 per-frame resolver can compare the
+/// found local/const/vararg's declaration scope level against a matching
+/// `global` barrier's level (`singlevaraux`). All hit kinds are `>= 0`, so the
+/// caller's `>= 0` "found?" gate is unchanged.
 fn searchvar(ls: &LexState, fs: &FuncState, n: &GcRef<LuaString>, var: &mut ExprDesc) -> i32 {
     for i in (0..fs.nactvar as i32).rev() {
         let vd = get_local_var_desc(ls, fs, i);
@@ -3305,7 +3311,7 @@ fn searchvar(ls: &LexState, fs: &FuncState, n: &GcRef<LuaString>, var: &mut Expr
                     var.k = ExprKind::VarArgVar;
                 }
             }
-            return var.k as i32;
+            return i;
         }
     }
     -1
@@ -3336,20 +3342,50 @@ fn marktobeclosed(fs: &mut FuncState) {
 
 /// Recursively finds variable `n` in `fs` and its enclosing functions.
 /// If not found at any level, sets var->k = VVOID (global).
+///
+/// Lua 5.5's `global x` barrier decision is made HERE, at each recursion frame,
+/// BEFORE any capture side effect (`markupval` / `mark_vararg_table_needed` /
+/// `search_upvalue` / `new_upvalue`) — exactly where reference 5.5's
+/// `searchvar`/`singlevaraux` make it (`lparser.c`). A post-hoc check in
+/// `singlevar` cannot work: `new_upvalue` has already incremented `fs.nups` and
+/// `close_func` preserves the slot, so a later `var.k = Void` would leave a
+/// phantom upvalue the reference never creates (issue #304 §2).
+///
+/// `upper` is the EXCLUSIVE upper bound of this frame's barrier slice in
+/// `ls.scope_barriers`. Each frame's slice is `[fs.first_scope_barrier .. upper]`;
+/// recursion into the enclosing function passes `upper = fs.first_scope_barrier`,
+/// so every outer frame sees only its own barriers (§3). On ≤5.4
+/// `ls.scope_barriers` is empty, the slice is empty, no `global` barrier ever
+/// matches, and the local always wins — byte-identical to the pre-5.5 path.
 fn singlevaraux(
     ls: &LexState,
     fs: Option<&mut FuncState>,
     n: &GcRef<LuaString>,
     var: &mut ExprDesc,
     base: bool,
+    upper: usize,
 ) -> Result<(), LuaError> {
     match fs {
         None => {
             init_exp(var, ExprKind::Void, 0);
         }
         Some(fs) => {
-            let v = searchvar(ls, fs, n, var);
-            if v >= 0 {
+            let lower = fs.first_scope_barrier;
+            let hi = upper.min(ls.scope_barriers.len());
+            let lo = lower.min(hi);
+            let slice = &ls.scope_barriers[lo..hi];
+            let global_level = latest_matching_global_barrier_in_slice(slice, n);
+            let found_idx = searchvar(ls, fs, n, var);
+            let local_wins = if found_idx >= 0 {
+                let local_level = scope_level_of_local_in(fs, slice, found_idx);
+                match global_level {
+                    Some(g) => local_level > g,
+                    None => true,
+                }
+            } else {
+                false
+            };
+            if local_wins {
                 if !base {
                     if var.k == ExprKind::VarArgVar {
                         mark_vararg_table_needed(fs);
@@ -3359,10 +3395,12 @@ fn singlevaraux(
                         markupval(fs, var.u.var_vidx as i32);
                     }
                 }
+            } else if global_level.is_some() {
+                init_exp(var, ExprKind::Void, 0);
             } else {
                 let idx = search_upvalue(fs, n);
                 let final_idx = if idx < 0 {
-                    singlevaraux(ls, fs.prev.as_deref_mut(), n, var, false)?;
+                    singlevaraux(ls, fs.prev.as_deref_mut(), n, var, false, lower)?;
                     if var.k == ExprKind::Local
                         || var.k == ExprKind::VarArgVar
                         || var.k == ExprKind::UpVal
@@ -3388,38 +3426,11 @@ fn singlevaraux(
 fn singlevar(ls: &mut LexState, state: &mut LuaState, var: &mut ExprDesc) -> Result<(), LuaError> {
     let name_line = ls.linenumber;
     let varname = str_check_name(ls, state)?;
+    let upper = ls.scope_barriers.len();
     let mut fs_box = ls.fs.take();
-    let recurse_result = singlevaraux(ls, fs_box.as_deref_mut(), &varname, var, true);
+    let recurse_result = singlevaraux(ls, fs_box.as_deref_mut(), &varname, var, true, upper);
     ls.fs = fs_box;
     recurse_result?;
-    if state.global().lua_version == lua_types::LuaVersion::V55 {
-        match var.k {
-            ExprKind::Local => {
-                if let Some(global_level) = latest_matching_global_barrier_current(ls, &varname) {
-                    let local_level = scope_level_for_local_level(ls, var.u.var_vidx as u8);
-                    if global_level > local_level {
-                        init_exp(var, ExprKind::Void, 0);
-                    }
-                }
-            }
-            ExprKind::Const => {
-                // A resolved `<const>` may have been reached across one or more
-                // function boundaries. Reference 5.5 scans each enclosing
-                // function's globals and locals together at every recursive
-                // level; mirror that walk (see `ctc_shadowed_by_global`) rather
-                // than only inspecting the innermost function's barriers.
-                if ctc_shadowed_by_global(ls, &varname, var.u.info) {
-                    init_exp(var, ExprKind::Void, 0);
-                }
-            }
-            ExprKind::UpVal => {
-                if is_active_global_function_name(ls, &varname) {
-                    init_exp(var, ExprKind::Void, 0);
-                }
-            }
-            _ => {}
-        }
-    }
     if var.k == ExprKind::Void {
         // Lua 5.5: once a scope is in strict mode (an explicit `global`
         // declaration was seen), a free name must be a declared global —
@@ -3453,7 +3464,16 @@ fn singlevar(ls: &mut LexState, state: &mut LuaState, var: &mut ExprDesc) -> Res
             .envn
             .clone()
             .expect("envn must be set when resolving globals");
-        if has_active_global_barrier(ls, &envn) {
+        let mut env_var = ExprDesc::default();
+        let upper = ls.scope_barriers.len();
+        let mut fs_box = ls.fs.take();
+        let r = singlevaraux(ls, fs_box.as_deref_mut(), &envn, &mut env_var, true, upper);
+        ls.fs = fs_box;
+        r?;
+        // Reference `buildglobal`: if `_ENV` itself resolves to a shadowing
+        // global (`env_var.k == Void`), there is no environment to index —
+        // raise the semantic error rather than pass `Void` to codegen (§5).
+        if env_var.k == ExprKind::Void {
             let msg = format!(
                 "{} is global when accessing variable '{}'",
                 lua_lex::LUA_ENV.escape_ascii(),
@@ -3461,12 +3481,6 @@ fn singlevar(ls: &mut LexState, state: &mut LuaState, var: &mut ExprDesc) -> Res
             );
             return Err(lua_lex::lex_error(&mut ls.lex, msg.as_bytes(), 0));
         }
-        let mut env_var = ExprDesc::default();
-        let mut fs_box = ls.fs.take();
-        let r = singlevaraux(ls, fs_box.as_deref_mut(), &envn, &mut env_var, true);
-        ls.fs = fs_box;
-        r?;
-        debug_assert!(env_var.k != ExprKind::Void, "_ENV must resolve");
         let line = ls.lastline;
         let fs = ls.fs.as_mut().unwrap();
         cg_exp_to_any_reg_up(fs, line, &mut env_var)?;
@@ -3772,33 +3786,22 @@ fn local_level_for_scope_level(ls: &LexState, scope_level: u8) -> i32 {
     locals.clamp(0, max_locals)
 }
 
-fn scope_level_for_local_level(ls: &LexState, local_level: u8) -> u8 {
-    let first_barrier = ls.fs.as_ref().map_or(0usize, |fs| fs.first_scope_barrier);
-    let target = local_level as usize;
-    let mut locals_seen = 0usize;
-    for level in 0..=current_scope_level(ls) {
-        if ls.scope_barriers[first_barrier..]
-            .iter()
-            .any(|b| b.level == level)
-        {
-            continue;
-        }
-        if locals_seen == target {
-            return level;
-        }
-        locals_seen += 1;
-    }
-    local_level
-}
-
 fn add_scope_barrier(ls: &mut LexState, name: GcRef<LuaString>) {
     let level = current_scope_level(ls);
     ls.scope_barriers.push(ScopeBarrier { level, name });
 }
 
-fn latest_matching_global_barrier_current(ls: &LexState, name: &GcRef<LuaString>) -> Option<u8> {
-    let first_barrier = ls.fs.as_ref().map_or(0usize, |fs| fs.first_scope_barrier);
-    ls.scope_barriers[first_barrier..]
+/// The level of the latest (declaration-order last) `global <name>` barrier in
+/// a frame's barrier `slice`, or `None` if the frame declares no matching
+/// `global`. Barriers are pushed in declaration order, so `rev().find` yields the
+/// most recent one; its level is compared strictly (`>`) against a found local's
+/// scope level so a later declaration — global or local — wins, exactly like
+/// reference 5.5's newest-first `searchvar` scan over `actvar` (`lparser.c:414`).
+fn latest_matching_global_barrier_in_slice(
+    slice: &[ScopeBarrier],
+    name: &GcRef<LuaString>,
+) -> Option<u8> {
+    slice
         .iter()
         .rev()
         .find(|b| GcRef::ptr_eq(&b.name, name))
@@ -3806,12 +3809,11 @@ fn latest_matching_global_barrier_current(ls: &LexState, name: &GcRef<LuaString>
 }
 
 /// The scope level (declaration ordinal) of the `local_index`-th register/CTC
-/// local in `fs`, given `fs`'s active global-barrier `slice`. This is the
-/// function-parameterized form of [`scope_level_for_local_level`] used during
-/// the recursive resolution walk, where the function under examination is an
-/// enclosing function rather than `ls.fs`. Barriers occupy their own levels;
-/// locals fill the gaps, so the level of the k-th local is the (k+1)-th
-/// non-barrier level.
+/// local in `fs`, given `fs`'s active global-barrier `slice`. Used during the
+/// per-frame resolution walk in [`singlevaraux`] to place a found local on the
+/// same level axis as the `global` barriers so the two can be ordered. Barriers
+/// occupy their own levels; locals fill the gaps, so the level of the k-th local
+/// is the (k+1)-th non-barrier level.
 fn scope_level_of_local_in(fs: &FuncState, slice: &[ScopeBarrier], local_index: i32) -> u8 {
     let scope_level_max = fs.nactvar as usize + slice.len();
     let target = local_index.max(0) as usize;
@@ -3827,63 +3829,6 @@ fn scope_level_of_local_in(fs: &FuncState, slice: &[ScopeBarrier], local_index: 
         locals_seen += 1;
     }
     local_index.max(0).min(u8::MAX as i32) as u8
-}
-
-/// Lua 5.5: does an active `global <name>` declaration shadow the resolved
-/// `<const>` compile-time constant at absolute actvar index `ctc_abs_index`?
-///
-/// Reference 5.5's `searchvar` scans each enclosing function's global
-/// declarations and locals together at EVERY recursive level (globals live in
-/// `actvar` there), so the most recent declaration — global or local — wins at
-/// the first function that has any match. This walks the live `FuncState` chain
-/// from the innermost function outward, reconstructing each function's active
-/// barrier slice (`[first_scope_barrier .. child.first_scope_barrier]`):
-///
-/// - a matching `global` in any function nested BETWEEN the reference site and
-///   the constant's owner shadows it outright (that function has no matching
-///   local — otherwise resolution would have stopped there — so its `global` is
-///   the only match and wins, exactly as reference stops recursing at it);
-/// - a matching `global` in the OWNER function shadows the constant only when it
-///   is declared later than the constant (a strictly deeper scope level).
-///
-/// On pre-5.5 versions `scope_barriers` is always empty, so this returns
-/// `false`; it is called only from the 5.5 resolution branch regardless.
-fn ctc_shadowed_by_global(ls: &LexState, name: &GcRef<LuaString>, ctc_abs_index: i32) -> bool {
-    let mut upper = ls.scope_barriers.len();
-    let mut fs_opt = ls.fs.as_deref();
-    while let Some(fs) = fs_opt {
-        let lower = fs.first_scope_barrier.min(upper);
-        let slice = &ls.scope_barriers[lower..upper];
-        let owns = ctc_abs_index >= fs.firstlocal
-            && ctc_abs_index < fs.firstlocal + fs.nactvar as i32;
-        if owns {
-            let ctc_scope_level =
-                scope_level_of_local_in(fs, slice, ctc_abs_index - fs.firstlocal);
-            return slice
-                .iter()
-                .any(|b| GcRef::ptr_eq(&b.name, name) && b.level > ctc_scope_level);
-        }
-        if slice.iter().any(|b| GcRef::ptr_eq(&b.name, name)) {
-            return true;
-        }
-        upper = lower;
-        fs_opt = fs.prev.as_deref();
-    }
-    false
-}
-
-fn has_active_global_barrier(ls: &LexState, name: &GcRef<LuaString>) -> bool {
-    ls.scope_barriers
-        .iter()
-        .rev()
-        .any(|b| GcRef::ptr_eq(&b.name, name))
-}
-
-fn is_active_global_function_name(ls: &LexState, name: &GcRef<LuaString>) -> bool {
-    ls.global_function_names
-        .iter()
-        .rev()
-        .any(|n| GcRef::ptr_eq(n, name))
 }
 
 fn scope_name_at(ls: &LexState, level: u8, label_nactvar: u8) -> Vec<u8> {
@@ -6058,10 +6003,22 @@ fn globalstat(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
             .clone()
             .expect("envn must be set when resolving globals");
         let mut target = ExprDesc::default();
+        let upper = ls.scope_barriers.len();
         let mut fs_box = ls.fs.take();
-        let r = singlevaraux(ls, fs_box.as_deref_mut(), &envn, &mut target, true);
+        let r = singlevaraux(ls, fs_box.as_deref_mut(), &envn, &mut target, true, upper);
         ls.fs = fs_box;
         r?;
+        // Reference `buildglobal`: a `global function _ENV`, or a prior
+        // `global _ENV`, makes `_ENV` itself resolve to a shadowing global —
+        // there is no environment to store the function into (§5).
+        if target.k == ExprKind::Void {
+            let msg = format!(
+                "{} is global when accessing variable '{}'",
+                lua_lex::LUA_ENV.escape_ascii(),
+                String::from_utf8_lossy(name.as_bytes())
+            );
+            return Err(lua_lex::lex_error(&mut ls.lex, msg.as_bytes(), 0));
+        }
         let lline = ls.lastline;
         {
             let fs = ls.fs.as_mut().unwrap();
@@ -6071,9 +6028,7 @@ fn globalstat(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
             cg_indexed(fs, lline, &mut target, &mut key)?;
         }
         let mut b = ExprDesc::default();
-        ls.global_function_names.push(name.clone());
         let body_result = body(ls, state, &mut b, false, line);
-        ls.global_function_names.pop();
         body_result?;
         {
             let fs = ls.fs.as_mut().unwrap();
@@ -6140,10 +6095,21 @@ fn globalstat(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
                 .clone()
                 .expect("envn must be set when resolving globals");
             let mut env_var = ExprDesc::default();
+            let upper = ls.scope_barriers.len();
             let mut fs_box = ls.fs.take();
-            let r = singlevaraux(ls, fs_box.as_deref_mut(), &envn, &mut env_var, true);
+            let r = singlevaraux(ls, fs_box.as_deref_mut(), &envn, &mut env_var, true, upper);
             ls.fs = fs_box;
             r?;
+            // Reference `buildglobal`: a prior `global _ENV` makes `_ENV` a
+            // shadowing global, so there is no environment to assign into (§5).
+            if env_var.k == ExprKind::Void {
+                let msg = format!(
+                    "{} is global when accessing variable '{}'",
+                    lua_lex::LUA_ENV.escape_ascii(),
+                    String::from_utf8_lossy(name.as_bytes())
+                );
+                return Err(lua_lex::lex_error(&mut ls.lex, msg.as_bytes(), 0));
+            }
             let line = ls.lastline;
             let fs = ls.fs.as_mut().unwrap();
             cg_exp_to_any_reg_up(fs, line, &mut env_var)?;
@@ -6554,7 +6520,6 @@ pub fn parse(
         global_wildcard_const: false,
         declared_globals: Vec::new(),
         scope_barriers: Vec::new(),
-        global_function_names: Vec::new(),
     };
     //   `mainfunc`; it does NOT pre-read the first token. `mainfunc` itself
     //   issues the initial `luaX_next` once its prelude (open_func, vararg
