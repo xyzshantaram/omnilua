@@ -4087,14 +4087,6 @@ fn enter_block(ls: &mut LexState, isloop: bool) {
         saved_scope_barriers,
     });
     fs.bl = Some(new_bl);
-    // This assertion is a tautology: the real check would call
-    // `nvarstack(ls, fs)`, but doing so here hits a circular borrow, so it
-    // currently verifies nothing.
-    debug_assert!(
-        fs.freereg as i32 == {
-            fs.freereg as i32 // placeholder assertion
-        }
-    );
 }
 
 fn undef_goto(ls: &mut LexState, version: lua_types::LuaVersion, gt_idx: usize) -> LuaError {
