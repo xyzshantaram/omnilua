@@ -117,10 +117,29 @@ on any canary/official flip; codex fix-rounds capped at ~3 with triage
   slot-byte projection). Everything else fills its class exactly → the rest
   of the GcBox diet is parked; remaining RSS gap is buffer representation (a
   separate track). Candidate 1 → Wave B, arbiter-gated (drop-if-neutral).
-- **#267 — PARTIAL mitigation (#294, in fix-round).** The cheap C/D fix
-  closes the no-guard release UAFs (F1/F3/F4) deref-free + byte-neutral —
-  Codex-confirmed sound. The HDR_FREED tripwire + owner_gen attempt at the
+- **#267 — PARTIAL mitigation MERGED (#294).** The cheap C/D fix closes the
+  no-guard release UAFs (F1/F3/F4) deref-free + byte-neutral — Codex-confirmed
+  sound. The HDR_FREED tripwire + owner_gen attempt at the
   foreign/stale-after-sweep cases was NUKED (Codex: it re-derefs a freed
   header — a new UAF in the check). Those cases genuinely need option B
-  (slot-indexed handles) → filed as **#295**. #267 reframed as
-  partially-mitigated, not fully closed.
+  (slot-indexed handles) → filed as **#295**. Both Codex r2 findings landed
+  before merge: the spec carries a SUPERSEDED-IN-PART banner marking the
+  tripwire REJECTED ("do not re-implement"), and `GcBox<u64>` has target-gated
+  const size asserts (32B/24B) beside the `GcHeader` ones. Issue #267 stays
+  open only as the option-B tracker (→ #295); the reachable bug is fixed.
+- **#113 UpVal shrink (candidate 1) — codex re-round in flight (PR #298).**
+  `struct UpVal { state: Cell<UpValState> }` with `enum UpValState { Open{...},
+  Closed(LuaValue) }` collapses three Cells → one; UpVal 32→24, GcBox<UpVal>
+  56→48 (crosses libmalloc 64→48). Measured **−16.71% closure_ops RSS**,
+  +1.924% Ir, **wall FLAT** (best-of-7 A/B) → KEEP: the layout arbiter is wall,
+  and CPI absorbs the Ir via better cache packing, so it's a pure RSS win.
+  Codex r1 caught a real wasm32 u64-thread-id truncation (usize round-trip at
+  the API boundary) — agent threaded u64 end-to-end, size-neutral, all gates
+  green. Awaiting r2 codex verdict → merge.
+- **#278 embedding-API grab-bag — in fix-round (PR #299).** register_c_function
+  extraction + dead-code deletions are Codex-clean. The `debug.debug` "0x?"
+  fix via `to_display_string` delegation exposed a real luaL_tolstring fidelity
+  cluster (light-userdata name, `__name` on non-tables, real function address,
+  numeric→string pushed-value contract) + a #276-class missing-gc-check — 6
+  findings sent back as one bounded fix-round; split to its own issue if the
+  luaL_tolstring fidelity can't land clean in one pass.
