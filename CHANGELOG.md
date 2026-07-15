@@ -4,7 +4,7 @@ All notable changes to `omniLua` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] - 2026-07-15
 
 ### Breaking — filesystem host hooks now return `std::io::Result` (#301)
 
@@ -44,6 +44,55 @@ On `wasm32-unknown-unknown` — where `std` has no `strerror` table and
 `io::Error` `Display` renders "operation successful" — the errno message is
 resolved from a target-independent POSIX `strerror` table so the wasm build's
 `(nil, msg, errno)` matches a native build's.
+
+### Fixed — `<const>` compile-time-constant folding (#300)
+
+A `local x <const> = <constant-expr>` in Lua 5.4/5.5 is now **folded**: the
+value is stored on the variable descriptor, the variable is marked a
+compile-time constant, and no register/local and no upvalue are emitted for it —
+references materialize the constant inline (`LOADI`/`LOADK`/`LOADFALSE`/…),
+exactly as reference Lua does. Previously the port kept it as an ordinary local,
+so `debug.getlocal`/`debug.getupvalue` reported a phantom local/upvalue that the
+reference does not. Implemented on top of a faithful register-accounting refactor
+(a real-local-register watermark decoupled from `nactvar`, mirroring C's
+`luaY_nvarstack`/`reglevel`), which is byte-identical for code containing no
+`<const>` constants. The 5.5 `global`-declaration barrier correctly shadows a
+folded constant across enclosing/intermediate function levels.
+
+### Fixed — Lua 5.5 per-frame `global`/local name resolution (#304)
+
+The 5.5 `global x` declaration now shadows an enclosing regular local `x` at
+every function level, matching reference Lua — the decision is made per frame
+during name resolution (before any upvalue capture) instead of post-hoc, which
+could not un-capture a variable. This corrects four divergences: a captured
+local shadowed by a later `global x` (the headline; previously the nested
+function saw the local, not the global), a `global function` name shadowed by an
+inner local, a named vararg parameter (`function f(...x)`) shadowed by `global x`,
+and `global function x` with an enclosing local (which previously left a phantom
+upvalue). `_ENV`-shadowing globals now raise the reference error
+(`_ENV is global when accessing variable '<name>'`). Pre-5.5 output is
+byte-identical (the machinery is inert without `global` declarations).
+
+### Fixed — LightC pointer identity + embedding-API stubs (#278)
+
+`tostring`/`string.format("%p", …)`/`debug.debug`/the public
+`Function::to_pointer()` now report the **same, real** address for a built-in
+C function — previously three separate resolvers disagreed, and some returned a
+tiny registry index instead of the function's code address. `luaL_tolstring`
+display fidelity was corrected (light userdata renders `userdata`, `__name` is
+honored on any reference value for 5.3+, numeric `__tostring` satisfies the
+pushed-string contract on 5.2+), several embedding-API stubs were made
+functional (`to_cfunction`, C-closure/userdata construction with GC pacing,
+upvalue-count validation), and dead code from the de-port sweep was removed.
+
+### Performance — UpVal representation shrink (#113)
+
+`GcBox<UpVal>` shrank 56 → 48 bytes (three `Cell`s collapsed into one
+`Cell<UpValState>` enum), crossing the libmalloc 64→48 size class: measured
+**−16.7% closure_ops peak RSS**, wall-flat, +1.9% Ir (CPI-absorbed — see the
+layout-shrink rule in `docs/MEASUREMENT_PROTOCOL.md`). The size-class histogram
+analysis (#296) confirmed UpVal was the only GC object whose shrink both crosses
+a malloc class and has the live population to move RSS.
 
 ## [0.6.0] - 2026-07-13
 
