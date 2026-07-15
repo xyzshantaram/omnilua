@@ -59,6 +59,20 @@ reference does not. Implemented on top of a faithful register-accounting refacto
 `<const>` constants. The 5.5 `global`-declaration barrier correctly shadows a
 folded constant across enclosing/intermediate function levels.
 
+### Fixed — Lua 5.5 per-frame `global`/local name resolution (#304)
+
+The 5.5 `global x` declaration now shadows an enclosing regular local `x` at
+every function level, matching reference Lua — the decision is made per frame
+during name resolution (before any upvalue capture) instead of post-hoc, which
+could not un-capture a variable. This corrects four divergences: a captured
+local shadowed by a later `global x` (the headline; previously the nested
+function saw the local, not the global), a `global function` name shadowed by an
+inner local, a named vararg parameter (`function f(...x)`) shadowed by `global x`,
+and `global function x` with an enclosing local (which previously left a phantom
+upvalue). `_ENV`-shadowing globals now raise the reference error
+(`_ENV is global when accessing variable '<name>'`). Pre-5.5 output is
+byte-identical (the machinery is inert without `global` declarations).
+
 ### Fixed — LightC pointer identity + embedding-API stubs (#278)
 
 `tostring`/`string.format("%p", …)`/`debug.debug`/the public
