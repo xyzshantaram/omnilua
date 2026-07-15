@@ -102,3 +102,47 @@ fn identity_is_version_invariant() {
         assert_ne!(a, other, "distinct tables must differ on {v:?}");
     }
 }
+
+/// Issue #278 fix-round-2: a light C function's public `to_pointer()` must be
+/// its real code address — the same value the VM's own `%p` and `tostring`
+/// print — never the tiny `c_functions` registry index. `print` is a stdlib
+/// LightC function. Guards against the embedding handle diverging from the VM's
+/// pointer resolver.
+#[test]
+fn lightc_function_pointer_is_real_address_not_registry_index() {
+    let lua = Lua::new();
+    let print_fn: Function = lua.globals().get("print").unwrap();
+    let ptr = print_fn.to_pointer().unwrap();
+    assert!(
+        ptr > u16::MAX as usize,
+        "handle must expose a real address, got {ptr:#x} (looks like a registry index)"
+    );
+
+    let via_p: String = lua
+        .load("return string.format('%p', print)")
+        .eval()
+        .unwrap();
+    let p_ptr = usize::from_str_radix(via_p.trim_start_matches("0x"), 16).unwrap();
+    assert_eq!(ptr, p_ptr, "handle pointer must equal the VM %p address");
+
+    let via_tostring: String = lua.load("return tostring(print)").eval().unwrap();
+    assert!(
+        via_tostring.starts_with("function: 0x"),
+        "unexpected tostring form: {via_tostring}"
+    );
+    let ts_ptr = usize::from_str_radix(via_tostring.rsplit_once("0x").unwrap().1, 16).unwrap();
+    assert_eq!(ts_ptr, ptr, "tostring address must equal the handle address");
+
+    let type_fn: Function = lua.globals().get("type").unwrap();
+    assert_ne!(
+        ptr,
+        type_fn.to_pointer().unwrap(),
+        "distinct stdlib functions must have distinct pointers"
+    );
+    let print_again: Function = lua.globals().get("print").unwrap();
+    assert_eq!(
+        ptr,
+        print_again.to_pointer().unwrap(),
+        "the same function must have a stable pointer"
+    );
+}

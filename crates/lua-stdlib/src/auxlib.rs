@@ -1216,60 +1216,17 @@ pub fn lua_len(state: &mut LuaState, idx: i32) -> Result<i64, LuaError> {
     Ok(l)
 }
 
-/// Convert the value at `idx` to a byte-string representation (using `__tostring`
-/// if available) and push it onto the stack.
+/// Convert the value at `idx` to its display byte-string, push the result onto
+/// the stack, and return its bytes. Mirrors C's `luaL_tolstring`: the
+/// `__tostring` metamethod is honored (and, from 5.3, the `__name` metafield
+/// names the type for reference values).
 ///
-/// Tables/functions/userdata/threads print as `"kind: 0x?"` — a fixed
-/// placeholder rather than a real address, since this API surface does not
-/// yet expose a stable per-value identifier analogous to C's `lua_topointer`.
+/// This is a thin wrapper over [`lua_vm::state::LuaState::to_display_string`],
+/// the single implementation of the conversion, so tables/functions/userdata/
+/// threads render as `"kind: 0x<addr>"` with a real per-value identity — two
+/// distinct values print distinct addresses, matching the reference.
 pub fn to_lua_string(state: &mut LuaState, idx: i32) -> Result<Vec<u8>, LuaError> {
-    let idx = state.abs_index(idx);
-    if call_meta(state, idx, b"__tostring")? {
-        if state.type_at(-1) != LuaType::String {
-            return Err(LuaError::runtime(format_args!(
-                "'__tostring' must return a string"
-            )));
-        }
-    } else {
-        match state.type_at(idx) {
-            LuaType::Number => {
-                if state.is_integer(idx) {
-                    let i = state.to_integer_x(idx).unwrap_or(0);
-                    state.push_fstring(format_args!("{}", i))?;
-                } else {
-                    let f = state.to_number_x(idx).unwrap_or(0.0);
-                    state.push_fstring(format_args!("{:?}", f))?;
-                }
-            }
-            LuaType::String => {
-                state.push_value(idx)?;
-            }
-            LuaType::Boolean => {
-                let b = state.to_boolean(idx);
-                state.push_string(if b { b"true" } else { b"false" })?;
-            }
-            LuaType::Nil => {
-                state.push_string(b"nil")?;
-            }
-            _ => {
-                let tt = if state.global().lua_version.honors_name_metafield() {
-                    get_metafield(state, idx, b"__name")?
-                } else {
-                    LuaType::Nil
-                };
-                let kind: Vec<u8> = if tt == LuaType::String {
-                    state.peek_bytes(-1).unwrap_or_else(|| b"?".to_vec())
-                } else {
-                    state.type_name_at(idx).to_vec()
-                };
-                state.push_fstring(format_args!("{}: 0x?", BStr(&kind)))?;
-                if tt != LuaType::Nil {
-                    state.remove(-2)?;
-                }
-            }
-        }
-    }
-    Ok(state.peek_bytes(-1).unwrap_or_default())
+    state.to_display_string(idx)
 }
 
 /// Register the functions in `l` into the table at `-(nup + 1)`, giving each

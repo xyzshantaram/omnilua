@@ -84,12 +84,6 @@ impl LuaString {
         self.bytes.len() + 2 * std::mem::size_of::<usize>()
     }
 
-    pub fn is_reserved_word(&self) -> bool {
-        // Always false: never wired to the lexer's token enum, and (as far
-        // as this pass could tell) never called anywhere in the workspace.
-        false
-    }
-
     pub fn hash_bytes(bytes: &[u8], seed: u32) -> u32 {
         // Stub WyHash. Real impl ports bun_wyhash. Stable for now so
         // intern-table equality works.

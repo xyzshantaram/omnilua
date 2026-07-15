@@ -214,6 +214,30 @@ the current surface:
   (`marshal_from` + `LossyIntPolicy`), but the formal `enum Engine` / `Backend`
   trait / `Unsupported` divergence registry from
   `specs/WEBLUA_MULTIVERSION_API_SPEC.md` is deferred (issue #234).
+- **A few low-level C-API-surface helpers are host-only stubs (issue #278).**
+  The Rust-native API is complete for pure Lua scripts; these gaps only affect a
+  host driving the raw `lua-vm::api` / `state_stub` surface directly, and are
+  either niche or architecturally constrained:
+  - `to_close` marks a to-be-closed slot but does nothing; `close_slot`
+    **clears** its slot (sets it to nil) but does **not** run the value's
+    `__close`. Scripts get full to-be-closed (`<close>`) semantics through the
+    VM's `OP_TBC` path; the *host* `lua_toclose`/`lua_closeslot` equivalents are
+    not wired into that TBC machinery (it needs the whole
+    to-be-closed-through-C-API path).
+  - `to_thread` yields an identity-only `LuaThread` handle (`id: u64`), not the
+    rich `lua-vm` coroutine object, for the same `lua-types`/`LuaState` layering
+    reason. The stdlib coroutine library resolves the id through the thread
+    registry, so scripts are unaffected.
+  - `lua_copy` *to* the registry pseudo-index is a no-op (C would overwrite the
+    entire `l_registry` table — a footgun no real embedder uses).
+  - `luaL_fileresult` / `luaL_execresult` (`auxlib`) cannot read a POSIX `errno`
+    in safe Rust. The actual `io` / `os` standard library uses an
+    `io::Error`-carrying variant (`io_lib::file_result`) that reports the real
+    OS error code, so `io.open` / `os.remove` failures still return a numeric
+    errno to scripts; only the generic `auxlib` helpers are limited.
+  - `os.getenv` on non-Unix, non-wasm targets (i.e. Windows) requires a UTF-8
+    variable name; a wide-string lookup is not wired. Unix and wasm are
+    unaffected.
 - **Interpreter only.** No LuaJIT-class speed; not Luau.
 - **Preview maturity.** The API is shaped after `mlua` but is not
   source-compatible, and has a far smaller user base / less battle-testing.
