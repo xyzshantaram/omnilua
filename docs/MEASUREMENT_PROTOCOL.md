@@ -92,6 +92,18 @@ shifts hot-path branch targets — REQUIRES a cold-machine wall A/B, not just Ir
 Ir-down is necessary but NOT sufficient for these. Pure logic changes that don't
 move layout can still trust Ir.
 
+The DUAL is equally true and just as load-bearing (added 2026-07-15, UpVal shrink
+#298): an Ir-UP change can be a clean WIN when it is a data-layout shrink. The
+UpVal representation shrink (`GcBox<UpVal>` 56→48, crossing the libmalloc 64→48
+size class) cost **+1.9% Ir** yet was **wall-FLAT** (best-of-7 cold A/B) and
+**−16.7% RSS** — the extra instructions were fully absorbed by CPI (a smaller,
+better-packed object → fewer cache stalls). RULE: for a layout **shrink**, the
+arbiter is **wall + RSS, not Ir**; a small Ir regression is NOT a veto — it is
+expected CPI-absorbed noise, and you confirm the absorption with a cold wall A/B.
+Do not let the Ir arbiter kill a wall-flat, RSS-down size-class-crossing shrink.
+(Symmetric to the T5a rule above: Ir cannot bless a layout change on its own, and
+it cannot condemn one either — wall settles both directions.)
+
 ## Tool index
 
 - `harness/bench/instr-count.sh` — deterministic Ir (callgrind, container);
