@@ -13,6 +13,30 @@
 //! created plus the target's heap allocation token. They upgrade only while
 //! that identity/token pair remains live. Handles to legacy uncollected boxes
 //! still upgrade forever, matching their process-lifetime allocation model.
+//!
+//! # Internal GC capability, not the embedding surface (issue #267)
+//!
+//! `GcRef` is a raw, `Copy`, guard-scoped GC capability: it carries no owner
+//! identity of its own, and its operations assume an active `HeapGuard` for the
+//! heap that owns the box. Holding a `GcRef` (or an issued `&T` from its
+//! `Deref`) across the owning heap's `drop_all`/`close`, or operating it under a
+//! *different* heap, is a use-after-free that safe code must not do. The
+//! guard-scoped operations here fail loudly on the one shape that is closable
+//! without reading the box — `downgrade`/`account_buffer` panic **deref-free**
+//! with no active guard (issue #267 F1/F3). The stale-*after-sweep* and
+//! foreign-heap shapes are **not** closed: validating them would mean reading a
+//! possibly-freed box, which *is* the use-after-free, so the raw type cannot
+//! make arbitrary handle lifetimes safe in release without slot-indexed handles
+//! / an API-shape change (spec option B).
+//!
+//! **`GcRef` is therefore an implementation-crate (`lua-types`/`lua-gc`)
+//! capability, not omniLua's public embedding surface.** Embedders never name
+//! it: the `omnilua` facade exposes only rooted handles (its `Value` /
+//! `RootedValue`, which own a `Lua`, root through a slab key, and return a
+//! stale-handle error on cross-state or post-teardown use) and deliberately does
+//! not re-export raw `Gc`/`GcRef`/`Heap`. Keep it that way — routing embedders
+//! through the rooted handle is what makes the "a handle must not outlive its
+//! heap" invariant real.
 
 use lua_gc::{Gc, HeapRef, Trace};
 
@@ -73,49 +97,53 @@ impl<T: Trace + 'static> GcRef<T> {
     /// heap, the weak handle will stop upgrading once sweep removes that exact
     /// heap allocation.
     ///
-    /// Downgrading a *heap-owned* box with no active `HeapGuard` is a
-    /// latent use-after-free: the resulting handle has no heap identity to
-    /// check, so it keeps upgrading after sweep frees the target. That case
-    /// panics unconditionally in every build; detached (process-lifetime)
-    /// targets keep the legacy always-upgrades behavior.
+    /// # No-guard path is deref-free (issue #267 F1)
     ///
-    /// A `GcRef` obtained before its heap closed (`Heap::drop_all` /
-    /// `close`) is dangling afterwards, and calling this on it is
-    /// use-after-free — the same contract as after `Heap::drop`. (Quarantine
-    /// mode detects use-after-*sweep* while the heap is alive; teardown
-    /// frees even quarantined boxes for real, so post-close dereferences are
-    /// plain UB with no tripwire.) When the *closed* heap is the active
-    /// guard, the closed-heap token refusal makes the resulting weak handle
-    /// permanently dead; with no guard or a different heap active, the
-    /// guard-mismatch cases above apply unchanged. A `Gc` box carries no
-    /// owner identity of its own to validate against — fixing that is the
-    /// heap-ownership redesign tracked as the #252 follow-up, not a #260
-    /// teardown property.
+    /// With no active `HeapGuard` there is no heap to validate against, and the
+    /// handle **must not** read the box to decide — if its owning heap has been
+    /// dropped, the box is freed and that read is itself the use-after-free (the
+    /// old `is_heap_owned()` check was exactly this UAF-in-the-safety-check). So
+    /// this panics unconditionally, reading nothing, consistent with
+    /// [`GcRef::new`]'s guard-less panic and the always-on guard policy. The
+    /// legacy detached-box "always upgrades on a guard-less downgrade" path is
+    /// dropped with it.
+    ///
+    /// # Guarded path and residuals (issue #267)
+    ///
+    /// The guarded path mints a token against the active heap *without*
+    /// dereferencing the box — so a same-heap downgrade is validated by the
+    /// allocation token, and when the active guard is a *closed* heap the
+    /// closed-heap token refusal makes the resulting weak handle permanently
+    /// dead. The stale corners this cannot fix in release — a *foreign*-heap
+    /// downgrade (the box's owner is a different heap), a same-heap re-downgrade
+    /// of a box already swept while unrooted, and an already-issued `&T`
+    /// outliving a later `drop_all(&self)` — are **not** closed here: validating
+    /// them would require reading the (possibly freed) box, which *is* the
+    /// use-after-free. They are documented residuals that only slot-indexed
+    /// handles / an API-shape change (spec option B) close; see the spec and the
+    /// `stale_handle_kit`.
     pub fn downgrade(&self) -> GcWeak<T> {
         let identity = self.identity();
-        let tracked = lua_gc::with_current_heap(|heap| {
+        match lua_gc::with_current_heap(|heap| {
             heap.map(|heap| {
                 let token = heap.register_allocation_token(identity);
                 (HeapRef::from_heap(heap), token)
             })
-        });
-        if tracked.is_none() && self.0.is_heap_owned() {
-            panic!(
-                "GcRef::downgrade::<{}> on a heap-owned box with no \
-                 active HeapGuard — the weak handle would upgrade forever, including after \
-                 sweep frees the target (use-after-free); push a HeapGuard on the entry path",
+        }) {
+            Some((heap, allocation_token)) => GcWeak {
+                target: self.0,
+                identity,
+                allocation_token,
+                heap: Some(heap),
+            },
+            None => panic!(
+                "GcRef::downgrade::<{}> with no active HeapGuard — a GcRef \
+                 operated outside its owning heap's guard cannot be validated \
+                 against any heap, and reading the box to decide would be a \
+                 use-after-free if the heap has been dropped; push a HeapGuard \
+                 on the entry path",
                 std::any::type_name::<T>()
-            );
-        }
-        let (heap, allocation_token) = match tracked {
-            Some((heap, token)) => (Some(heap), token),
-            None => (None, 0),
-        };
-        GcWeak {
-            target: self.0,
-            identity,
-            allocation_token,
-            heap,
+            ),
         }
     }
 
@@ -124,28 +152,39 @@ impl<T: Trace + 'static> GcRef<T> {
     /// fire at honest memory pressure. No-op on `delta == 0` or when the
     /// underlying box is uncollected (see [`lua_gc::Gc::account_buffer`]).
     ///
-    /// A guard-less charge on a *heap-owned* box panics unconditionally in
-    /// every build: the charge would be silently dropped and the pacer would
-    /// drift from real memory. Detached (uncollected, process-lifetime) boxes
-    /// keep the legacy no-op behavior.
+    /// # No-guard path is deref-free (issue #267 F3)
+    ///
+    /// With no active `HeapGuard` this panics unconditionally, reading nothing:
+    /// the charge would otherwise be silently dropped (pacer drift), and — as
+    /// with [`downgrade`](Self::downgrade) — reading the box to decide would be
+    /// a use-after-free if the heap has been dropped (the old `is_heap_owned()`
+    /// check was that UAF). The legacy detached no-op path is dropped with it.
+    ///
+    /// The guarded charge intrinsically reads the box (it mutates
+    /// `header.size`), so — unlike the no-guard path — it cannot be made
+    /// deref-free: a charge against a stale box under an active guard reads that
+    /// box, which is the same option-B residual as `downgrade`. Under quarantine
+    /// a same-heap swept target is caught by the `HDR_FREED` `debug_assert` in
+    /// `as_box`; in release it is a documented residual (see the spec).
     pub fn account_buffer(&self, delta: isize) {
         if delta == 0 {
             return;
         }
-        lua_gc::with_current_heap(|h| match h {
-            Some(h) => self.0.account_buffer(h, delta),
-            None => {
-                if self.0.is_heap_owned() {
-                    panic!(
-                        "account_buffer({delta}) on a heap-owned \
-                         {} with no active HeapGuard — the charge would be silently dropped \
-                         and the pacer would drift from real memory; push a HeapGuard on \
-                         the entry path",
-                        std::any::type_name::<T>()
-                    );
-                }
-            }
-        })
+        match lua_gc::with_current_heap(|h| {
+            h.map(|h| {
+                self.0.account_buffer(h, delta);
+            })
+        }) {
+            Some(()) => {}
+            None => panic!(
+                "GcRef::account_buffer::<{}>({delta}) with no active HeapGuard \
+                 — the charge would be silently dropped and the pacer would \
+                 drift from real memory, and reading the box to decide would be \
+                 a use-after-free if the heap has been dropped; push a HeapGuard \
+                 on the entry path",
+                std::any::type_name::<T>()
+            ),
+        }
     }
 }
 
@@ -304,6 +343,27 @@ mod tests {
             "a weak handle minted after close must never upgrade — the box \
              is freed and the heap is closed"
         );
+    }
+
+    /// Issue #267 regression: the same close-then-downgrade sequence must stay
+    /// sound under quarantine. A withdrawn revision of #267 added a "tripwire"
+    /// that read the target box header at `downgrade` time whenever the *active*
+    /// heap was quarantined — but the active heap's quarantine flag says nothing
+    /// about whether the target's owner already freed the box, so this deref'd
+    /// freed memory *inside* the safety check (codex found it here). `downgrade`
+    /// must never read the box: on a closed heap the token refusal alone makes
+    /// the weak permanently dead, with no header read.
+    #[test]
+    fn downgrade_after_close_under_quarantine_reads_no_box() {
+        let heap = lua_gc::Heap::new_quarantined();
+        heap.unpause();
+        let _guard = lua_gc::HeapGuard::push(&heap);
+
+        let stale = GcRef::new(Cell0);
+        heap.drop_all();
+
+        let weak = stale.downgrade();
+        assert!(weak.upgrade().is_none());
     }
 }
 

@@ -1,5 +1,19 @@
 # Issue #267 — GC owner identity for stale-handle safety: design + options
 
+> **SUPERSEDED IN PART (2026-07-15).** The cheap parts of the recommendation
+> shipped in PR #294 as a *partial* mitigation: the **no-guard deref-free
+> `downgrade`/`account_buffer` guards** (which close F1/F3/F4 in release).
+> **The `HDR_FREED`/`owner_gen` tripwire this spec recommends below (see the
+> "recommended option" and the C/D sections) was IMPLEMENTED, REVIEWED, and
+> WITHDRAWN as UNSOUND** — it reads a foreign/freed box header *inside* the
+> safety check, which is itself a use-after-free (worse than the bug it aimed
+> to catch), and its u8 owner-generation wraps/collides. **Do not
+> re-implement it.** The foreign-heap, stale-after-sweep, and
+> issued-`&T`-across-`drop_all` cases genuinely require **option B**
+> (slot-indexed handles / an exclusive-teardown API) because reading the box
+> IS the UAF for them — tracked as **#295**. Treat every `HDR_FREED`/
+> `owner_gen`/per-box-owner-tag recommendation below as REJECTED history.
+
 **Status:** design spec, no production code. Recommends a direction; the load-bearing
 choice is the maintainer's because it is a soundness-vs-per-object-cost /
 contract-vs-mechanism trade-off. Revised once after an adversarial codex review
