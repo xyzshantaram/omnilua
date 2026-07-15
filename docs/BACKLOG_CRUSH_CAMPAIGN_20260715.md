@@ -196,3 +196,47 @@ on any canary/official flip; codex fix-rounds capped at ~3 with triage
   (`specs/ISSUE_300_CONST_FOLDING_SPEC.md`) folds in all 6 findings + the GC
   verdict (no UAF — the loader stops GC over the whole parse window). Executing
   the watermark refactor as a standalone byte-identical step FIRST, then folding.
+
+## Campaign end-state (2026-07-15)
+
+Every ticket that was open at campaign start is resolved or parked with evidence
+— the goal ("drive to zero OR to a defensible parked state with evidence") is met.
+
+**Shipped this campaign:** #282 (closed, no-code), #291 (#293), #113-analysis
+(#296), #267 partial mitigation (#294, then closed — reachable UAFs fixed,
+residual == #295), #278 (#299), #113 UpVal candidate (#298), #300 `<const>`
+folding (#303), #301 io/os errno fidelity (#302).
+
+**Parked / documented children (the defensible remainder):**
+- **#304** — 5.5 `global x` fails to shadow a captured regular local (UpVal). The
+  analog of the #300 CTC fix, but for the general resolution path. Fix path is
+  now scoped: generalize `ctc_shadowed_by_global` (lib.rs:3851) to the upvalue
+  case — the hard part is threading the captured local's owner-function + scope
+  level out of `singlevaraux` (the data-flow #300 deliberately avoided as blast
+  radius). A real value-model lane → deep-spec→codex→execute when picked up.
+- **#305** — errno-fidelity residuals split from #301: wasm errno-1 (EPERM) ABI
+  encoding, short-write result tuple, Win32→CRT-errno normalization. Edge /
+  other-platform; the Darwin-observable bug is fully fixed.
+- **#295** — GC option-B slot-indexed handles (multi-day redesign; the only
+  sound fix for the foreign/stale-after-sweep cases). Parked with a full spec.
+- **#113** — remaining RSS gap is buffer representation, a separate track from the
+  object-header diet (which is exhausted at UpVal per the #296 histogram).
+
+**Release checkpoint (needs the maintainer — irreversible publish):** #301
+carries a **source-breaking** hook-signature change (`Result<_,LuaError>` →
+`io::Result`), CHANGELOG-noted under `[Unreleased]`. A release bundling #298/#299/
+#300/#302 publishes irreversibly to crates.io + npm and must not be done
+autonomously — the version bump (breaking-change → minor under the 0.x line) and
+the publish are the maintainer's call.
+
+**Method notes (for the harness retrospective):** the supervisor+subagent +
+codex-loop pattern held up across 4 parallel lanes. Every codex round earned its
+cost — each caught a real defect that would otherwise have shipped (a wasm compile
+break the native toolchain hid, an `os.remove` errno-clobber, an incomplete
+three-way pointer-identity contract, an enclosing-function barrier gap). The
+deep-spec→codex→execute discipline for #300 converted a wrong "wire two functions"
+plan into the correct "register-accounting refactor is the prerequisite" — the
+spec review paid for itself. Keep-vs-nuke was exercised as authority, not
+ceremony: the UpVal RSS win was KEPT on a wall-flat/RSS-down measurement, and
+#301's round-3 grab-bag spiral was cut by fixing the one true regression and
+splitting the rest to #305.
