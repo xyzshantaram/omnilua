@@ -319,10 +319,8 @@ fn aux_resume(state: &mut LuaState, co: GcRef<lua_types::value::LuaThread>, narg
     lua_vm::api::set_top(state, (top_before - narg) as i32).ok();
 
     let mut parent_open_upval_slots = pop_resume_slot_buf(state);
-    parent_open_upval_slots.extend(state.openupval.iter().filter_map(|uv| {
-        uv.try_open_payload()
-            .map(|(thread_id, idx)| (thread_id as u64, idx))
-    }));
+    parent_open_upval_slots
+        .extend(state.openupval.iter().filter_map(|uv| uv.try_open_payload()));
     {
         let mut g = state.global_mut();
         for (tid, idx) in &parent_open_upval_slots {
@@ -915,10 +913,8 @@ fn close_suspended_or_dead(
     let caller_c_calls = state.c_calls();
 
     let mut parent_open_upval_slots = pop_resume_slot_buf(state);
-    parent_open_upval_slots.extend(state.openupval.iter().filter_map(|uv| {
-        uv.try_open_payload()
-            .map(|(thread_id, idx)| (thread_id as u64, idx))
-    }));
+    parent_open_upval_slots
+        .extend(state.openupval.iter().filter_map(|uv| uv.try_open_payload()));
     {
         let mut g = state.global_mut();
         for (tid, idx) in &parent_open_upval_slots {

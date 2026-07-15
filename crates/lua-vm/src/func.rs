@@ -58,7 +58,7 @@ fn new_open_upval(state: &mut LuaState, level: StackIdx, insert_pos: usize) -> G
     // executing `find_upval` — it captures one of that thread's stack slots.
     // `GlobalState::cross_thread_upvals` is what a coroutine actually reads
     // or writes through when accessing an upvalue belonging to its parent.
-    let owner_tid = state.global().current_thread_id as usize;
+    let owner_tid = state.global().current_thread_id;
     let uv: GcRef<UpVal> = state.new_upval_open(owner_tid, level);
     // Vec insert maintains descending StackIdx order (highest first),
     // mirroring the C intrusive list where the head is always the topmost slot.

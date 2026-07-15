@@ -51,10 +51,10 @@ const _: () = assert!(std::mem::size_of::<UpVal>() == 24);
 const _: () = assert!(std::mem::size_of::<lua_gc::GcBox<UpVal>>() == 48);
 
 impl UpVal {
-    pub fn open(thread_id: usize, idx: StackIdx) -> Self {
+    pub fn open(thread_id: u64, idx: StackIdx) -> Self {
         UpVal {
             state: Cell::new(UpValState::Open {
-                thread_id: thread_id as u64,
+                thread_id,
                 idx: idx.0,
             }),
         }
@@ -76,11 +76,13 @@ impl UpVal {
     /// Zero-overhead read of the open shape used by `upvalue_get` /
     /// `upvalue_set` and every out-of-crate consumer that inspects an open
     /// upvalue's `(thread_id, idx)`. Returns `Some((thread_id, idx))` when the
-    /// upvalue is still open, `None` once it has been closed.
+    /// upvalue is still open, `None` once it has been closed. `thread_id` is a
+    /// `u64` end-to-end so the never-reused monotonic id domain is preserved on
+    /// every target, including 32-bit `usize` ones (wasm32).
     #[inline(always)]
-    pub fn try_open_payload(&self) -> Option<(usize, StackIdx)> {
+    pub fn try_open_payload(&self) -> Option<(u64, StackIdx)> {
         match self.state.get() {
-            UpValState::Open { thread_id, idx } => Some((thread_id as usize, StackIdx(idx))),
+            UpValState::Open { thread_id, idx } => Some((thread_id, StackIdx(idx))),
             UpValState::Closed(_) => None,
         }
     }
@@ -142,12 +144,28 @@ mod tests {
         assert_eq!(uv.try_open_payload(), None);
     }
 
+    /// A thread id above `i64::MAX` (and far above `u32::MAX`) must round-trip
+    /// exactly — thread ids come from a never-reused monotonic `u64` counter.
+    /// It would read back negative under an `i64` discriminant and truncate
+    /// under a `u32`/32-bit-`usize` id, so this guards the full domain
+    /// end-to-end.
     #[test]
     fn open_upvalue_preserves_full_u64_thread_id() {
-        let big = (u32::MAX as usize).wrapping_add(1234);
-        let uv = UpVal::open(big, StackIdx(9));
-        assert_eq!(uv.try_open_payload(), Some((big, StackIdx(9))));
+        const BIG_TID: u64 = 0xFEDC_BA98_7654_3210;
+        assert!(BIG_TID > i64::MAX as u64);
+        let uv = UpVal::open(BIG_TID, StackIdx(9));
+        assert_eq!(uv.try_open_payload(), Some((BIG_TID, StackIdx(9))));
         assert!(uv.is_open());
         assert_eq!(uv.try_closed_value(), None);
+    }
+
+    /// `closed_value()` on an open upvalue reports `Nil`, matching the value
+    /// its closed slot held under the previous three-`Cell` layout (the
+    /// byte-identical edge preserved by the tagged-`Cell` representation).
+    #[test]
+    fn open_upvalue_closed_value_reports_nil() {
+        let uv = UpVal::open(3, StackIdx(1));
+        assert!(uv.is_open());
+        assert_eq!(uv.closed_value(), LuaValue::Nil);
     }
 }

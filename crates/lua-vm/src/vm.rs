@@ -2026,7 +2026,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         let uv = cl.upval(b);
                         let v = match uv.try_open_payload() {
                             Some((thread_id, idx))
-                                if thread_id as u64 == state.cached_thread_id =>
+                                if thread_id == state.cached_thread_id =>
                             {
                                 state.stack[idx.0 as usize].val
                             }
@@ -2044,7 +2044,7 @@ pub(crate) fn execute(state: &mut LuaState, mut ci: CallInfoIdx) -> Result<(), L
                         let uv = cl.upval(b);
                         match uv.try_open_payload() {
                             Some((thread_id, idx))
-                                if thread_id as u64 == state.cached_thread_id =>
+                                if thread_id == state.cached_thread_id =>
                             {
                                 state.stack[idx.0 as usize].val = v;
                                 if v.is_collectable() {

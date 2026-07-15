@@ -3231,7 +3231,7 @@ impl LuaState {
     }
 
     /// Allocate an open upvalue referring to a thread's stack slot.
-    pub fn new_upval_open(&mut self, thread_id: usize, level: StackIdx) -> GcRef<UpVal> {
+    pub fn new_upval_open(&mut self, thread_id: u64, level: StackIdx) -> GcRef<UpVal> {
         self.mark_gc_check_needed();
         self.legacy_open_upval_touched.set(true);
         GcRef::new(UpVal::open(thread_id, level))
@@ -3345,11 +3345,10 @@ impl LuaState {
             None => return uv.closed_value(),
         };
         let current = self.cached_thread_id;
-        let tid = thread_id as u64;
-        if tid == current {
+        if thread_id == current {
             return self.stack[idx.0 as usize].val;
         }
-        self.upvalue_get_cross_thread(tid, idx)
+        self.upvalue_get_cross_thread(thread_id, idx)
     }
 
     #[cold]
@@ -3388,12 +3387,11 @@ impl LuaState {
         let uv = cl.upval(n);
         match uv.try_open_payload() {
             Some((thread_id, idx)) => {
-                let tid = thread_id as u64;
                 let current = self.cached_thread_id;
-                if tid == current {
+                if thread_id == current {
                     self.stack[idx.0 as usize].val = val;
                 } else {
-                    self.upvalue_set_cross_thread(tid, idx, val)?;
+                    self.upvalue_set_cross_thread(thread_id, idx, val)?;
                 }
             }
             None => {
@@ -4616,7 +4614,7 @@ fn close_open_upvalues_for_unreachable_threads(global: &GlobalState, marker: &mu
             let Some((thread_id, idx)) = uv.try_open_payload() else {
                 continue;
             };
-            if thread_id as u64 != *id {
+            if thread_id != *id {
                 continue;
             }
             let value = thread.get_at(idx);
