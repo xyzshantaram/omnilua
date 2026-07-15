@@ -745,6 +745,18 @@ pub struct GcHeader {
     /// charged — [`Gc::account_buffer`] no-ops), gray_listed (true while the
     /// object has an entry in the heap-side `Heap::grayagain` revisit vector).
     flags: Cell<u8>,
+    /// Wrapping generation id of the `Heap` that allocated this box, stamped
+    /// once at allocation. Occupies the offset-3 padding byte the `size` u32's
+    /// alignment already reserved, so it is byte-free (header stays 24 B on
+    /// 64-bit / 16 B on wasm32; see `gcheader_is_24_bytes_after_grayagain_diet`).
+    /// A tripwire-only owner tag (issue #267 option D): under quarantine,
+    /// `Heap::stale_handle_tripwire` refuses a `downgrade`/`account_buffer` of a
+    /// box whose `owner_gen` does not match the active heap's — catching a
+    /// foreign-heap operation on a *still-live* box, the one stale case the
+    /// `HDR_FREED` tripwire cannot see. Not a release guarantee: it wraps at 256
+    /// heap constructions and cannot be read on a freed box. `0` is the detached
+    /// (`Gc::new_uncollected`, no owning heap) sentinel and is never matched.
+    owner_gen: Cell<u8>,
     /// Rough byte size charged to the pacer for this object. Starts at the
     /// `GcBox<T>` size and is adjusted in place by [`Gc::account_buffer`]
     /// when the value's owned heap buffers (table array/node Vecs) grow or
@@ -772,15 +784,34 @@ const HDR_HEAP_OWNED: u8 = 16;
 /// deterministic panic with a backtrace (see `Heap::release_box`).
 const HDR_FREED: u8 = 8;
 
+/// Owner-generation sentinel for detached (`Gc::new_uncollected`) boxes: they
+/// have no owning heap, so [`Heap::stale_handle_tripwire`] skips the owner-tag
+/// check whenever it reads this value.
+const DETACHED_OWNER_GEN: u8 = 0;
+
+/// Process-global wrapping source of per-[`Heap`] generation ids (issue #267
+/// option D). Starts at 1 so the first heap never collides with the detached
+/// sentinel `0`; it wraps through the full u8 range once >255 heaps have been
+/// constructed, which is exactly why the owner-generation match is a debug
+/// tripwire rather than a release guarantee.
+static NEXT_HEAP_GEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
 impl GcHeader {
-    fn new_white(size: usize, color: Color, flags: u8) -> Self {
+    fn new_white(size: usize, color: Color, flags: u8, owner_gen: u8) -> Self {
         Self {
             color: Cell::new(color),
             age: Cell::new(GcAge::New),
             flags: Cell::new(flags),
+            owner_gen: Cell::new(owner_gen),
             size: Cell::new(size.min(u32::MAX as usize) as u32),
             next: Cell::new(None),
         }
+    }
+
+    /// Wrapping generation id of the owning heap (`0` for detached boxes). See
+    /// the field doc; read only by [`Heap::stale_handle_tripwire`].
+    fn owner_gen(&self) -> u8 {
+        self.owner_gen.get()
     }
 
     fn flag(&self, bit: u8) -> bool {
@@ -883,7 +914,7 @@ impl<T: Trace + 'static> Gc<T> {
         DETACHED_ALLOCATIONS.with(|c| c.set(c.get() + 1));
         let size = std::mem::size_of::<T>();
         let boxed = Box::new(GcBox {
-            header: GcHeader::new_white(size, Color::White0, 0),
+            header: GcHeader::new_white(size, Color::White0, 0, DETACHED_OWNER_GEN),
             value,
         });
         Gc {
@@ -1462,6 +1493,13 @@ pub struct Heap {
     bytes: Cell<usize>,
     /// Number of currently heap-owned GC boxes across all owner lists.
     objects: Cell<usize>,
+    /// This heap's wrapping generation id (issue #267 option D), assigned once
+    /// at construction from [`NEXT_HEAP_GEN`] and stamped into every box's
+    /// `GcHeader::owner_gen`. Read only by [`stale_handle_tripwire`](Self::stale_handle_tripwire)
+    /// to detect a foreign-heap `downgrade`/`account_buffer` of a still-live box
+    /// under quarantine. Never `0` at construction (the detached sentinel), but
+    /// may wrap to `0` after 256 heaps — a tripwire limitation, not a guarantee.
+    gen: u8,
     /// White bit used for new allocations and for survivors after a sweep.
     current_white: Cell<Color>,
     /// Heap-owned allocation tokens keyed by box address. Weak handles store
@@ -1629,6 +1667,7 @@ impl Heap {
             finobjrold: Cell::new(None),
             bytes: Cell::new(0),
             objects: Cell::new(0),
+            gen: NEXT_HEAP_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             current_white: Cell::new(Color::White0),
             allocation_tokens: RefCell::new(IdentityHashMap::default()),
             next_allocation_token: Cell::new(1),
@@ -1745,6 +1784,7 @@ impl Heap {
                 size,
                 self.current_white.get(),
                 HDR_COLLECTED | HDR_HEAP_OWNED,
+                self.gen,
             ),
             value,
         });
@@ -1775,7 +1815,12 @@ impl Heap {
         self.assert_open();
         let size = std::mem::size_of::<GcBox<T>>();
         let boxed = Box::new(GcBox {
-            header: GcHeader::new_white(size, self.current_white.get(), HDR_HEAP_OWNED),
+            header: GcHeader::new_white(
+                size,
+                self.current_white.get(),
+                HDR_HEAP_OWNED,
+                self.gen,
+            ),
             value,
         });
         boxed.header.next.set(self.uncollected.get());
@@ -2289,6 +2334,50 @@ impl Heap {
     /// validate — without touching the map. A downgrade of a stale `GcRef`
     /// after close would otherwise re-register the freed box's address and
     /// resurrect it as an upgradable weak target.
+    /// Stale-handle tripwire for `GcRef::downgrade` / `GcRef::account_buffer`,
+    /// active only under quarantine mode (a debug instrument; a no-op branch in
+    /// release). Called with the active heap as `self` and the operated handle
+    /// as `gc`, *before* any token is minted or buffer byte is charged.
+    ///
+    /// It reads the target box's header — safe precisely because quarantine
+    /// *parks* a swept box (sets `HDR_FREED`, keeps the memory allocated)
+    /// rather than freeing it — and refuses:
+    ///
+    /// - a handle whose box the collector already swept (`HDR_FREED` set):
+    ///   catches the same-heap swept-then-re-`downgrade` resurrection (spec
+    ///   #267 F2c) and the foreign-heap downgrade of an already-swept box
+    ///   (F2b), including the no-guard-into-swept F1 corner;
+    /// - a handle whose box is owned by a different live heap generation
+    ///   (`owner_gen` mismatch): catches a foreign-heap operation on a box that
+    ///   is *still live* (spec #267 F2a), the one stale case `HDR_FREED` cannot
+    ///   see because the box is not freed.
+    ///
+    /// Not a release guarantee and deliberately narrow: it is a no-op outside
+    /// quarantine, the `owner_gen` tag wraps at 256 heaps, and it cannot help
+    /// once the owning heap has run `drop_all` (that memory is truly freed —
+    /// reading it would itself be the use-after-free). That residual is closed
+    /// only by slot-indexed handles (issue #267 option B).
+    pub fn stale_handle_tripwire<T: Trace + 'static>(&self, gc: Gc<T>) {
+        if !self.quarantine {
+            return;
+        }
+        let header = self.header_from_ptr(gc.as_trace_ptr());
+        assert!(
+            !header.flag(HDR_FREED),
+            "stale-handle tripwire: a GcRef operation names a box the collector \
+             already swept (use-after-sweep — issue #267 F1/F2b/F2c); this is a \
+             rooting/lifetime bug: the handle outlived the object it points at"
+        );
+        let owner_gen = header.owner_gen();
+        assert!(
+            owner_gen == DETACHED_OWNER_GEN || owner_gen == self.gen,
+            "stale-handle tripwire: a GcRef operation targets a box owned by a \
+             different (foreign) heap generation (issue #267 F2a) — operating a \
+             GcRef under a heap that does not own it mints a weak token on the \
+             wrong heap and resurrects freed memory once the owner sweeps"
+        );
+    }
+
     pub fn register_allocation_token(&self, identity: usize) -> usize {
         if self.closed.get() {
             return 0;
@@ -4270,15 +4359,36 @@ mod tests {
 
     /// Header-size regression for #113 Wave 1. Removing the `gray_next`
     /// grayagain fat pointer shrinks `GcHeader` from **40 B to 24 B on
-    /// 64-bit** (`color + age + flags + pad + size(u32) + next(16)`), align 8.
-    /// The wasm32 figure is 24 -> 16 B (an 8-B fat pointer), but that is NOT
-    /// asserted here — a native test cannot observe the wasm32 layout, so the
-    /// assertion is gated to 64-bit targets; the wasm32 size is pinned by the
-    /// W2 `const` assert per the spec.
+    /// 64-bit** (`color + age + flags + owner_gen + size(u32) + next(16)`),
+    /// align 8. The wasm32 figure is 24 -> 16 B (an 8-B fat pointer), but that
+    /// is NOT asserted here — a native test cannot observe the wasm32 layout, so
+    /// the assertion is gated to 64-bit targets; the wasm32 size is pinned by
+    /// the `const` assert below per the spec.
+    ///
+    /// Issue #267 added `owner_gen: Cell<u8>` into the offset-3 padding byte the
+    /// `size` u32's 4-byte alignment already reserved, so the header stays 24 B:
+    /// this test staying green is the byte-neutrality proof for option D.
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn gcheader_is_24_bytes_after_grayagain_diet() {
         assert_eq!(std::mem::size_of::<GcHeader>(), 24);
+        assert_eq!(std::mem::align_of::<GcHeader>(), 8);
+        assert_eq!(
+            std::mem::size_of::<GcBox<u64>>(),
+            32,
+            "the owner_gen tag reused padding: a GcBox<u64> stays header(24) + \
+             value(8) with no growth"
+        );
+    }
+
+    /// wasm32 header-size pin (issue #113 W1 + #267 owner_gen): a 4-byte-aligned
+    /// 8-byte fat `next` pointer makes the header 16 B, and `owner_gen` reuses
+    /// the padding the same way it does on 64-bit. Compiled only on 32-bit
+    /// targets, so it is the wasm build's guard that option D stayed byte-free.
+    #[test]
+    #[cfg(target_pointer_width = "32")]
+    fn gcheader_is_16_bytes_on_wasm32() {
+        assert_eq!(std::mem::size_of::<GcHeader>(), 16);
     }
 
     #[test]
