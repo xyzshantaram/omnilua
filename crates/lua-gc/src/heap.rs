@@ -837,6 +837,15 @@ const _: () = {
     assert!(std::mem::size_of::<GcHeader>() == 16);
 };
 
+/// Compile-time pin on a representative `GcBox` layout (24-byte header +
+/// an 8-byte payload): the header diet's byte-neutrality is only meaningful
+/// if the composed box size holds too, and a `const` block checks it on
+/// every real build for the target rather than only under the test suite.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<GcBox<u64>>() == 32);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(std::mem::size_of::<GcBox<u64>>() == 24);
+
 /// A heap-allocated, GC-tracked value plus its header.
 #[repr(C)]
 pub struct GcBox<T: ?Sized> {
