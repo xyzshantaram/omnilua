@@ -440,6 +440,14 @@ export class LuaRsRuntime {
     return value === undefined ? -1 : this.writeBytes(outPtr, outLen, asBytes(value));
   }
 
+  /**
+   * Open a host file. Returns a non-negative handle id on success. A negative
+   * return signals failure and carries an errno so the Lua `io.open` failure
+   * triple reports the real `(nil, msg, errno)` instead of errno 0 (#301):
+   * `-1` means "failed, no errno available"; any value `<= -2` encodes
+   * `errno = -id` (e.g. `-2` == ENOENT). The wasm module decodes this and
+   * constructs a matching `std::io::Error`.
+   */
   openFile(pathPtr, pathLen, modePtr, modeLen) {
     const path = this.readString(pathPtr, pathLen);
     const mode = this.readString(modePtr, modeLen);
@@ -459,7 +467,7 @@ export class LuaRsRuntime {
 
       const source = this.files.get(path);
       if (source === undefined) {
-        return -1;
+        return -2;
       }
       this.openFiles.set(id, {
         mode,
@@ -492,7 +500,7 @@ export class LuaRsRuntime {
       return id;
     }
 
-    return -1;
+    return -22;
   }
 
   fileReadByte(id) {

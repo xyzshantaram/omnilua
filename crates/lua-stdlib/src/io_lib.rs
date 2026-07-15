@@ -434,7 +434,7 @@ fn strerror_text(err: &io::Error) -> String {
     }
 }
 
-/// Push success (`true`) or failure (`fail`, msg, errno) per `luaL_fileresult`.
+/// Push success (`true`) or failure (`fail`, msg[, errno]) per `luaL_fileresult`.
 ///
 /// On success: `lua_pushboolean(L, 1); return 1`. On failure C runs
 /// `luaL_pushfail(L); lua_pushfstring(...); lua_pushinteger(errno); return 3`,
@@ -447,6 +447,17 @@ fn strerror_text(err: &io::Error) -> String {
 /// `raw_os_error()` — callers must pass through the original `io::Error` from
 /// the host hook unmodified, never re-wrap it as `ErrorKind::Other` (#301:
 /// re-wrapping drops `raw_os_error()`, surfacing as errno 0 downstream).
+///
+/// The errno is pushed **only when `os_err` actually carries one**
+/// (`raw_os_error().is_some()` — every real OS failure does). C always has a
+/// live `errno`, so real filesystem failures produce the faithful 3-value
+/// triple. When the error is a non-OS failure with no errno — an omniLua-only
+/// case C cannot reach, e.g. a sandbox capability failure ("no filesystem hook
+/// registered") or a host hook that returned a `raw_os_error`-less
+/// `io::Error` — there is genuinely no errno to report, so the result is the
+/// honest 2-value `(nil, msg)`. Coercing that to `0` (the removed
+/// `unwrap_or(0)`) was the #301 fallback: a fabricated errno that no `errno`
+/// value ever legitimately equals here.
 pub(crate) fn file_result(
     state: &mut LuaState,
     success: bool,
@@ -471,9 +482,13 @@ pub(crate) fn file_result(
             state.push_string(msg.as_bytes())?;
         }
     }
-    let errno_code = os_err.raw_os_error().unwrap_or(0) as i64;
-    state.push(LuaValue::Int(errno_code));
-    Ok(3)
+    match os_err.raw_os_error() {
+        Some(code) => {
+            state.push(LuaValue::Int(code as i64));
+            Ok(3)
+        }
+        None => Ok(2),
+    }
 }
 
 /// Push popen/system exit-status results per `luaL_execresult`: `true` on a
@@ -574,6 +589,35 @@ fn new_file(state: &mut LuaState) -> Result<Rc<RefCell<LStream>>, LuaError> {
     Ok(cell)
 }
 
+/// Build the `io.input`/`io.output`/`io.lines` open-failure error, version-gated.
+///
+/// C splits here by version. 5.2+ `opencheck` raises
+/// `luaL_error(L, "cannot open file '%s' (%s)", fname, strerror(errno))`. 5.1's
+/// `g_iofile`/`io_lines` instead call `fileerror`, which does
+/// `luaL_argerror(L, 1, "<fname>: <strerror>")` — rendered as
+/// `bad argument #1 to '<caller>' (<fname>: <strerror>)`, with `<caller>`
+/// resolved from the call stack ('?' under `pcall(io.input, x)`, `'lines'` when
+/// called from a Lua frame). [`lua_vm::debug::arg_error_impl`] reproduces that
+/// exact stack walk, so routing the 5.1 case through it matches the reference
+/// funcname and location prefix without special-casing either.
+fn open_failure_error(state: &mut LuaState, fname: &[u8], detail: &[u8]) -> LuaError {
+    if matches!(state.global().lua_version, lua_types::LuaVersion::V51) {
+        let mut extramsg = Vec::with_capacity(fname.len() + 2 + detail.len());
+        extramsg.extend_from_slice(fname);
+        extramsg.extend_from_slice(b": ");
+        extramsg.extend_from_slice(detail);
+        lua_vm::debug::arg_error_impl(state, 1, &extramsg)
+    } else {
+        let mut msg = Vec::with_capacity(fname.len() + detail.len() + 20);
+        msg.extend_from_slice(b"cannot open file '");
+        msg.extend_from_slice(fname);
+        msg.extend_from_slice(b"' (");
+        msg.extend_from_slice(detail);
+        msg.push(b')');
+        lua_vm::debug::c_api_runtime(state, msg)
+    }
+}
+
 /// Open `fname` and push its handle; raise a runtime error on failure.
 ///
 /// The file system is reached via `GlobalState::file_open_hook` (registered by
@@ -581,18 +625,19 @@ fn new_file(state: &mut LuaState) -> Result<Rc<RefCell<LStream>>, LuaError> {
 fn opencheck(state: &mut LuaState, fname: &[u8], mode: &[u8]) -> Result<(), LuaError> {
     let hook = state.global().file_open_hook;
     let fh = match hook {
-        Some(open_fn) => open_fn(fname, mode).map_err(|e| {
-            LuaError::runtime(format_args!(
-                "cannot open file '{}' ({})",
-                fname.escape_ascii(),
-                strerror_text(&e)
-            ))
-        })?,
+        Some(open_fn) => match open_fn(fname, mode) {
+            Ok(fh) => fh,
+            Err(e) => {
+                let detail = strerror_text(&e);
+                return Err(open_failure_error(state, fname, detail.as_bytes()));
+            }
+        },
         None => {
-            return Err(LuaError::runtime(format_args!(
-                "cannot open file '{}' (no filesystem hook registered)",
-                fname.escape_ascii()
-            )));
+            return Err(open_failure_error(
+                state,
+                fname,
+                b"no filesystem hook registered",
+            ));
         }
     };
     let cell = new_file(state)?;

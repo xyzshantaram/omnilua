@@ -363,18 +363,31 @@ impl LuaFileHandle for ImportedFileHandle {
     }
 }
 
+/// Opens a host file, preserving the host's errno across the wasm boundary (#301).
+///
+/// The `open_file` host import returns `id >= 0` for a live handle; a negative
+/// return signals failure and carries the errno so `io_lib::file_result` can
+/// report the faithful `(nil, msg, errno)` triple instead of errno 0:
+///   * `id == -1` — failure with **no** errno available (the host has no OS
+///     error to report). Mapped to a `raw_os_error`-less `io::Error`, which
+///     `file_result` renders as the honest 2-value `(nil, msg)`. This is the
+///     original `-1 == fail` sentinel, kept for host backward-compatibility.
+///   * `id <= -2` — failure carrying `errno = -id` (e.g. `-2` → `ENOENT`).
+///     Mapped to `io::Error::from_raw_os_error(-id)`.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-fn imported_file_open(path: &[u8], mode: &[u8]) -> Result<Box<dyn LuaFileHandle>, LuaError> {
+fn imported_file_open(path: &[u8], mode: &[u8]) -> io::Result<Box<dyn LuaFileHandle>> {
     // SAFETY: `path` and `mode` are live Rust slices for this synchronous import.
     // The host returns an opaque file id and must not retain the pointers.
     let id = unsafe { imported_open_file(path.as_ptr(), path.len(), mode.as_ptr(), mode.len()) };
-    if id < 0 {
-        Err(LuaError::runtime(format_args!(
-            "host file open failed: {}",
-            String::from_utf8_lossy(path)
-        )))
-    } else {
+    if id >= 0 {
         Ok(Box::new(ImportedFileHandle::new(id)))
+    } else if id == -1 {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "host file open failed",
+        ))
+    } else {
+        Err(io::Error::from_raw_os_error(-id))
     }
 }
 

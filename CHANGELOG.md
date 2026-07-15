@@ -4,6 +4,39 @@ All notable changes to `omniLua` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Breaking — filesystem host hooks now return `std::io::Result` (#301)
+
+`FileOpenHook`, `FileRemoveHook`, and `FileRenameHook` changed from
+`Result<_, LuaError>` to `std::io::Result<_>` (i.e. `Result<_, std::io::Error>`).
+This is required for fidelity: only `std::io::Error` carries `raw_os_error()`,
+and `io.open`/`os.remove`/`os.rename` must report the real errno as the third
+return value the way C's `luaL_fileresult` does. A `LuaError` return could not
+carry an errno, so the boundary was silently dropping it (see the Fixed note
+below). Embedders installing these hooks must return `io::Error` (typically
+straight from `std::fs`, which already carries the OS errno) instead of building
+a `LuaError`. The wasm host ABI's `open_file` import gained an errno-carrying
+failure convention (`id <= -2` encodes `errno = -id`; `-1` stays "failure, no
+errno").
+
+### Fixed — io/os error fidelity: real errno + clean strerror text (#301)
+
+`io.open`, `os.remove`, and `os.rename` on failure returned errno **0** and a
+verbose Rust-style message (`... (os error 2)`) where reference Lua returns the
+real errno and the bare `strerror` text (`No such file or directory`, errno 2).
+Root cause: the file-hook boundary re-wrapped the OS error as
+`io::ErrorKind::Other`, discarding `raw_os_error()`. The hooks now propagate the
+original `io::Error` end to end; the failure message is rendered as clean
+`strerror`-shaped text; and the errno is reported only when the error actually
+carries one (a non-OS failure — e.g. a sandbox "no filesystem hook registered" —
+now yields the honest 2-value `(nil, msg)` instead of a fabricated errno 0).
+Also fixed alongside: `os.remove` on a symlink now reports the real `unlink`
+errno (mirroring C `remove(3)`) instead of a spurious `rmdir` `ENOTDIR`; and
+`io.input`/`io.output`/`io.lines` open-failure messages are version-gated
+(Lua 5.1 uses the `argerror` form, 5.2+ the `cannot open file` form, with the
+`luaL_where` location prefix), matching every reference binary 5.1–5.5.
+
 ## [0.6.0] - 2026-07-13
 
 ### Fixed — deterministic close (#260)
