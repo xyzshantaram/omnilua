@@ -3403,27 +3403,12 @@ fn singlevar(ls: &mut LexState, state: &mut LuaState, var: &mut ExprDesc) -> Res
                 }
             }
             ExprKind::Const => {
-                // `u.info` is the ABSOLUTE actvar index of the resolved
-                // `<const>` constant. If it lies within THIS function's active
-                // range the constant was declared here, so a `global <name>`
-                // wins only if declared more recently (deeper scope level) — the
-                // same comparison as a local. If it lies below this function's
-                // first local it was reached across a function boundary (an
-                // outer function's CTC), and a `global <name>` declared in THIS
-                // function always shadows it — matching reference 5.5, whose
-                // `searchvar` returns VGLOBAL for a current-function global
-                // before ever recursing to the enclosing function.
-                let cur_firstlocal = ls.fs.as_ref().unwrap().firstlocal;
-                if var.u.info >= cur_firstlocal {
-                    if let Some(global_level) =
-                        latest_matching_global_barrier_current(ls, &varname)
-                    {
-                        let local_level = scope_level_for_local_level(ls, var.u.var_vidx as u8);
-                        if global_level > local_level {
-                            init_exp(var, ExprKind::Void, 0);
-                        }
-                    }
-                } else if latest_matching_global_barrier_current(ls, &varname).is_some() {
+                // A resolved `<const>` may have been reached across one or more
+                // function boundaries. Reference 5.5 scans each enclosing
+                // function's globals and locals together at every recursive
+                // level; mirror that walk (see `ctc_shadowed_by_global`) rather
+                // than only inspecting the innermost function's barriers.
+                if ctc_shadowed_by_global(ls, &varname, var.u.info) {
                     init_exp(var, ExprKind::Void, 0);
                 }
             }
@@ -3818,6 +3803,73 @@ fn latest_matching_global_barrier_current(ls: &LexState, name: &GcRef<LuaString>
         .rev()
         .find(|b| GcRef::ptr_eq(&b.name, name))
         .map(|b| b.level)
+}
+
+/// The scope level (declaration ordinal) of the `local_index`-th register/CTC
+/// local in `fs`, given `fs`'s active global-barrier `slice`. This is the
+/// function-parameterized form of [`scope_level_for_local_level`] used during
+/// the recursive resolution walk, where the function under examination is an
+/// enclosing function rather than `ls.fs`. Barriers occupy their own levels;
+/// locals fill the gaps, so the level of the k-th local is the (k+1)-th
+/// non-barrier level.
+fn scope_level_of_local_in(fs: &FuncState, slice: &[ScopeBarrier], local_index: i32) -> u8 {
+    let scope_level_max = fs.nactvar as usize + slice.len();
+    let target = local_index.max(0) as usize;
+    let mut locals_seen = 0usize;
+    for level in 0..=scope_level_max {
+        let lvl = level.min(u8::MAX as usize) as u8;
+        if slice.iter().any(|b| b.level == lvl) {
+            continue;
+        }
+        if locals_seen == target {
+            return lvl;
+        }
+        locals_seen += 1;
+    }
+    local_index.max(0).min(u8::MAX as i32) as u8
+}
+
+/// Lua 5.5: does an active `global <name>` declaration shadow the resolved
+/// `<const>` compile-time constant at absolute actvar index `ctc_abs_index`?
+///
+/// Reference 5.5's `searchvar` scans each enclosing function's global
+/// declarations and locals together at EVERY recursive level (globals live in
+/// `actvar` there), so the most recent declaration — global or local — wins at
+/// the first function that has any match. This walks the live `FuncState` chain
+/// from the innermost function outward, reconstructing each function's active
+/// barrier slice (`[first_scope_barrier .. child.first_scope_barrier]`):
+///
+/// - a matching `global` in any function nested BETWEEN the reference site and
+///   the constant's owner shadows it outright (that function has no matching
+///   local — otherwise resolution would have stopped there — so its `global` is
+///   the only match and wins, exactly as reference stops recursing at it);
+/// - a matching `global` in the OWNER function shadows the constant only when it
+///   is declared later than the constant (a strictly deeper scope level).
+///
+/// On pre-5.5 versions `scope_barriers` is always empty, so this returns
+/// `false`; it is called only from the 5.5 resolution branch regardless.
+fn ctc_shadowed_by_global(ls: &LexState, name: &GcRef<LuaString>, ctc_abs_index: i32) -> bool {
+    let mut upper = ls.scope_barriers.len();
+    let mut fs_opt = ls.fs.as_deref();
+    while let Some(fs) = fs_opt {
+        let lower = fs.first_scope_barrier.min(upper);
+        let slice = &ls.scope_barriers[lower..upper];
+        let owns = ctc_abs_index >= fs.firstlocal
+            && ctc_abs_index < fs.firstlocal + fs.nactvar as i32;
+        if owns {
+            let ctc_scope_level =
+                scope_level_of_local_in(fs, slice, ctc_abs_index - fs.firstlocal);
+            return slice
+                .iter()
+                .any(|b| GcRef::ptr_eq(&b.name, name) && b.level > ctc_scope_level);
+        }
+        if slice.iter().any(|b| GcRef::ptr_eq(&b.name, name)) {
+            return true;
+        }
+        upper = lower;
+        fs_opt = fs.prev.as_deref();
+    }
+    false
 }
 
 fn has_active_global_barrier(ls: &LexState, name: &GcRef<LuaString>) -> bool {
