@@ -422,6 +422,7 @@ fn check_mode_popen(mode: &[u8]) -> bool {
 /// between Darwin and glibc, e.g. macOS `ENOTEMPTY` = 66) return `None` and are
 /// resolved from the OS `Display`, which is correct on a native host and does
 /// not arise on wasm.
+#[cfg(any(unix, target_arch = "wasm32"))]
 fn posix_strerror(code: i32) -> Option<&'static str> {
     Some(match code {
         1 => "Operation not permitted",
@@ -450,6 +451,22 @@ fn posix_strerror(code: i32) -> Option<&'static str> {
     })
 }
 
+/// The [`posix_strerror`] table only applies where `raw_os_error()` IS a POSIX
+/// errno — Unix and wasm. On Windows `raw_os_error()` is a Win32 code with
+/// different numbering (code 5 is `ERROR_ACCESS_DENIED`, not `EIO`), so the
+/// table would mistranslate it; there we return `None` and fall back to the OS
+/// `Display` (Windows's own message + code), which is the port's native
+/// behavior. Faithful Win32→CRT-errno normalization is a separate follow-up.
+#[cfg(any(unix, target_arch = "wasm32"))]
+fn target_posix_strerror(code: i32) -> Option<&'static str> {
+    posix_strerror(code)
+}
+
+#[cfg(not(any(unix, target_arch = "wasm32")))]
+fn target_posix_strerror(_code: i32) -> Option<&'static str> {
+    None
+}
+
 /// Render an `io::Error` the way C's `strerror(errno)` would: the plain
 /// platform message, with no trailing `" (os error N)"`.
 ///
@@ -462,7 +479,7 @@ fn posix_strerror(code: i32) -> Option<&'static str> {
 /// carry their own message and pass through unchanged.
 fn strerror_text(err: &io::Error) -> String {
     match err.raw_os_error() {
-        Some(code) => match posix_strerror(code) {
+        Some(code) => match target_posix_strerror(code) {
             Some(msg) => msg.to_string(),
             None => {
                 let full = err.to_string();
