@@ -558,7 +558,6 @@ pub struct LexState {
     /// locals, but they do not occupy VM registers. Keep that bookkeeping
     /// separate from `FuncState::nactvar` so codegen remains register-stable.
     pub scope_barriers: Vec<ScopeBarrier>,
-    pub global_function_names: Vec<GcRef<LuaString>>,
 }
 
 const PARSER_MAX_C_CALLS: u32 = 200;
@@ -3787,25 +3786,6 @@ fn local_level_for_scope_level(ls: &LexState, scope_level: u8) -> i32 {
     locals.clamp(0, max_locals)
 }
 
-fn scope_level_for_local_level(ls: &LexState, local_level: u8) -> u8 {
-    let first_barrier = ls.fs.as_ref().map_or(0usize, |fs| fs.first_scope_barrier);
-    let target = local_level as usize;
-    let mut locals_seen = 0usize;
-    for level in 0..=current_scope_level(ls) {
-        if ls.scope_barriers[first_barrier..]
-            .iter()
-            .any(|b| b.level == level)
-        {
-            continue;
-        }
-        if locals_seen == target {
-            return level;
-        }
-        locals_seen += 1;
-    }
-    local_level
-}
-
 fn add_scope_barrier(ls: &mut LexState, name: GcRef<LuaString>) {
     let level = current_scope_level(ls);
     ls.scope_barriers.push(ScopeBarrier { level, name });
@@ -3849,63 +3829,6 @@ fn scope_level_of_local_in(fs: &FuncState, slice: &[ScopeBarrier], local_index: 
         locals_seen += 1;
     }
     local_index.max(0).min(u8::MAX as i32) as u8
-}
-
-/// Lua 5.5: does an active `global <name>` declaration shadow the resolved
-/// `<const>` compile-time constant at absolute actvar index `ctc_abs_index`?
-///
-/// Reference 5.5's `searchvar` scans each enclosing function's global
-/// declarations and locals together at EVERY recursive level (globals live in
-/// `actvar` there), so the most recent declaration — global or local — wins at
-/// the first function that has any match. This walks the live `FuncState` chain
-/// from the innermost function outward, reconstructing each function's active
-/// barrier slice (`[first_scope_barrier .. child.first_scope_barrier]`):
-///
-/// - a matching `global` in any function nested BETWEEN the reference site and
-///   the constant's owner shadows it outright (that function has no matching
-///   local — otherwise resolution would have stopped there — so its `global` is
-///   the only match and wins, exactly as reference stops recursing at it);
-/// - a matching `global` in the OWNER function shadows the constant only when it
-///   is declared later than the constant (a strictly deeper scope level).
-///
-/// On pre-5.5 versions `scope_barriers` is always empty, so this returns
-/// `false`; it is called only from the 5.5 resolution branch regardless.
-fn ctc_shadowed_by_global(ls: &LexState, name: &GcRef<LuaString>, ctc_abs_index: i32) -> bool {
-    let mut upper = ls.scope_barriers.len();
-    let mut fs_opt = ls.fs.as_deref();
-    while let Some(fs) = fs_opt {
-        let lower = fs.first_scope_barrier.min(upper);
-        let slice = &ls.scope_barriers[lower..upper];
-        let owns = ctc_abs_index >= fs.firstlocal
-            && ctc_abs_index < fs.firstlocal + fs.nactvar as i32;
-        if owns {
-            let ctc_scope_level =
-                scope_level_of_local_in(fs, slice, ctc_abs_index - fs.firstlocal);
-            return slice
-                .iter()
-                .any(|b| GcRef::ptr_eq(&b.name, name) && b.level > ctc_scope_level);
-        }
-        if slice.iter().any(|b| GcRef::ptr_eq(&b.name, name)) {
-            return true;
-        }
-        upper = lower;
-        fs_opt = fs.prev.as_deref();
-    }
-    false
-}
-
-fn has_active_global_barrier(ls: &LexState, name: &GcRef<LuaString>) -> bool {
-    ls.scope_barriers
-        .iter()
-        .rev()
-        .any(|b| GcRef::ptr_eq(&b.name, name))
-}
-
-fn is_active_global_function_name(ls: &LexState, name: &GcRef<LuaString>) -> bool {
-    ls.global_function_names
-        .iter()
-        .rev()
-        .any(|n| GcRef::ptr_eq(n, name))
 }
 
 fn scope_name_at(ls: &LexState, level: u8, label_nactvar: u8) -> Vec<u8> {
@@ -6597,7 +6520,6 @@ pub fn parse(
         global_wildcard_const: false,
         declared_globals: Vec::new(),
         scope_barriers: Vec::new(),
-        global_function_names: Vec::new(),
     };
     //   `mainfunc`; it does NOT pre-read the first token. `mainfunc` itself
     //   issues the initial `luaX_next` once its prelude (open_func, vararg
