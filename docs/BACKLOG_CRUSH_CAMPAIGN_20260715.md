@@ -207,13 +207,23 @@ Every ticket that was open at campaign start is resolved or parked with evidence
 residual == #295), #278 (#299), #113 UpVal candidate (#298), #300 `<const>`
 folding (#303), #301 io/os errno fidelity (#302).
 
+**Also SHIPPED (picked up after the initial end-state, at the user's "crush #304
+next" call):**
+- **#304 — CLOSED, MERGED (#307).** Turned out to be much bigger than one bug:
+  the adversarial spec-review DISPROVED the naive post-hoc fix (it leaves phantom
+  upvalues — `new_upvalue` mints the capture before any post-check runs) and
+  specified the correct design — move the 5.5 global/local decision INSIDE
+  `singlevaraux`, per-frame, threading a barrier-slice upper bound. The refactor
+  fixes **four** real 5.5 divergences (captured-local shadowing, global-function
+  precedence, named-vararg shadowing, `global function` phantom capture) + the
+  `_ENV`-rejection cases, and REMOVES the post-hoc barrier arms,
+  `ctc_shadowed_by_global` (the #300 helper, now subsumed), and the
+  `global_function_names` stack. ≤5.4 byte-identical (sha256-proven), #300 CTC
+  cases green, codex APPROVED (all 6 points, no findings), official 44/44. The
+  spec-review paid for itself AGAIN — it caught that #304 was a resolution
+  refactor, not a one-liner, and surfaced 3 extra divergences.
+
 **Parked / documented children (the defensible remainder):**
-- **#304** — 5.5 `global x` fails to shadow a captured regular local (UpVal). The
-  analog of the #300 CTC fix, but for the general resolution path. Fix path is
-  now scoped: generalize `ctc_shadowed_by_global` (lib.rs:3851) to the upvalue
-  case — the hard part is threading the captured local's owner-function + scope
-  level out of `singlevaraux` (the data-flow #300 deliberately avoided as blast
-  radius). A real value-model lane → deep-spec→codex→execute when picked up.
 - **#305** — errno-fidelity residuals split from #301: wasm errno-1 (EPERM) ABI
   encoding, short-write result tuple, Win32→CRT-errno normalization. Edge /
   other-platform; the Darwin-observable bug is fully fixed.
@@ -222,12 +232,12 @@ folding (#303), #301 io/os errno fidelity (#302).
 - **#113** — remaining RSS gap is buffer representation, a separate track from the
   object-header diet (which is exhausted at UpVal per the #296 histogram).
 
-**Release checkpoint (needs the maintainer — irreversible publish):** #301
-carries a **source-breaking** hook-signature change (`Result<_,LuaError>` →
-`io::Result`), CHANGELOG-noted under `[Unreleased]`. A release bundling #298/#299/
-#300/#302 publishes irreversibly to crates.io + npm and must not be done
-autonomously — the version bump (breaking-change → minor under the 0.x line) and
-the publish are the maintainer's call.
+**Release 0.7.0 — PREPPED, awaiting the maintainer (irreversible publish).**
+**PR #306** stages the version bump 0.6.0 → 0.7.0 (breaking-change minor on the
+0.x line, because #301's file-hook signature is source-breaking) + the CHANGELOG,
+bundling **#298/#299/#300/#302/#304**. Tagging the merge SHA `v0.7.0` publishes
+irreversibly to crates.io + npm — the maintainer approved *prepping* the release
+but the tag push is theirs. The supervisor did NOT tag.
 
 **Method notes (for the harness retrospective):** the supervisor+subagent +
 codex-loop pattern held up across 4 parallel lanes. Every codex round earned its
