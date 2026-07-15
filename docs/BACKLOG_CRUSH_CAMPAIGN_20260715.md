@@ -140,10 +140,37 @@ on any canary/official flip; codex fix-rounds capped at ~3 with triage
   as the broader RSS-representation tracker — the histogram (#296) showed UpVal
   was the ONLY worth-it box shrink; remaining RSS gap is buffer representation,
   a separate track.
-- **#278 embedding-API grab-bag — in fix-round (PR #299).** register_c_function
-  extraction + dead-code deletions are Codex-clean. The `debug.debug` "0x?"
-  fix via `to_display_string` delegation exposed a real luaL_tolstring fidelity
-  cluster (light-userdata name, `__name` on non-tables, real function address,
-  numeric→string pushed-value contract) + a #276-class missing-gc-check — 6
-  findings sent back as one bounded fix-round; split to its own issue if the
-  luaL_tolstring fidelity can't land clean in one pass.
+- **#278 embedding-API grab-bag — CLOSED, MERGED (#299).** Official 44/44 on
+  branch, codex r3 APPROVED, issue auto-closed.
+  register_c_function extraction + dead-code deletions Codex-clean from r1. The
+  `debug.debug` "0x?" fix via `to_display_string` delegation exposed a real
+  luaL_tolstring fidelity cluster; fixed faithfully in one pass (r1: 6 findings —
+  #276-class gc-check, luaL_tolstring kind lookup, LightC real address,
+  numeric→string slot, upval-count bounds, docs). r2 found the LightC address fix
+  was incomplete (3 divergent pointer resolvers); r2 fix unified them into one
+  `value_identity_pointer` (deleted `value_pointer`/`raw_value_pointer`), so the
+  public handle `to_pointer()` now equals the VM `%p`. r3 APPROVED. Lesson: a
+  "grab-bag" hid a real cross-path pointer-identity contract; the codex loop
+  (3 rounds) is what surfaced it. Kept, not split.
+- **#301 io/os errno fidelity — in fix-round (PR #302).** Root cause confirmed:
+  the FileOpenHook/Remove/Rename type alias was `Result<_, LuaError>`, which
+  structurally can't carry a numeric errno — so every hook had to stringify the
+  io::Error (verbose `(os error N)` Display) and drop `raw_os_error()`, giving
+  errno 0. Fix retypes the hooks to `io::Result` (a source-breaking public API
+  change — accepted for fidelity, CHANGELOG-noted) + an exact `(os error N)`
+  suffix-strip. Codex confirmed the core sound but found a wasm compile break
+  (cfg(wasm32) hooks still on the old signature — the Homebrew-rustc-no-wasm-std
+  gotcha means native build hid it), an `os.remove` errno-corruption (remove_dir
+  clobbers the real unlink error), a still-reachable `unwrap_or(0)` fallback
+  (no-fallback-rule violation), and a 5.1 io.input wording gap → fix-round.
+- **#300 `<const>` compile-time-const folding — spec + execution dispatched
+  (PR pending).** Deep-spec → adversarial-codex → execute (value-model workflow).
+  The spec review PAID OFF: v1 assumed the port had all VCONST plumbing and just
+  needed two functions wired; codex found two CRITICAL prerequisites — (1)
+  `FuncState` can't reach `DynData.actvar`, so discharge can't read `const_val`
+  (needs an `ExprPayload` const snapshot), and (2) codegen uses `nactvar` as the
+  register watermark, but a folded const bumps `nactvar` without a register (needs
+  `nvarstack`/reglevel decoupling — a real refactor). Spec v2
+  (`specs/ISSUE_300_CONST_FOLDING_SPEC.md`) folds in all 6 findings + the GC
+  verdict (no UAF — the loader stops GC over the whole parse window). Executing
+  the watermark refactor as a standalone byte-identical step FIRST, then folding.
