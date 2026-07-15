@@ -4,59 +4,73 @@ use crate::value::LuaValue;
 use crate::StackIdx;
 use std::cell::Cell;
 
+/// Open/closed state of an [`UpVal`], stored in a single [`Cell`].
+///
+/// The open and closed states are mutually exclusive, so overlapping their
+/// storage in one enum keeps the payload at 24 bytes — `GcBox<UpVal>` = 48,
+/// one libmalloc size-class below the 56-byte three-`Cell` layout it replaces
+/// (#113 candidate 1: the 56→48 crossing drops the box from the 64-byte class
+/// into the 48-byte class). `Open` carries the owning thread id as a full
+/// `u64`; thread ids come from a globally monotonic, never-reused `u64`
+/// counter, so the domain must not be narrowed. `idx` is the stack slot the
+/// open upvalue refers to (the stack reallocates, so it is held by index).
+/// `Closed` owns the value.
+#[derive(Debug, Clone, Copy)]
+enum UpValState {
+    Open { thread_id: u64, idx: u32 },
+    Closed(LuaValue),
+}
+
 /// A closure upvalue. Open upvalues point at a slot on a thread's stack
 /// (referred to by index, since the stack reallocates). Closed upvalues
 /// own the value.
 ///
-/// State lives entirely in three `Cell` fields and is single-source-of-truth.
-/// `open_thread_id` doubles as the open/closed discriminant: a non-negative
-/// value is the owning thread id of an open upvalue; the [`CLOSED_TAG`]
-/// sentinel (`-1`) means the upvalue is closed and its payload is in
-/// `closed_value`. Valid thread ids are non-negative (the main thread is id 0),
-/// so the sentinel is unambiguous. `open_idx` is the stack slot of an open
-/// upvalue. Closing is terminal — there is no re-open path — so a `CLOSED_TAG`
-/// tag never reverts.
+/// State lives entirely in one [`Cell<UpValState>`] and is
+/// single-source-of-truth. Closing is terminal — there is no re-open path — so
+/// the state never reverts from `Closed` back to `Open`.
 ///
 /// Read the open shape with [`try_open_payload`](UpVal::try_open_payload)
 /// (`None` once closed) and the closed payload with
 /// [`closed_value`](UpVal::closed_value) / [`try_closed_value`](UpVal::try_closed_value).
-/// The all-`Cell` layout lets `state.rs::upvalue_get` / `upvalue_set`
-/// short-circuit the Open path with zero borrow-guard overhead, which is the
-/// dominant cost in fibonacci-class recursion benchmarks.
+/// The `Cell` layout lets `state.rs::upvalue_get` / `upvalue_set` short-circuit
+/// the Open path with zero borrow-guard overhead, which is the dominant cost in
+/// fibonacci-class recursion benchmarks.
 #[derive(Debug)]
 pub struct UpVal {
-    open_thread_id: Cell<i64>,
-    open_idx: Cell<u32>,
-    closed_value: Cell<LuaValue>,
+    state: Cell<UpValState>,
 }
 
-/// Sentinel placed in `open_thread_id` once the upvalue has been closed.
-/// Valid thread ids are non-negative (the main thread is id 0), so -1 is
-/// unambiguous.
-const CLOSED_TAG: i64 = -1;
+/// `UpVal` is a GC-boxed hot object; every byte multiplies across the live
+/// upvalue population (≈100k on closure_ops). The tagged-`Cell` layout keeps
+/// the payload at 24 bytes so `GcBox<UpVal>` is 48 bytes — one libmalloc class
+/// below the previous 56. Gated to 64-bit because the byte count is a
+/// pointer-width claim (the wasm32 build has a 32-bit layout).
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<UpVal>() == 24);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<lua_gc::GcBox<UpVal>>() == 48);
 
 impl UpVal {
     pub fn open(thread_id: usize, idx: StackIdx) -> Self {
         UpVal {
-            open_thread_id: Cell::new(thread_id as i64),
-            open_idx: Cell::new(idx.0),
-            closed_value: Cell::new(LuaValue::Nil),
+            state: Cell::new(UpValState::Open {
+                thread_id: thread_id as u64,
+                idx: idx.0,
+            }),
         }
     }
 
     pub fn closed(v: LuaValue) -> Self {
         UpVal {
-            open_thread_id: Cell::new(CLOSED_TAG),
-            open_idx: Cell::new(0),
-            closed_value: Cell::new(v),
+            state: Cell::new(UpValState::Closed(v)),
         }
     }
 
     pub fn is_open(&self) -> bool {
-        self.open_thread_id.get() >= 0
+        matches!(self.state.get(), UpValState::Open { .. })
     }
     pub fn is_closed(&self) -> bool {
-        self.open_thread_id.get() < 0
+        matches!(self.state.get(), UpValState::Closed(_))
     }
 
     /// Zero-overhead read of the open shape used by `upvalue_get` /
@@ -65,38 +79,36 @@ impl UpVal {
     /// upvalue is still open, `None` once it has been closed.
     #[inline(always)]
     pub fn try_open_payload(&self) -> Option<(usize, StackIdx)> {
-        let tid = self.open_thread_id.get();
-        if tid < 0 {
-            None
-        } else {
-            Some((tid as usize, StackIdx(self.open_idx.get())))
+        match self.state.get() {
+            UpValState::Open { thread_id, idx } => Some((thread_id as usize, StackIdx(idx))),
+            UpValState::Closed(_) => None,
         }
     }
 
     /// Returns the closed-side value. Callers must have confirmed the
-    /// upvalue is closed (`try_open_payload` returned `None`).
+    /// upvalue is closed (`try_open_payload` returned `None`); an open upvalue
+    /// reports [`LuaValue::Nil`], matching the value its closed slot held under
+    /// the previous layout.
     #[inline(always)]
     pub fn closed_value(&self) -> LuaValue {
-        self.closed_value.get()
+        match self.state.get() {
+            UpValState::Closed(v) => v,
+            UpValState::Open { .. } => LuaValue::Nil,
+        }
     }
 
     pub fn close_with(&self, v: LuaValue) {
-        self.open_thread_id.set(CLOSED_TAG);
-        self.open_idx.set(0);
-        self.closed_value.set(v);
+        self.state.set(UpValState::Closed(v));
     }
 
     pub fn set_closed_value(&self, v: LuaValue) {
-        self.open_thread_id.set(CLOSED_TAG);
-        self.open_idx.set(0);
-        self.closed_value.set(v);
+        self.state.set(UpValState::Closed(v));
     }
 
     pub fn try_closed_value(&self) -> Option<LuaValue> {
-        if self.is_closed() {
-            Some(self.closed_value.get())
-        } else {
-            None
+        match self.state.get() {
+            UpValState::Closed(v) => Some(v),
+            UpValState::Open { .. } => None,
         }
     }
 }
@@ -128,5 +140,14 @@ mod tests {
         assert_eq!(uv.try_closed_value(), Some(LuaValue::Bool(true)));
         assert!(uv.is_closed());
         assert_eq!(uv.try_open_payload(), None);
+    }
+
+    #[test]
+    fn open_upvalue_preserves_full_u64_thread_id() {
+        let big = (u32::MAX as usize).wrapping_add(1234);
+        let uv = UpVal::open(big, StackIdx(9));
+        assert_eq!(uv.try_open_payload(), Some((big, StackIdx(9))));
+        assert!(uv.is_open());
+        assert_eq!(uv.try_closed_value(), None);
     }
 }
