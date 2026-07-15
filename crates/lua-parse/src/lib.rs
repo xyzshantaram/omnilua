@@ -359,6 +359,18 @@ pub struct FuncState {
     pub firstlabel: i32,
     pub ndebugvars: i16,
     pub nactvar: u8,
+    /// The number of active-variable registers actually occupied on the VM
+    /// stack — C's `luaY_nvarstack(fs)` / `reglevel(fs, fs->nactvar)`. Equal to
+    /// `nactvar` while every active variable is a real register-backed local,
+    /// but strictly less once a `<const>` compile-time constant (`RDKCTC`) is in
+    /// scope, since such a variable is counted by `nactvar` yet consumes no
+    /// register. This is the watermark every register-bound codegen helper
+    /// (`cg_free_reg`, `cg_exp_to_any_reg`, `cg_free_reg_if_temp`) must compare
+    /// against instead of `nactvar`; it is maintained by `adjust_local_vars`
+    /// and `remove_vars` (the only sites that grow/shrink the active set) so it
+    /// is readable from `FuncState`-only contexts that cannot reach `LexState`'s
+    /// `dyd.actvar` to recompute `reglevel`.
+    pub nactvar_reg: u8,
     pub first_scope_barrier: usize,
     pub nups: u8,
     pub freereg: u8,
@@ -724,13 +736,16 @@ fn reserve_regs(fs: &mut FuncState, n: i32) -> Result<(), LuaError> {
     Ok(())
 }
 
-/// Free `reg` if it sits above the active-local watermark.
+/// Free `reg` if it sits above the active-local register watermark.
 ///
-/// Mirrors C's `freereg` from `lcode.c`: registers below `nactvar` belong to
-/// declared locals and must not be popped; temporaries above that watermark
-/// are freed by decrementing `fs.freereg`.
+/// Mirrors C's `freereg` from `lcode.c`: registers below `luaY_nvarstack(fs)`
+/// belong to register-backed declared locals and must not be popped;
+/// temporaries above that watermark are freed by decrementing `fs.freereg`.
+/// The watermark is [`FuncState::nactvar_reg`], not `nactvar`, so a `<const>`
+/// compile-time constant (which `nactvar` counts but occupies no register)
+/// does not make a temporary look like a local.
 fn cg_free_reg(fs: &mut FuncState, reg: i32) {
-    if reg >= fs.nactvar as i32 {
+    if reg >= fs.nactvar_reg as i32 {
         debug_assert_eq!(reg, fs.freereg as i32 - 1);
         fs.freereg = fs.freereg.saturating_sub(1);
     }
@@ -2119,15 +2134,16 @@ fn clear_arg_table_needed(fs: &mut FuncState) {
 }
 
 /// Minimal `luaK_exp2anyreg`: ensure `e` ends up in *some* register. If `e`
-/// is already `VNONRELOC` and its register is at or above `nactvar`, keep it
-/// there; otherwise discharge to the next free register.
+/// is already `VNONRELOC` and its register is at or above the register
+/// watermark ([`FuncState::nactvar_reg`], = `luaY_nvarstack`), keep it there;
+/// otherwise discharge to the next free register.
 fn cg_exp_to_any_reg(fs: &mut FuncState, line: i32, e: &mut ExprDesc) -> Result<u8, LuaError> {
     cg_discharge_vars(fs, line, e)?;
     if e.k == ExprKind::NonReloc {
         if e.t == NO_JUMP && e.f == NO_JUMP {
             return Ok(e.u.info as u8);
         }
-        if e.u.info >= fs.nactvar as i32 {
+        if e.u.info >= fs.nactvar_reg as i32 {
             cg_exp_to_reg(fs, line, e, e.u.info as u8)?;
             return Ok(e.u.info as u8);
         }
@@ -2610,10 +2626,11 @@ fn cg_exp_to_reg(fs: &mut FuncState, line: i32, e: &mut ExprDesc, reg: u8) -> Re
 }
 
 /// Like `cg_free_reg`, but only acts when the index actually belongs to a
-/// temporary register (one above `fs.nactvar`). Used by indexed-get
-/// dischargers, which may operate on either a temp result or a local.
+/// temporary register (one at or above the register watermark
+/// [`FuncState::nactvar_reg`]). Used by indexed-get dischargers, which may
+/// operate on either a temp result or a local.
 fn cg_free_reg_if_temp(fs: &mut FuncState, reg: i32) {
-    if reg >= fs.nactvar as i32 {
+    if reg >= fs.nactvar_reg as i32 {
         debug_assert!(reg < fs.freereg as i32);
         if reg == fs.freereg as i32 - 1 {
             fs.freereg -= 1;
@@ -3045,6 +3062,11 @@ fn adjust_local_vars(ls: &mut LexState, state: &mut LuaState, nvars: i32) -> Res
             // No variable name: not expected in valid source.
         }
     }
+    // Every variable adjusted here is register-backed (a `<const>` CTC is
+    // folded before this runs and excluded from the count), so the register
+    // watermark advances to the level reached after placing them. This mirrors
+    // `reg_level(ls, fs, fs.nactvar)` without re-walking `dyd.actvar`.
+    ls.fs.as_mut().unwrap().nactvar_reg = reglevel_val as u8;
     Ok(())
 }
 
@@ -3087,6 +3109,11 @@ fn remove_vars(ls: &mut LexState, fs: &mut FuncState, tolevel: i32) {
         let new_len = ls.dyd.actvar.len().saturating_sub(delta as usize);
         ls.dyd.actvar.truncate(new_len);
     }
+    // The active set shrank; recompute the register watermark from the
+    // surviving descriptors (which are still present below `tolevel`). This
+    // keeps `nactvar_reg == reg_level(ls, fs, fs.nactvar)` after any CTC that
+    // was in scope is dropped.
+    fs.nactvar_reg = reg_level(ls, fs, fs.nactvar as i32) as u8;
 }
 
 // ── §4 Upvalue handling ──────────────────────────────────────────────────────
@@ -4279,6 +4306,7 @@ fn open_func(
     new_fs.nups = 0;
     new_fs.ndebugvars = 0;
     new_fs.nactvar = 0;
+    new_fs.nactvar_reg = 0;
     new_fs.needclose = false;
 
     new_fs.firstlocal = ls.dyd.actvar.len() as i32;
@@ -4740,6 +4768,7 @@ fn body(
         firstlabel: 0,
         ndebugvars: 0,
         nactvar: 0,
+        nactvar_reg: 0,
         first_scope_barrier: ls.scope_barriers.len(),
         nups: 0,
         freereg: 0,
@@ -6361,6 +6390,7 @@ pub fn parse(
         firstlabel: 0,
         ndebugvars: 0,
         nactvar: 0,
+        nactvar_reg: 0,
         first_scope_barrier: 0,
         nups: 0,
         freereg: 0,
@@ -6419,6 +6449,7 @@ mod tests {
             firstlabel: 0,
             ndebugvars: 0,
             nactvar: 0,
+            nactvar_reg: 0,
             first_scope_barrier: 0,
             nups: 0,
             freereg: 0,
