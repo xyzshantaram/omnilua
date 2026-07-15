@@ -198,5 +198,3 @@ fn f4_account_buffer_on_swept_box_panics() {
     heap.full_collect(&NoRoots);
     strong.account_buffer(64);
 }
-
-// PORT STATUS: complete — stale_handle_kit for issue #267 owner-identity work.
