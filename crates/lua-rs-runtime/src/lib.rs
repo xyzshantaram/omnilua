@@ -3928,29 +3928,17 @@ fn integer_out_of_range_error() -> Error {
     Error::from(LuaError::runtime(format_args!("integer out of range")))
 }
 
-/// The object identity of a reference-typed raw value, as a `usize` token —
-/// the same mapping `lua_topointer` uses. Reference types (string, table,
-/// function, userdata, thread, light userdata) yield `Some`; the value types
-/// (nil, boolean, integer, number) yield `None` because they have no identity.
-fn raw_value_pointer(raw: &RawLuaValue) -> Option<usize> {
-    match raw {
-        RawLuaValue::Function(RawLuaClosure::LightC(f)) => Some(*f as usize),
-        RawLuaValue::LightUserData(p) => Some(*p as usize),
-        RawLuaValue::Str(s) => Some(GcRef::identity(s)),
-        RawLuaValue::Table(t) => Some(GcRef::identity(t)),
-        RawLuaValue::Function(RawLuaClosure::Lua(f)) => Some(GcRef::identity(f)),
-        RawLuaValue::Function(RawLuaClosure::C(f)) => Some(GcRef::identity(f)),
-        RawLuaValue::UserData(u) => Some(GcRef::identity(u)),
-        RawLuaValue::Thread(t) => Some(GcRef::identity(t)),
-        _ => None,
-    }
-}
-
-/// Resolve a handle's underlying object identity. Errors only if the rooted
-/// value is somehow not a reference type, which would mean a corrupted handle.
+/// Resolve a handle's underlying object identity (`lua_topointer`) through the
+/// single state-aware [`lua_vm::api::value_identity_pointer`] resolver, so an
+/// embedding handle reports the same address the VM's own `tostring` / `%p` do
+/// — in particular a light C function's real code address, not the registry
+/// index. Errors only if the rooted value is somehow not a reference type,
+/// which would mean a corrupted handle.
 fn handle_pointer(root: &RootedValue, expected: &str) -> Result<usize> {
     let raw = root.raw()?;
-    raw_value_pointer(&raw).ok_or_else(|| type_error_raw(&raw, expected))
+    root.lua
+        .with_state(|state| lua_vm::api::value_identity_pointer(state, &raw))
+        .ok_or_else(|| type_error_raw(&raw, expected))
 }
 
 impl Table {

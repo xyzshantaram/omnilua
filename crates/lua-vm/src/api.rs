@@ -898,12 +898,23 @@ impl LuaState {
     }
 }
 
-/// Opaque identity pointer for a `LuaValue`, mirroring `to_pointer` but keyed on
-/// the value rather than a stack index. Returns `None` for value-typed values
-/// that have no identity (nil, bool, numbers).
-fn value_pointer(o: &LuaValue) -> Option<usize> {
+/// The object-identity token for a `LuaValue`, mirroring `lua_topointer`.
+/// Reference types (string, table, function, userdata, thread, light userdata)
+/// yield `Some`; the value types (nil, boolean, numbers) yield `None`.
+///
+/// A light C function resolves to its registered bare `fn`'s real code address
+/// via the per-state `c_functions` table — never the tiny registry index. This
+/// is the **single** resolver behind `api::to_pointer`, `display_default_bytes`,
+/// and the public `omnilua` `*::to_pointer` handles, so every path prints the
+/// same address for the same value.
+pub fn value_identity_pointer(state: &LuaState, o: &LuaValue) -> Option<usize> {
     match o {
-        LuaValue::Function(LuaClosure::LightC(f)) => Some(*f as usize),
+        LuaValue::Function(LuaClosure::LightC(f)) => state
+            .global()
+            .c_functions
+            .get(*f)
+            .and_then(|c| c.as_bare())
+            .map(|fp| fp as usize),
         LuaValue::LightUserData(p) => Some(*p as usize),
         LuaValue::Str(s) => Some(GcRef::identity(s)),
         LuaValue::Table(t) => Some(GcRef::identity(t)),
@@ -934,7 +945,7 @@ fn display_default_bytes(
         LuaValue::Nil => Ok(b"nil".to_vec()),
         _ => {
             let kind = crate::tagmethods::obj_type_name(state, val)?;
-            let ptr = value_pointer(val).unwrap_or(0);
+            let ptr = value_identity_pointer(state, val).unwrap_or(0);
             let mut buf = kind;
             buf.extend_from_slice(b": 0x");
             buf.extend_from_slice(format!("{:x}", ptr).as_bytes());
@@ -1134,26 +1145,12 @@ pub fn to_thread(state: &LuaState, idx: i32) -> Option<GcRef<lua_types::value::L
     }
 }
 
-// Returns a usize (opaque GC identity) rather than a raw void*, since raw
-// pointers are only allowed in lua-gc / lua-coro.
+/// C's `lua_topointer` keyed on a stack index. Returns a `usize` identity token
+/// (raw void* pointers are confined to lua-gc / lua-coro). Delegates to the
+/// single [`value_identity_pointer`] resolver.
 pub fn to_pointer(state: &LuaState, idx: i32) -> Option<usize> {
     let o = index_to_value(state, idx);
-    match &o {
-        LuaValue::Function(LuaClosure::LightC(f)) => state
-            .global()
-            .c_functions
-            .get(*f)
-            .and_then(|c| c.as_bare())
-            .map(|fp| fp as usize),
-        LuaValue::LightUserData(p) => Some(*p as usize),
-        LuaValue::Str(s) => Some(GcRef::identity(s)),
-        LuaValue::Table(t) => Some(GcRef::identity(t)),
-        LuaValue::Function(LuaClosure::Lua(f)) => Some(GcRef::identity(f)),
-        LuaValue::Function(LuaClosure::C(f)) => Some(GcRef::identity(f)),
-        LuaValue::UserData(u) => Some(GcRef::identity(u)),
-        LuaValue::Thread(t) => Some(GcRef::identity(t)),
-        _ => None,
-    }
+    value_identity_pointer(state, &o)
 }
 
 // ── push functions (Rust → stack) ────────────────────────────────────────────
@@ -1216,6 +1213,14 @@ pub fn push_fstring(state: &mut LuaState, formatted: &[u8]) -> Result<GcRef<LuaS
     push_vfstring(state, formatted)
 }
 
+/// C's `lua_pushcclosure`: register `f`, then push either a light C function
+/// (`n == 0`) or a C closure that captures the top `n` stack values as
+/// upvalues.
+///
+/// The `n > 0` branch builds the closure inline rather than delegating to
+/// `state.new_c_closure`, because it must *populate* the upvalue slots from the
+/// stack; `new_c_closure` only performs the object step (nil-initialised
+/// upvalues), leaving the stack fill to the caller.
 pub fn push_cclosure(
     state: &mut LuaState,
     f: fn(&mut LuaState) -> Result<usize, LuaError>,
@@ -1238,9 +1243,6 @@ pub fn push_cclosure(
             upvalues.push(state.get_at(crate::state::StackIdx((base + i) as u32)));
         }
         state.pop_n(n_usize);
-        // Constructs the closure directly rather than through
-        // state.new_c_closure, which is unimplemented and errors out pointing
-        // callers back to push_cclosure.
         let cl = LuaClosure::C(GcRef::new(lua_types::closure::LuaCClosure {
             func: idx,
             upvalues: std::cell::RefCell::new(upvalues),
