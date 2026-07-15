@@ -12,7 +12,7 @@ use crate::prelude::*;
 use std::convert::Infallible;
 
 use crate::state::{
-    FinalizerObject, LuaCFunction, LuaCallable, LuaState, LuaTableRefExt, LuaTypeExt,
+    FinalizerObject, LuaCFunction, LuaState, LuaTableRefExt, LuaTypeExt,
     LuaUserDataRefExt, LuaValueExt, StackIdx, StackIdxExt, WeakTableEntry,
 };
 use lua_types::value::LuaTable;
@@ -302,6 +302,10 @@ pub fn rotate(state: &mut LuaState, idx: i32, n: i32) {
     reverse_segment(state, p, t);
 }
 
+/// C's `lua_copy`: copy the value at `fromidx` into `toidx` (a stack slot or a
+/// function-upvalue pseudo-index). Copying *to* `LUA_REGISTRYINDEX` is
+/// intentionally a no-op — C would replace the whole `l_registry` table, a
+/// footgun no real embedder uses (issue #278).
 pub fn copy(state: &mut LuaState, fromidx: i32, toidx: i32) {
     let fr = index_to_value(state, fromidx);
     if is_upvalue(toidx) {
@@ -1186,31 +1190,7 @@ pub fn push_cclosure(
     f: fn(&mut LuaState) -> Result<usize, LuaError>,
     n: i32,
 ) -> Result<(), LuaError> {
-    // `LuaClosure::LightC` and `LuaCClosure` carry a `LuaCFnPtr`
-    // (a `usize` index into `GlobalState.c_functions`) rather than the raw
-    // function pointer, because lua-types cannot reference `LuaState`. We
-    // register `f` in the per-state registry and store the resulting index.
-    let idx: lua_types::closure::LuaCFnPtr = {
-        let mut g = state.global_mut();
-        if n == 0 {
-            match g.c_functions.iter().position(|existing| {
-                existing
-                    .as_bare()
-                    .is_some_and(|existing| std::ptr::fn_addr_eq(existing, f))
-            }) {
-                Some(i) => i,
-                None => {
-                    let i = g.c_functions.len();
-                    g.c_functions.push(LuaCallable::bare(f));
-                    i
-                }
-            }
-        } else {
-            let i = g.c_functions.len();
-            g.c_functions.push(LuaCallable::bare(f));
-            i
-        }
-    };
+    let idx: lua_types::closure::LuaCFnPtr = state.register_c_function(f, n == 0);
     if n == 0 {
         state.push(LuaValue::Function(LuaClosure::LightC(idx)));
     } else {
@@ -2510,6 +2490,11 @@ pub fn next(state: &mut LuaState, idx: i32) -> Result<bool, LuaError> {
     }
 }
 
+/// C's `lua_toclose`: mark the value at `idx` as a to-be-closed slot. Host-only
+/// stub — scripts get `<close>` semantics through the VM's `OP_TBC` path, which
+/// is not routed through this C-API surface, so this only validates the index
+/// and does nothing else. See `docs/EMBEDDING_API_IMPLEMENTATION.md` "Known
+/// Limits" (issue #278).
 pub fn to_close(state: &mut LuaState, idx: i32) -> Result<(), LuaError> {
     let _level = index_to_stack_idx(state, idx);
     Ok(())

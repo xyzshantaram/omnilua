@@ -3245,17 +3245,70 @@ impl LuaState {
     pub fn intern_or_create_str(&mut self, bytes: &[u8]) -> Result<GcRef<LuaString>, LuaError> {
         self.intern_str(bytes)
     }
+    /// Allocates a full userdata with `size` payload bytes and `nuvalue` nil
+    /// user-value slots, returning the `GcRef` without pushing it. Mirrors C's
+    /// `lua_newuserdatauv` allocation step; the untyped counterpart of
+    /// [`Self::new_userdata_typed`] (no `__name`-carrying metatable is
+    /// attached). Callers such as `api::new_userdata_uv` push the result and run
+    /// the GC step.
     pub fn new_userdata(
         &mut self,
-        _size: usize,
-        _nuvalue: usize,
+        size: usize,
+        nuvalue: usize,
     ) -> Result<GcRef<LuaUserData>, LuaError> {
-        Err(LuaError::runtime(format_args!(
-            "new_userdata not implemented in this Phase-B build; use new_userdata_typed instead"
-        )))
+        debug_assert!(nuvalue < u16::MAX as usize, "invalid value");
+        let u = GcRef::new(LuaUserData {
+            data: vec![0u8; size].into_boxed_slice(),
+            uv: std::cell::RefCell::new(vec![LuaValue::Nil; nuvalue]),
+            metatable: std::cell::RefCell::new(None),
+            host_value: std::cell::RefCell::new(None),
+        });
+        u.account_buffer(u.buffer_bytes() as isize);
+        Ok(u)
     }
-    pub fn new_c_closure(&mut self, _f: LuaCFunction, _n: i32) -> Result<LuaClosure, LuaError> {
-        Err(LuaError::runtime(format_args!("new_c_closure not implemented in this Phase-B build; use push_cclosure in lua_vm::api instead")))
+
+    /// Registers a C function pointer `f` in the per-state `c_functions` table
+    /// and returns its `LuaCFnPtr` index. `LuaClosure::LightC`/`LuaCClosure`
+    /// carry this index rather than a raw pointer because `lua_types` cannot
+    /// reference `LuaState`. When `dedup` is set (upvalue-less light C
+    /// functions) an already-registered identical `f` is reused; otherwise a
+    /// fresh slot is always allocated, since closures with upvalues must not
+    /// share identity.
+    pub fn register_c_function(&mut self, f: LuaCFunction, dedup: bool) -> LuaCFnPtr {
+        let mut g = self.global_mut();
+        if dedup {
+            if let Some(i) = g.c_functions.iter().position(|existing| {
+                existing
+                    .as_bare()
+                    .is_some_and(|existing| std::ptr::fn_addr_eq(existing, f))
+            }) {
+                return i;
+            }
+        }
+        let i = g.c_functions.len();
+        g.c_functions.push(LuaCallable::bare(f));
+        i
+    }
+
+    /// Creates a C closure over `f` with `n` (nil-initialised) upvalue slots and
+    /// returns it without pushing. Mirrors `lua_pushcclosure`'s object step:
+    /// `n == 0` yields a light C function, `n > 0` a full C closure. The stack
+    /// filling of upvalues is the caller's responsibility (see
+    /// `api::push_cclosure`).
+    pub fn new_c_closure(&mut self, f: LuaCFunction, n: i32) -> Result<LuaClosure, LuaError> {
+        debug_assert!(n >= 0, "upvalue count must be non-negative");
+        let idx = self.register_c_function(f, n == 0);
+        if n == 0 {
+            return Ok(LuaClosure::LightC(idx));
+        }
+        let cl = LuaClosure::C(GcRef::new(lua_types::closure::LuaCClosure {
+            func: idx,
+            upvalues: std::cell::RefCell::new(vec![LuaValue::Nil; n as usize]),
+        }));
+        if let LuaClosure::C(ccl) = &cl {
+            ccl.account_buffer(ccl.buffer_bytes() as isize);
+        }
+        Ok(cl)
     }
     pub fn push_closure(
         &mut self,
@@ -6525,6 +6578,111 @@ mod tests {
 
     fn test_noop_cclosure(_: &mut LuaState) -> Result<usize, LuaError> {
         Ok(0)
+    }
+
+    /// Issue #278: `new_userdata` (the untyped `lua_newuserdatauv` allocation
+    /// step) builds a real full userdata rather than erroring. It carries
+    /// `size` payload bytes, `nuvalue` nil user-value slots, and no metatable.
+    #[test]
+    fn new_userdata_builds_untyped_full_userdata() {
+        let mut state = new_state().expect("state should initialize");
+        let _heap_guard = {
+            let g = state.global();
+            lua_gc::HeapGuard::push(&g.heap)
+        };
+        let ud = state
+            .new_userdata(16, 2)
+            .expect("new_userdata should build, not error");
+        assert_eq!(ud.data.len(), 16);
+        assert_eq!(ud.uv.borrow().len(), 2);
+        assert!(ud.uv.borrow().iter().all(|v| matches!(v, LuaValue::Nil)));
+        assert!(ud.metatable.borrow().is_none());
+    }
+
+    /// Issue #278: `new_c_closure` builds a light C function for `n == 0` and a
+    /// full C closure with `n` nil upvalue slots for `n > 0`, rather than
+    /// erroring.
+    #[test]
+    fn new_c_closure_builds_light_and_full_closures() {
+        let mut state = new_state().expect("state should initialize");
+        let _heap_guard = {
+            let g = state.global();
+            lua_gc::HeapGuard::push(&g.heap)
+        };
+        let light = state
+            .new_c_closure(test_noop_cclosure, 0)
+            .expect("light closure should build");
+        assert!(
+            matches!(light, LuaClosure::LightC(_)),
+            "n==0 must yield a light C function"
+        );
+
+        let full = state
+            .new_c_closure(test_noop_cclosure, 3)
+            .expect("full closure should build");
+        match full {
+            LuaClosure::C(ccl) => {
+                let ups = ccl.upvalues.borrow();
+                assert_eq!(ups.len(), 3);
+                assert!(ups.iter().all(|v| matches!(v, LuaValue::Nil)));
+            }
+            _ => panic!("n>0 must yield a full C closure"),
+        }
+    }
+
+    /// Issue #278: `register_c_function` reuses an identical function's slot
+    /// when `dedup` is set (the upvalue-less fast path) and always allocates a
+    /// fresh slot otherwise (closures with upvalues must not share identity).
+    #[test]
+    fn register_c_function_dedups_only_when_requested() {
+        let mut state = new_state().expect("state should initialize");
+        let _heap_guard = {
+            let g = state.global();
+            lua_gc::HeapGuard::push(&g.heap)
+        };
+        let a = state.register_c_function(test_noop_cclosure, true);
+        let b = state.register_c_function(test_noop_cclosure, true);
+        assert_eq!(a, b, "dedup=true should reuse the identical fn's slot");
+        let c = state.register_c_function(test_noop_cclosure, false);
+        assert_ne!(a, c, "dedup=false must always allocate a fresh slot");
+    }
+
+    /// Issue #278: `to_display_string` (C's `luaL_tolstring`; the single
+    /// stringifier `auxlib::to_lua_string`, `tostring`, `print` and
+    /// `debug.debug` all route through) must render a table with its real
+    /// per-value address, never the old fixed `"0x?"` placeholder, and two
+    /// distinct tables must render distinct addresses.
+    #[test]
+    fn to_display_string_renders_distinct_real_table_addresses() {
+        let mut state = new_state().expect("state should initialize");
+        let _heap_guard = {
+            let g = state.global();
+            lua_gc::HeapGuard::push(&g.heap)
+        };
+
+        let t1 = state.new_table();
+        state.push(LuaValue::Table(t1));
+        let s1 = state
+            .to_display_string(-1)
+            .expect("to_display_string on table 1");
+
+        let t2 = state.new_table();
+        state.push(LuaValue::Table(t2));
+        let s2 = state
+            .to_display_string(-1)
+            .expect("to_display_string on table 2");
+
+        assert!(
+            s1.starts_with(b"table: 0x"),
+            "expected a real address, got {:?}",
+            String::from_utf8_lossy(&s1)
+        );
+        assert!(
+            !s1.windows(3).any(|w| w == b"0x?"),
+            "the fixed '0x?' placeholder must be gone, got {:?}",
+            String::from_utf8_lossy(&s1)
+        );
+        assert_ne!(s1, s2, "two distinct tables must render distinct addresses");
     }
 
     /// Issue #275 item 2 + item 3: the version-dependent numeric registry
