@@ -218,14 +218,12 @@ the current surface:
   The Rust-native API is complete for pure Lua scripts; these gaps only affect a
   host driving the raw `lua-vm::api` / `state_stub` surface directly, and are
   either niche or architecturally constrained:
-  - `to_close` / `close_slot` are no-ops. Scripts get to-be-closed (`<close>`)
-    variables through the VM's `OP_TBC` path, which is fully implemented; the
-    *host* `lua_toclose`-equivalent is not wired into that TBC machinery (it
-    needs the whole to-be-closed-through-C-API path).
-  - `to_cfunction` always returns `None`. `LightC` / C closures carry an index
-    into the per-state `c_functions` table rather than a raw `fn` pointer
-    (`lua-types` cannot name `LuaState`), so `lua_tocfunction`'s exact shape
-    cannot be handed back as-is.
+  - `to_close` marks a to-be-closed slot but does nothing; `close_slot`
+    **clears** its slot (sets it to nil) but does **not** run the value's
+    `__close`. Scripts get full to-be-closed (`<close>`) semantics through the
+    VM's `OP_TBC` path; the *host* `lua_toclose`/`lua_closeslot` equivalents are
+    not wired into that TBC machinery (it needs the whole
+    to-be-closed-through-C-API path).
   - `to_thread` yields an identity-only `LuaThread` handle (`id: u64`), not the
     rich `lua-vm` coroutine object, for the same `lua-types`/`LuaState` layering
     reason. The stdlib coroutine library resolves the id through the thread

@@ -29,7 +29,7 @@ const LUA_MULTRET: i32 = -1;
 
 const LUA_RIDX_GLOBALS: i64 = 2;
 
-const MAX_UPVAL: u8 = 255;
+pub(crate) const MAX_UPVAL: u8 = 255;
 
 #[inline]
 fn is_pseudo(idx: i32) -> bool {
@@ -265,6 +265,11 @@ pub fn set_top(state: &mut LuaState, idx: i32) -> Result<(), LuaError> {
     Ok(())
 }
 
+/// C's `lua_closeslot`: this **clears** the slot at `idx` (sets it to nil), but
+/// does **not** invoke the value's `__close` metamethod — a destructive but
+/// incomplete stand-in. The host-side to-be-closed path is not wired into the
+/// VM's TBC machinery (issue #278); scripts still get full `<close>` semantics
+/// via `OP_TBC`.
 pub fn close_slot(state: &mut LuaState, idx: i32) -> Result<(), LuaError> {
     let level = index_to_stack_idx(state, idx);
     state.set_at(level, LuaValue::Nil);
@@ -428,7 +433,7 @@ impl LuaState {
             LuaValue::UserData(u) => u.metatable(),
             _ => self.global().mt[v.base_type() as usize].clone(),
         };
-        if let Some(mt_ref) = mt {
+        if let Some(mt_ref) = mt.as_ref() {
             let key = self.intern_str(b"__tostring")?;
             let f = mt_ref.get_short_str(&key);
             if !matches!(f, LuaValue::Nil) {
@@ -450,9 +455,13 @@ impl LuaState {
                     lua_types::LuaVersion::V51 | lua_types::LuaVersion::V52
                 );
                 if matches!(result, LuaValue::Int(_) | LuaValue::Float(_)) {
-                    return Ok(crate::object::num_to_string(self, &result)?
-                        .as_bytes()
-                        .to_vec());
+                    let s = crate::object::num_to_string(self, &result)?;
+                    let out = s.as_bytes().to_vec();
+                    if !matches!(self.global().lua_version, lua_types::LuaVersion::V51) {
+                        let slot = StackIdx(top.0 - 1);
+                        self.set_at(slot, LuaValue::Str(s));
+                    }
+                    return Ok(out);
                 }
                 if legacy_no_check {
                     let display_idx = StackIdx(top.0 - 1).0 as i32;
@@ -488,7 +497,21 @@ impl LuaState {
                 b"nil".to_vec()
             }
             _ => {
-                let kind = crate::tagmethods::obj_type_name(self, &v)?;
+                let named = if self.global().lua_version.honors_name_metafield() {
+                    match &mt {
+                        Some(mt_ref) => match mt_ref.get_str_bytes(b"__name") {
+                            LuaValue::Str(s) => Some(s.as_bytes().to_vec()),
+                            _ => None,
+                        },
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                let kind: Vec<u8> = match named {
+                    Some(n) => n,
+                    None => crate::tagmethods::type_name(v.base_type()).to_vec(),
+                };
                 let ptr = to_pointer(self, abs).unwrap_or(0);
                 let mut buf = kind;
                 buf.extend_from_slice(b": 0x");
@@ -1062,18 +1085,21 @@ pub fn raw_len(state: &LuaState, idx: i32) -> u64 {
     }
 }
 
+/// C's `lua_tocfunction`: the underlying bare C function pointer for a light C
+/// function or a C closure, or `None` for any other value. `LightC`/`LuaCClosure`
+/// store a `LuaCFnPtr` index into the per-state `c_functions` table; resolve it
+/// and hand back the registered `fn`.
 pub fn to_cfunction(
     state: &LuaState,
     idx: i32,
 ) -> Option<fn(&mut LuaState) -> Result<usize, LuaError>> {
     let o = index_to_value(state, idx);
-    match o {
-        // `LuaClosure::LightC` carries a placeholder `fn() -> i32` until it
-        // can reference `LuaState`, so this always reports no C function.
-        LuaValue::Function(LuaClosure::LightC(_f)) => None,
-        LuaValue::Function(LuaClosure::C(_ccl)) => None,
-        _ => None,
-    }
+    let cfn_idx = match o {
+        LuaValue::Function(LuaClosure::LightC(i)) => i,
+        LuaValue::Function(LuaClosure::C(ccl)) => ccl.func,
+        _ => return None,
+    };
+    state.global().c_functions.get(cfn_idx).and_then(|c| c.as_bare())
 }
 
 #[inline]
@@ -1113,7 +1139,12 @@ pub fn to_thread(state: &LuaState, idx: i32) -> Option<GcRef<lua_types::value::L
 pub fn to_pointer(state: &LuaState, idx: i32) -> Option<usize> {
     let o = index_to_value(state, idx);
     match &o {
-        LuaValue::Function(LuaClosure::LightC(f)) => Some(*f as usize),
+        LuaValue::Function(LuaClosure::LightC(f)) => state
+            .global()
+            .c_functions
+            .get(*f)
+            .and_then(|c| c.as_bare())
+            .map(|fp| fp as usize),
         LuaValue::LightUserData(p) => Some(*p as usize),
         LuaValue::Str(s) => Some(GcRef::identity(s)),
         LuaValue::Table(t) => Some(GcRef::identity(t)),

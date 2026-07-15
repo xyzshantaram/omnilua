@@ -3257,6 +3257,7 @@ impl LuaState {
         nuvalue: usize,
     ) -> Result<GcRef<LuaUserData>, LuaError> {
         debug_assert!(nuvalue < u16::MAX as usize, "invalid value");
+        self.mark_gc_check_needed();
         let u = GcRef::new(LuaUserData {
             data: vec![0u8; size].into_boxed_slice(),
             uv: std::cell::RefCell::new(vec![LuaValue::Nil; nuvalue]),
@@ -3295,12 +3296,22 @@ impl LuaState {
     /// `n == 0` yields a light C function, `n > 0` a full C closure. The stack
     /// filling of upvalues is the caller's responsibility (see
     /// `api::push_cclosure`).
+    ///
+    /// `n` is validated against `0..=MAX_UPVAL` before anything is registered,
+    /// so an out-of-range count errors without polluting the `c_functions`
+    /// table.
     pub fn new_c_closure(&mut self, f: LuaCFunction, n: i32) -> Result<LuaClosure, LuaError> {
-        debug_assert!(n >= 0, "upvalue count must be non-negative");
+        if n < 0 || n as i64 > crate::api::MAX_UPVAL as i64 {
+            return Err(LuaError::runtime(format_args!(
+                "C closure upvalue count {n} out of range (0..={})",
+                crate::api::MAX_UPVAL
+            )));
+        }
         let idx = self.register_c_function(f, n == 0);
         if n == 0 {
             return Ok(LuaClosure::LightC(idx));
         }
+        self.mark_gc_check_needed();
         let cl = LuaClosure::C(GcRef::new(lua_types::closure::LuaCClosure {
             func: idx,
             upvalues: std::cell::RefCell::new(vec![LuaValue::Nil; n as usize]),
@@ -6683,6 +6694,139 @@ mod tests {
             String::from_utf8_lossy(&s1)
         );
         assert_ne!(s1, s2, "two distinct tables must render distinct addresses");
+    }
+
+    /// Issue #278 fix-round finding 1: the raw `new_userdata` / `new_c_closure`
+    /// constructors allocate `GcRef`s directly, so they must flag a GC check
+    /// (the #276-class pacing invariant) — otherwise the debt accumulates with
+    /// no safe point noticing.
+    #[test]
+    fn raw_constructors_flag_gc_check_needed() {
+        let mut state = new_state().expect("state should initialize");
+        let _heap_guard = {
+            let g = state.global();
+            lua_gc::HeapGuard::push(&g.heap)
+        };
+
+        state.gc_check_needed = false;
+        let _ = state.new_userdata(32, 1).expect("new_userdata");
+        assert!(state.gc_check_needed, "new_userdata must flag a GC check");
+
+        state.gc_check_needed = false;
+        let _ = state
+            .new_c_closure(test_noop_cclosure, 2)
+            .expect("new_c_closure n>0");
+        assert!(
+            state.gc_check_needed,
+            "new_c_closure(n>0) must flag a GC check"
+        );
+    }
+
+    /// Issue #278 fix-round finding 2: light userdata renders with the plain
+    /// `luaL_typename` "userdata" (as C's `luaL_tolstring` does), never the
+    /// error-message-only "light userdata".
+    #[test]
+    fn to_display_string_light_userdata_uses_plain_userdata_name() {
+        let mut state = new_state().expect("state should initialize");
+        let _heap_guard = {
+            let g = state.global();
+            lua_gc::HeapGuard::push(&g.heap)
+        };
+        let ptr = 0x1234usize as *mut core::ffi::c_void;
+        state.push(LuaValue::LightUserData(ptr));
+        let s = state
+            .to_display_string(-1)
+            .expect("display light userdata");
+        assert!(
+            s.starts_with(b"userdata: 0x"),
+            "expected 'userdata: 0x...', got {:?}",
+            String::from_utf8_lossy(&s)
+        );
+        assert!(
+            !s.starts_with(b"light userdata"),
+            "must not use the error-message name 'light userdata'"
+        );
+    }
+
+    /// Issue #278 fix-round finding 3: a light C function's pointer must be its
+    /// real code address, never the tiny `c_functions` registry index.
+    #[test]
+    fn to_pointer_lightc_is_real_address_not_index() {
+        let mut state = new_state().expect("state should initialize");
+        let _heap_guard = {
+            let g = state.global();
+            lua_gc::HeapGuard::push(&g.heap)
+        };
+        let cl = state
+            .new_c_closure(test_noop_cclosure, 0)
+            .expect("light C function");
+        let idx = match cl {
+            LuaClosure::LightC(i) => i,
+            _ => panic!("n==0 must yield LightC"),
+        };
+        state.push(LuaValue::Function(cl));
+        let ptr = crate::api::to_pointer(&state, -1).expect("LightC must have a pointer");
+        assert!(
+            ptr > u16::MAX as usize,
+            "expected a real address, got {ptr:#x} (registry index was {idx})"
+        );
+        assert_eq!(
+            ptr, test_noop_cclosure as usize,
+            "must resolve to the registered fn's real address"
+        );
+    }
+
+    /// Issue #278 fix-round finding 6: `to_cfunction` resolves the registered
+    /// bare fn for light C functions / C closures, and is `None` otherwise.
+    #[test]
+    fn to_cfunction_resolves_registered_fn() {
+        let mut state = new_state().expect("state should initialize");
+        let _heap_guard = {
+            let g = state.global();
+            lua_gc::HeapGuard::push(&g.heap)
+        };
+        let cl = state
+            .new_c_closure(test_noop_cclosure, 0)
+            .expect("light C function");
+        state.push(LuaValue::Function(cl));
+        let f = crate::api::to_cfunction(&state, -1).expect("to_cfunction must resolve");
+        assert_eq!(f as usize, test_noop_cclosure as usize);
+
+        state.push(LuaValue::Int(7));
+        assert!(
+            crate::api::to_cfunction(&state, -1).is_none(),
+            "non-function must yield None"
+        );
+    }
+
+    /// Issue #278 fix-round finding 5: `new_c_closure` validates the upvalue
+    /// count against `0..=MAX_UPVAL` before registering anything, so an
+    /// out-of-range count errors without polluting `c_functions`.
+    #[test]
+    fn new_c_closure_rejects_out_of_range_upvalue_count() {
+        let mut state = new_state().expect("state should initialize");
+        let _heap_guard = {
+            let g = state.global();
+            lua_gc::HeapGuard::push(&g.heap)
+        };
+        let before = state.global().c_functions.len();
+        assert!(
+            state.new_c_closure(test_noop_cclosure, 256).is_err(),
+            "n>255 must error"
+        );
+        assert!(
+            state.new_c_closure(test_noop_cclosure, -1).is_err(),
+            "negative n must error"
+        );
+        assert_eq!(
+            before,
+            state.global().c_functions.len(),
+            "an invalid upvalue count must not pollute c_functions"
+        );
+        assert!(
+            state.new_c_closure(test_noop_cclosure, 255).is_ok(),
+            "n==255 (MAX_UPVAL) must succeed"
+        );
     }
 
     /// Issue #275 item 2 + item 3: the version-dependent numeric registry
