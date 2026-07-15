@@ -1,0 +1,111 @@
+closure_ops.lua OK: total=10000000
+# size_class_histogram
+workload : harness/bench/workloads/closure_ops.lua
+peak live bytes (proxy for peak RSS) : 15577925 bytes (14.86 MiB)
+pointer width : 64 bits
+
+## macOS libmalloc size-class probes (malloc_good_size, authoritative)
+ request   good_size
+      16          16
+      24          32
+      40          48
+      56          64
+      72          80
+      88          96
+     104         112
+     120         128
+     136         144
+     152         160
+     168         176
+     184         192
+     200         208
+     216         224
+     232         240
+     248         256
+     264         272
+     280         288
+     296         304
+     312         320
+     328         336
+     344         352
+     360         368
+     376         384
+     392         400
+     408         416
+     424         432
+     440         448
+     456         464
+     472         480
+     488         496
+     504         512
+     520         528
+     536         544
+     552         560
+     568         576
+     584         592
+     600         608
+     616         624
+     632         640
+     648         656
+     664         672
+     680         688
+     696         704
+     712         720
+     728         736
+     744         752
+     760         768
+     776         784
+     792         800
+     808         816
+     824         832
+     840         848
+     856         864
+     872         880
+     888         896
+     904         912
+     920         928
+     936         944
+     952         960
+     968         976
+     984         992
+    1000        1008
+    1016        1024
+    1536        1536
+    2048        2048
+    3072        3072
+    4096        4096
+    8192        8192
+   16384       16384
+
+## GcBox<T> sizes vs the size-class table (GcHeader = 24 B)
+type             payld   GcBox   class   prevcls   cross(B)    step(B)    peakpop
+LuaTable            72      96      96        80         16         16         22
+LuaString           24      48      48        32         16         16     100213
+UpVal               32      56      64        48          8         16     100001
+LuaLClosure         24      48      48        32         16         16     100213
+LuaCClosure         40      64      64        48         16         16         14
+LuaProto           208     232     240       224          8         16          3
+LuaUserData         88     112     112        96         16         16          3
+LuaThread            8      32      32        16         16         16        149
+LuaState           176     200     208       192          8         16          1
+
+legend: class=libmalloc class cap for GcBox; prevcls=next-smaller class cap;
+        cross(B)=bytes to remove from GcBox to drop below prevcls (enter cheaper class);
+        step(B)=RSS bytes/object reclaimed by crossing; peakpop=live count at peak.
+
+## helper-type sizes (context)
+LuaValue = 16 B, TableNode = 40 B, TableInner = 48 B
+
+## peak-moment live histogram (size buckets with >=8 live objects)
+    size  good_size   peak_count peak_bytes(good)
+       0         16          158             2528
+       8         16       100049          1600784
+      24         32            9              288
+      32         32          149             4768
+      48         48       100213          4810224
+      56         64       100001          6400064
+      64         64           14              896
+      96         96           22             2112
+(>65536 B overflow bucket: 3 live allocations)
+
+tracked good-size bytes across printed buckets: 12821664 (12.23 MiB)
