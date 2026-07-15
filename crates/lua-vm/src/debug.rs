@@ -1472,7 +1472,7 @@ fn get_upval_name(
     for (i, upval_slot) in lua_cl.upvals.iter().enumerate() {
         let upval = upval_slot.get();
         if let Some((thread_id, idx)) = upval.try_open_payload() {
-            if thread_id as u64 == current_thread && idx == val_idx {
+            if thread_id == current_thread && idx == val_idx {
                 *name = upval_name(&proto, i).to_vec();
                 return Some(b"upvalue");
             }
