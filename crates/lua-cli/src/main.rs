@@ -56,7 +56,7 @@ fn file_loader_hook(filename: &[u8]) -> Result<Vec<u8>, LuaError> {
 /// lost when `io.close()` drops the `Box<dyn LuaFileHandle>`.
 enum FsFile {
     Read(BufReader<std::fs::File>, Option<(i32, String)>),
-    Write(BufWriter<std::fs::File>, bool, FsBufMode),
+    Write(BufWriter<std::fs::File>, Option<(i32, String)>, FsBufMode),
     ReadWrite(std::fs::File, Option<u8>, Option<(i32, String)>),
 }
 
@@ -104,7 +104,7 @@ impl FsFile {
             }
             (b'w', false) => {
                 let f = std::fs::File::create(&path)?;
-                Ok(FsFile::Write(BufWriter::new(f), false, FsBufMode::Full))
+                Ok(FsFile::Write(BufWriter::new(f), None, FsBufMode::Full))
             }
             (b'a', false) => {
                 let mut f = std::fs::OpenOptions::new()
@@ -112,7 +112,7 @@ impl FsFile {
                     .create(true)
                     .open(&path)?;
                 f.seek(SeekFrom::End(0))?;
-                Ok(FsFile::Write(BufWriter::new(f), false, FsBufMode::Full))
+                Ok(FsFile::Write(BufWriter::new(f), None, FsBufMode::Full))
             }
             _ => {
                 let f = std::fs::OpenOptions::new()
@@ -128,11 +128,24 @@ impl FsFile {
     }
 }
 
+/// Capture a read/write-error's `(errno, message)` for `last_error_info`.
+///
+/// The `unwrap_or(0)` is safe here (not a #301 errno-0 fallback): the io read
+/// path treats a `0` code as "no OS errno" and rebuilds a `raw_os_error`-less
+/// `io::Error` (`ErrorKind::Other`) before it reaches `file_result`, so a
+/// missing errno surfaces to Lua as the honest 2-value `(nil, msg)`, never a
+/// fabricated errno `0`. A real read/write syscall failure always carries a
+/// non-zero `raw_os_error()`, which flows through as the faithful errno.
 fn io_error_info(err: &io::Error) -> (i32, String) {
     (err.raw_os_error().unwrap_or(0), err.to_string())
 }
 
 impl LuaFileHandle for FsFile {
+    /// Read one byte, or `-1` on EOF/error. The `Write` arm attempts the read
+    /// against the real write-only descriptor so a wrong-mode read reports the
+    /// OS's faithful errno (`EBADF`, "Bad file descriptor") that C's `fread`
+    /// yields — a synthetic error would carry no `raw_os_error()` and reach Lua
+    /// as errno-less (#301).
     fn read_byte(&mut self) -> i32 {
         match self {
             FsFile::Read(r, err) => {
@@ -160,9 +173,17 @@ impl LuaFileHandle for FsFile {
                     }
                 }
             }
-            FsFile::Write(_, errored, _) => {
-                *errored = true;
-                -1
+            FsFile::Write(w, err, _) => {
+                let mut buf = [0u8; 1];
+                let mut fref: &std::fs::File = w.get_ref();
+                match fref.read(&mut buf) {
+                    Ok(1) => buf[0] as i32,
+                    Ok(_) => -1,
+                    Err(e) => {
+                        *err = Some(io_error_info(&e));
+                        -1
+                    }
+                }
             }
         }
     }
@@ -183,6 +204,10 @@ impl LuaFileHandle for FsFile {
         }
     }
 
+    /// Write a byte slice. The `Read` arm attempts the write against the real
+    /// read-only descriptor for the same errno-fidelity reason as
+    /// [`read_byte`](Self::read_byte): the OS yields `EBADF` rather than a
+    /// synthetic, `raw_os_error`-less error (#301).
     fn write_bytes(&mut self, data: &[u8]) -> io::Result<usize> {
         match self {
             FsFile::Write(w, _, mode) => {
@@ -195,10 +220,10 @@ impl LuaFileHandle for FsFile {
                 Ok(n)
             }
             FsFile::ReadWrite(f, _, _) => f.write(data),
-            FsFile::Read(_, _) => Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "file not open for writing",
-            )),
+            FsFile::Read(r, _) => {
+                let mut fref: &std::fs::File = r.get_ref();
+                fref.write(data)
+            }
         }
     }
 
@@ -225,7 +250,7 @@ impl LuaFileHandle for FsFile {
     fn clear_error(&mut self) {
         match self {
             FsFile::Read(_, err) => *err = None,
-            FsFile::Write(_, errored, _) => *errored = false,
+            FsFile::Write(_, err, _) => *err = None,
             FsFile::ReadWrite(_, _, err) => *err = None,
         }
     }
@@ -233,7 +258,7 @@ impl LuaFileHandle for FsFile {
     fn has_error(&self) -> bool {
         match self {
             FsFile::Read(_, err) => err.is_some(),
-            FsFile::Write(_, errored, _) => *errored,
+            FsFile::Write(_, err, _) => err.is_some(),
             FsFile::ReadWrite(_, _, err) => err.is_some(),
         }
     }
@@ -242,8 +267,7 @@ impl LuaFileHandle for FsFile {
         match self {
             FsFile::Read(_, err) => err.clone(),
             FsFile::ReadWrite(_, _, err) => err.clone(),
-            FsFile::Write(_, true, _) => Some((0, "file write error".to_string())),
-            FsFile::Write(_, false, _) => None,
+            FsFile::Write(_, err, _) => err.clone(),
         }
     }
 
@@ -302,7 +326,22 @@ impl Drop for FsFile {
     }
 }
 
-fn file_remove_hook(filename: &[u8]) -> Result<(), LuaError> {
+/// Removes a file or directory, mirroring C's `remove(3)` so the reported
+/// errno matches the reference (#301). `lua-stdlib`'s `os.remove` renders the
+/// `strerror`-shaped message and real errno itself via `io_lib::file_result`;
+/// this hook must not pre-format a message or re-wrap the error, or the errno
+/// is lost.
+///
+/// BSD/Darwin `remove(3)` is `lstat(path); S_ISDIR ? rmdir : unlink` — it
+/// decides by the path's OWN type (`lstat`, not following symlinks) and
+/// returns the `lstat` error if that fails. The previous
+/// `remove_file(path).or_else(|_| remove_dir(path))` clobbered the real
+/// `unlink` errno with a spurious `rmdir` one: `os.remove("/tmp")` (a symlink)
+/// reported `ENOTDIR` from the fallback `rmdir` where C reports `EPERM` from
+/// `unlink`. The `lstat`-first form matches Darwin exactly, and also matches
+/// glibc's `unlink`-first `remove(3)` on the errno for every case (symlink,
+/// directory, file, and missing path).
+fn file_remove_hook(filename: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     let path: std::path::PathBuf = {
         use std::os::unix::ffi::OsStrExt;
@@ -311,22 +350,21 @@ fn file_remove_hook(filename: &[u8]) -> Result<(), LuaError> {
     #[cfg(not(unix))]
     let path: std::path::PathBuf = {
         let s = std::str::from_utf8(filename)
-            .map_err(|_| LuaError::runtime(format_args!("filename is not valid UTF-8")))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "filename is not valid UTF-8"))?;
         std::path::PathBuf::from(s)
     };
-    std::fs::remove_file(&path)
-        .or_else(|_| std::fs::remove_dir(&path))
-        .map_err(|err| {
-            LuaError::runtime(format_args!(
-                "cannot remove '{}': {}",
-                String::from_utf8_lossy(filename),
-                err
-            ))
-        })
+    let meta = std::fs::symlink_metadata(&path)?;
+    if meta.is_dir() {
+        std::fs::remove_dir(&path)
+    } else {
+        std::fs::remove_file(&path)
+    }
 }
 
-fn file_rename_hook(from: &[u8], to: &[u8]) -> Result<(), LuaError> {
-    fn to_path(bytes: &[u8]) -> Result<std::path::PathBuf, LuaError> {
+/// Renames a file, preserving `raw_os_error()` end to end (#301). See
+/// [`file_remove_hook`] for why no message is pre-formatted here.
+fn file_rename_hook(from: &[u8], to: &[u8]) -> io::Result<()> {
+    fn to_path(bytes: &[u8]) -> io::Result<std::path::PathBuf> {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
@@ -334,36 +372,24 @@ fn file_rename_hook(from: &[u8], to: &[u8]) -> Result<(), LuaError> {
         }
         #[cfg(not(unix))]
         {
-            let s = std::str::from_utf8(bytes)
-                .map_err(|_| LuaError::runtime(format_args!("filename is not valid UTF-8")))?;
+            let s = std::str::from_utf8(bytes).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "filename is not valid UTF-8")
+            })?;
             Ok(std::path::PathBuf::from(s))
         }
     }
     let from_path = to_path(from)?;
     let to_path_buf = to_path(to)?;
-    std::fs::rename(&from_path, &to_path_buf).map_err(|err| {
-        LuaError::runtime(format_args!(
-            "cannot rename '{}' to '{}': {}",
-            String::from_utf8_lossy(from),
-            String::from_utf8_lossy(to),
-            err
-        ))
-    })
+    std::fs::rename(&from_path, &to_path_buf)
 }
 
-fn file_open_hook(filename: &[u8], mode: &[u8]) -> Result<Box<dyn LuaFileHandle>, LuaError> {
+/// Opens a file, preserving `raw_os_error()` end to end (#301). See
+/// [`file_remove_hook`] for why no message is pre-formatted here.
+fn file_open_hook(filename: &[u8], mode: &[u8]) -> io::Result<Box<dyn LuaFileHandle>> {
     if filename == b"/dev/full" {
         return Ok(Box::new(DevFullFile { errored: false }));
     }
-    FsFile::open(filename, mode)
-        .map(|f| Box::new(f) as Box<dyn LuaFileHandle>)
-        .map_err(|err| {
-            LuaError::runtime(format_args!(
-                "cannot open '{}': {}",
-                String::from_utf8_lossy(filename),
-                err
-            ))
-        })
+    FsFile::open(filename, mode).map(|f| Box::new(f) as Box<dyn LuaFileHandle>)
 }
 
 fn stdout_hook(bytes: &[u8]) -> io::Result<()> {

@@ -408,7 +408,90 @@ fn check_mode_popen(mode: &[u8]) -> bool {
     matches!(mode, b"r" | b"w")
 }
 
-/// Push success (`true`) or failure (`fail`, msg, errno) per `luaL_fileresult`.
+/// Canonical POSIX `strerror` text for common errnos, target-independent.
+///
+/// `wasm32-unknown-unknown`'s `std` ships no libc `strerror` table, so
+/// `io::Error::from_raw_os_error(n).to_string()` renders a useless
+/// "operation successful" there (#301). Resolving the message from this static
+/// map instead makes the wasm build report the SAME text a native build does
+/// for the same errno. The strings are the standard POSIX texts that Darwin and
+/// glibc `strerror` both emit — verified against the reference binary for the
+/// file errnos the oracle exercises (2, 9, 13, 20, 28, 1) — so using the table
+/// on every target is deterministic and keeps wasm and native identical.
+/// Errnos absent here (rare, platform-specific values whose text diverges
+/// between Darwin and glibc, e.g. macOS `ENOTEMPTY` = 66) return `None` and are
+/// resolved from the OS `Display`, which is correct on a native host and does
+/// not arise on wasm.
+#[cfg(any(unix, target_arch = "wasm32"))]
+fn posix_strerror(code: i32) -> Option<&'static str> {
+    Some(match code {
+        1 => "Operation not permitted",
+        2 => "No such file or directory",
+        3 => "No such process",
+        4 => "Interrupted system call",
+        5 => "Input/output error",
+        7 => "Argument list too long",
+        8 => "Exec format error",
+        9 => "Bad file descriptor",
+        10 => "No child processes",
+        12 => "Cannot allocate memory",
+        13 => "Permission denied",
+        14 => "Bad address",
+        17 => "File exists",
+        20 => "Not a directory",
+        21 => "Is a directory",
+        22 => "Invalid argument",
+        24 => "Too many open files",
+        27 => "File too large",
+        28 => "No space left on device",
+        29 => "Illegal seek",
+        30 => "Read-only file system",
+        32 => "Broken pipe",
+        _ => return None,
+    })
+}
+
+/// The [`posix_strerror`] table only applies where `raw_os_error()` IS a POSIX
+/// errno — Unix and wasm. On Windows `raw_os_error()` is a Win32 code with
+/// different numbering (code 5 is `ERROR_ACCESS_DENIED`, not `EIO`), so the
+/// table would mistranslate it; there we return `None` and fall back to the OS
+/// `Display` (Windows's own message + code), which is the port's native
+/// behavior. Faithful Win32→CRT-errno normalization is a separate follow-up.
+#[cfg(any(unix, target_arch = "wasm32"))]
+fn target_posix_strerror(code: i32) -> Option<&'static str> {
+    posix_strerror(code)
+}
+
+#[cfg(not(any(unix, target_arch = "wasm32")))]
+fn target_posix_strerror(_code: i32) -> Option<&'static str> {
+    None
+}
+
+/// Render an `io::Error` the way C's `strerror(errno)` would: the plain
+/// platform message, with no trailing `" (os error N)"`.
+///
+/// For an OS-backed error the message comes from [`posix_strerror`] (a
+/// target-independent table, so the wasm build matches native — #301), falling
+/// back to the OS `Display` minus its `" (os error N)"` suffix for errnos the
+/// table does not cover. `std::io::Error`'s `Display` appends that suffix for
+/// the `Repr::Os` case in a stable format, so stripping it is a deterministic
+/// un-format. Errors with no raw OS code (e.g. "no filesystem hook registered")
+/// carry their own message and pass through unchanged.
+fn strerror_text(err: &io::Error) -> String {
+    match err.raw_os_error() {
+        Some(code) => match target_posix_strerror(code) {
+            Some(msg) => msg.to_string(),
+            None => {
+                let full = err.to_string();
+                let suffix = format!(" (os error {code})");
+                full.strip_suffix(&suffix).unwrap_or(&full).to_string()
+            }
+        },
+        None => err.to_string(),
+    }
+}
+
+/// Push success (`true`) or failure (`fail`, msg[, errno]) per `luaL_fileresult`.
 ///
 /// On success: `lua_pushboolean(L, 1); return 1`. On failure C runs
 /// `luaL_pushfail(L); lua_pushfstring(...); lua_pushinteger(errno); return 3`,
@@ -416,7 +499,23 @@ fn check_mode_popen(mode: &[u8]) -> bool {
 /// (5.1-5.5), so the first failure value is `nil`, never `false`. Tests that
 /// compare the failure handle to `nil` (e.g. `io.open(missing) == nil`) rely on
 /// this exact value.
-fn file_result(
+///
+/// The message and errno come straight off `os_err` via [`strerror_text`] and
+/// `raw_os_error()` — callers must pass through the original `io::Error` from
+/// the host hook unmodified, never re-wrap it as `ErrorKind::Other` (#301:
+/// re-wrapping drops `raw_os_error()`, surfacing as errno 0 downstream).
+///
+/// The errno is pushed **only when `os_err` actually carries one**
+/// (`raw_os_error().is_some()` — every real OS failure does). C always has a
+/// live `errno`, so real filesystem failures produce the faithful 3-value
+/// triple. When the error is a non-OS failure with no errno — an omniLua-only
+/// case C cannot reach, e.g. a sandbox capability failure ("no filesystem hook
+/// registered") or a host hook that returned a `raw_os_error`-less
+/// `io::Error` — there is genuinely no errno to report, so the result is the
+/// honest 2-value `(nil, msg)`. Coercing that to `0` (the removed
+/// `unwrap_or(0)`) was the #301 fallback: a fabricated errno that no `errno`
+/// value ever legitimately equals here.
+pub(crate) fn file_result(
     state: &mut LuaState,
     success: bool,
     fname: Option<&[u8]>,
@@ -427,7 +526,7 @@ fn file_result(
         return Ok(1);
     }
     state.push(LuaValue::Nil);
-    let msg = os_err.to_string();
+    let msg = strerror_text(&os_err);
     match fname {
         Some(name) => {
             let mut s = Vec::with_capacity(name.len() + 2 + msg.len());
@@ -440,9 +539,13 @@ fn file_result(
             state.push_string(msg.as_bytes())?;
         }
     }
-    let errno_code = os_err.raw_os_error().unwrap_or(0) as i64;
-    state.push(LuaValue::Int(errno_code));
-    Ok(3)
+    match os_err.raw_os_error() {
+        Some(code) => {
+            state.push(LuaValue::Int(code as i64));
+            Ok(3)
+        }
+        None => Ok(2),
+    }
 }
 
 /// Push popen/system exit-status results per `luaL_execresult`: `true` on a
@@ -543,6 +646,35 @@ fn new_file(state: &mut LuaState) -> Result<Rc<RefCell<LStream>>, LuaError> {
     Ok(cell)
 }
 
+/// Build the `io.input`/`io.output`/`io.lines` open-failure error, version-gated.
+///
+/// C splits here by version. 5.2+ `opencheck` raises
+/// `luaL_error(L, "cannot open file '%s' (%s)", fname, strerror(errno))`. 5.1's
+/// `g_iofile`/`io_lines` instead call `fileerror`, which does
+/// `luaL_argerror(L, 1, "<fname>: <strerror>")` — rendered as
+/// `bad argument #1 to '<caller>' (<fname>: <strerror>)`, with `<caller>`
+/// resolved from the call stack ('?' under `pcall(io.input, x)`, `'lines'` when
+/// called from a Lua frame). [`lua_vm::debug::arg_error_impl`] reproduces that
+/// exact stack walk, so routing the 5.1 case through it matches the reference
+/// funcname and location prefix without special-casing either.
+fn open_failure_error(state: &mut LuaState, fname: &[u8], detail: &[u8]) -> LuaError {
+    if matches!(state.global().lua_version, lua_types::LuaVersion::V51) {
+        let mut extramsg = Vec::with_capacity(fname.len() + 2 + detail.len());
+        extramsg.extend_from_slice(fname);
+        extramsg.extend_from_slice(b": ");
+        extramsg.extend_from_slice(detail);
+        lua_vm::debug::arg_error_impl(state, 1, &extramsg)
+    } else {
+        let mut msg = Vec::with_capacity(fname.len() + detail.len() + 20);
+        msg.extend_from_slice(b"cannot open file '");
+        msg.extend_from_slice(fname);
+        msg.extend_from_slice(b"' (");
+        msg.extend_from_slice(detail);
+        msg.push(b')');
+        lua_vm::debug::c_api_runtime(state, msg)
+    }
+}
+
 /// Open `fname` and push its handle; raise a runtime error on failure.
 ///
 /// The file system is reached via `GlobalState::file_open_hook` (registered by
@@ -550,21 +682,19 @@ fn new_file(state: &mut LuaState) -> Result<Rc<RefCell<LStream>>, LuaError> {
 fn opencheck(state: &mut LuaState, fname: &[u8], mode: &[u8]) -> Result<(), LuaError> {
     let hook = state.global().file_open_hook;
     let fh = match hook {
-        Some(open_fn) => open_fn(fname, mode).map_err(|e| {
-            LuaError::runtime(format_args!(
-                "cannot open file '{}' ({})",
-                fname.escape_ascii(),
-                match e.message_bytes() {
-                    Some(b) => String::from_utf8_lossy(b).into_owned(),
-                    None => format!("{:?}", &e),
-                }
-            ))
-        })?,
+        Some(open_fn) => match open_fn(fname, mode) {
+            Ok(fh) => fh,
+            Err(e) => {
+                let detail = strerror_text(&e);
+                return Err(open_failure_error(state, fname, detail.as_bytes()));
+            }
+        },
         None => {
-            return Err(LuaError::runtime(format_args!(
-                "cannot open file '{}' (no filesystem hook registered)",
-                fname.escape_ascii()
-            )));
+            return Err(open_failure_error(
+                state,
+                fname,
+                b"no filesystem hook registered",
+            ));
         }
     };
     let cell = new_file(state)?;
@@ -721,16 +851,7 @@ pub fn io_open(state: &mut LuaState) -> Result<usize, LuaError> {
                 cell.borrow_mut().file = Some(fh);
                 Ok(1)
             }
-            Err(e) => {
-                let os_err = io::Error::new(
-                    io::ErrorKind::Other,
-                    match e.message_bytes() {
-                        Some(b) => String::from_utf8_lossy(b).into_owned(),
-                        None => format!("{:?}", &e),
-                    },
-                );
-                file_result(state, false, Some(&filename), os_err)
-            }
+            Err(os_err) => file_result(state, false, Some(&filename), os_err),
         },
         None => {
             let os_err =
@@ -851,16 +972,7 @@ pub fn io_tmpfile(state: &mut LuaState) -> Result<usize, LuaError> {
             cell.borrow_mut().file = Some(fh);
             Ok(1)
         }
-        Err(e) => {
-            let os_err = io::Error::new(
-                io::ErrorKind::Other,
-                match e.message_bytes() {
-                    Some(b) => String::from_utf8_lossy(b).into_owned(),
-                    None => format!("{:?}", &e),
-                },
-            );
-            file_result(state, false, None, os_err)
-        }
+        Err(os_err) => file_result(state, false, None, os_err),
     }
 }
 
@@ -1306,20 +1418,14 @@ fn num_to_write_bytes(state: &mut LuaState, val: &LuaValue) -> Result<Vec<u8>, L
     Ok(s.as_bytes().to_vec())
 }
 
-/// `io.write(...)`. C: `io_write`.
-///
-/// Writes all arguments to the current default output file (`IO_OUTPUT`). When
-/// a file was set via `io.output(filename)`, writes go to that file; otherwise
-/// they go to stdout via `state.write_output()`.
-///
-/// The borrow split (needing both `&mut LuaState` and `&mut dyn LuaFileHandle`)
-/// is resolved by collecting all formatted strings first and then writing them
-/// to the file handle obtained from the `LSTREAM_REGISTRY`.
-pub fn io_write(state: &mut LuaState) -> Result<usize, LuaError> {
-    // Step 1: collect all formatted byte strings before touching the file handle.
-    let n = state.top();
-    let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(n as usize);
-    for i in 1..=(n as i32) {
+/// Collect the write arguments `arg..=top` as owned byte chunks. Numbers are
+/// stringified with `num_to_write_bytes`; everything else is arg-checked to a
+/// string. Done before borrowing the file handle to keep `&mut LuaState`
+/// available for the coercions.
+fn collect_write_chunks(state: &mut LuaState, first_arg: i32) -> Result<Vec<Vec<u8>>, LuaError> {
+    let n = state.top() as i32;
+    let mut chunks: Vec<Vec<u8>> = Vec::with_capacity((n - first_arg + 1).max(0) as usize);
+    for i in first_arg..=n {
         if state.type_at(i) == LuaType::Number {
             let val = state.value_at(i);
             chunks.push(num_to_write_bytes(state, &val)?);
@@ -1328,67 +1434,88 @@ pub fn io_write(state: &mut LuaState) -> Result<usize, LuaError> {
             chunks.push(bytes);
         }
     }
-
-    // Step 2: resolve the current output file. C's `getiofile` errors when
-    // the default output is closed; do not silently fall back to stdout.
-    let p_rc = get_io_file_rc(state, IO_OUTPUT_KEY)?;
-    {
-        let mut p = p_rc.borrow_mut();
-        let fh = p.file.as_mut().expect("open stream has no file handle");
-        for chunk in &chunks {
-            fh.write_bytes(chunk)
-                .map_err(|e| LuaError::runtime(format_args!("io.write: {}", e)))?;
-        }
-    }
-    state.registry_get(IO_OUTPUT_KEY)?;
-    Ok(1)
+    Ok(chunks)
 }
 
-/// `file:write(...)`. C: `f_write`.
-pub fn f_write(state: &mut LuaState) -> Result<usize, LuaError> {
-    let p_rc = tofile(state)?;
-
-    // Step 1: collect args 2..=n as owned byte chunks before borrowing the file.
-    let n = state.top();
-    let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(n.saturating_sub(1) as usize);
-    for i in 2..=(n as i32) {
-        if state.type_at(i) == LuaType::Number {
-            let val = state.value_at(i);
-            chunks.push(num_to_write_bytes(state, &val)?);
-        } else {
-            let bytes: Vec<u8> = state.check_arg_string(i)?;
-            chunks.push(bytes);
-        }
-    }
-
-    // Step 2: write through the file with the LStream borrow scoped tightly.
-    let result: io::Result<()> = {
+/// Write every chunk to `p_rc`'s handle, accumulating total bytes written, and
+/// shape the result exactly like C's `g_write` (shared by `io.write` and
+/// `file:write`).
+///
+/// On full success returns `Ok(None)`; the caller pushes its own success value
+/// (the output file for `io.write`, the handle for `file:write`). On the first
+/// short/failed write returns `Ok(Some(nres))` with the failure result already
+/// on the stack: the `luaL_fileresult` tuple `(nil, msg[, errno])` and, **on
+/// Lua 5.5 only**, an appended total-bytes-written counter (5.5's `g_write`
+/// pushes `cast_st2S(totalbytes)` and returns `n + 1`; 5.1-5.4's `g_write` does
+/// not).
+fn g_write(
+    state: &mut LuaState,
+    p_rc: &Rc<RefCell<LStream>>,
+    chunks: &[Vec<u8>],
+) -> Result<Option<usize>, LuaError> {
+    let mut total: usize = 0;
+    let write_err: Option<io::Error> = {
         let mut p = p_rc.borrow_mut();
         let fh = p.file.as_mut().expect("open stream has no file handle");
-        let mut r: io::Result<()> = Ok(());
-        for chunk in &chunks {
+        let mut err = None;
+        for chunk in chunks {
             match fh.write_bytes(chunk) {
-                Ok(written) if written == chunk.len() => {}
-                Ok(_) => {
-                    r = Err(io::Error::new(io::ErrorKind::Other, "short write"));
-                    break;
+                Ok(written) => {
+                    total += written;
+                    if written < chunk.len() {
+                        err = Some(io::Error::new(io::ErrorKind::Other, "short write"));
+                        break;
+                    }
                 }
                 Err(e) => {
-                    r = Err(e);
+                    err = Some(e);
                     break;
                 }
             }
         }
-        r
+        err
     };
 
-    // Step 3: on success return the file handle (arg 1); on failure use file_result.
-    match result {
-        Ok(()) => {
+    match write_err {
+        None => Ok(None),
+        Some(e) => {
+            let mut nres = file_result(state, false, None, e)?;
+            if matches!(state.global().lua_version, lua_types::LuaVersion::V55) {
+                state.push(LuaValue::Int(total as i64));
+                nres += 1;
+            }
+            Ok(Some(nres))
+        }
+    }
+}
+
+/// `io.write(...)`. C: `io_write` → `g_write(L, getiofile(IO_OUTPUT), 1)`.
+///
+/// Writes all arguments to the current default output file (`IO_OUTPUT`). A
+/// write failure returns the `luaL_fileresult` tuple (like the reference), not
+/// a raised error.
+pub fn io_write(state: &mut LuaState) -> Result<usize, LuaError> {
+    let chunks = collect_write_chunks(state, 1)?;
+    let p_rc = get_io_file_rc(state, IO_OUTPUT_KEY)?;
+    match g_write(state, &p_rc, &chunks)? {
+        None => {
+            state.registry_get(IO_OUTPUT_KEY)?;
+            Ok(1)
+        }
+        Some(nres) => Ok(nres),
+    }
+}
+
+/// `file:write(...)`. C: `f_write` → `g_write(L, tofile(L), 2)`.
+pub fn f_write(state: &mut LuaState) -> Result<usize, LuaError> {
+    let p_rc = tofile(state)?;
+    let chunks = collect_write_chunks(state, 2)?;
+    match g_write(state, &p_rc, &chunks)? {
+        None => {
             state.push_value_at(1)?;
             Ok(1)
         }
-        Err(e) => file_result(state, false, None, e),
+        Some(nres) => Ok(nres),
     }
 }
 

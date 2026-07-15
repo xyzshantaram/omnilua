@@ -1,11 +1,22 @@
 //! Minimal file-handle abstraction shared between `lua-vm` (hook type) and
 //! `lua-stdlib` (io library).
 //!
-//! `std::fs` and `std::io` are banned in `lua-stdlib` by PORTING.md §1. The
-//! concrete implementation (backed by `std::fs::File`) lives in `lua-cli` and
-//! is installed via [`crate::error::LuaError`]-returning function pointers on
-//! [`lua_vm::state::GlobalState`]. This trait is the shared seam that allows
-//! `lua-stdlib` to program against file handles without importing `std::fs`.
+//! `std::fs` is banned in `lua-stdlib` by PORTING.md §1. The concrete
+//! implementation (backed by `std::fs::File`) lives in `lua-cli` and is
+//! installed on [`lua_vm::state::GlobalState`] via the `FileOpenHook` /
+//! `FileRemoveHook` / `FileRenameHook` function pointers. Those hooks return
+//! `std::io::Result` (not `LuaError`): only `std::io::Error` carries
+//! `raw_os_error()`, and `io.open`/`os.remove`/`os.rename` must report the real
+//! errno as their third return value the way C's `luaL_fileresult` does — a
+//! `LuaError` return would drop it (#301). This trait is the shared seam that
+//! lets `lua-stdlib` program against file handles without importing `std::fs`.
+//!
+//! On the `wasm32-unknown-unknown` host boundary there is no `io::Error` to pass
+//! by value, so the `open_file` host import encodes the outcome in its `i32`
+//! return: `>= 0` is a live handle id, `-1` is failure with no errno available
+//! (mapped to a `raw_os_error`-less error → a 2-value `(nil, msg)` result), and
+//! `<= -2` encodes `errno = -id` (mapped via `io::Error::from_raw_os_error`).
+//! See `lua-wasm`'s `imported_file_open` and the JS host's `openFile`.
 //!
 //! ## Trait design
 //! The trait mirrors the subset of `LuaFileOps` (defined in `lua-stdlib`) that
