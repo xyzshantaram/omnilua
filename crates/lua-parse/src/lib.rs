@@ -226,6 +226,19 @@ pub struct ExprPayload {
     pub ind_t: u8,
     pub var_ridx: u8,
     pub var_vidx: u16,
+    /// The materialized value of a [`ExprKind::Const`] (`VCONST`) expression: a
+    /// snapshot of the resolved `<const>` compile-time constant's stored value,
+    /// copied out of the owning function's `VarDesc::const_val` by [`searchvar`]
+    /// at resolution time. `Some` only for `ExprKind::Const`; `None` for every
+    /// other kind.
+    ///
+    /// This snapshot exists so that constant discharge (`cg_exp2const`'s
+    /// const-of-const arm and `cg_discharge_vars`'s `Const` arm) can read the
+    /// value from the `ExprDesc` alone. Those run in `FuncState`-only codegen
+    /// contexts that hold no reference to `LexState`/`DynData`, so they cannot
+    /// re-read `dyd.actvar[info].const_val` the way C's `const2val` does; the
+    /// absolute index in `u.info` is still kept for [`check_readonly`].
+    pub const_snapshot: Option<LuaValue>,
     /// Lua 5.5: when this expression resolves a global that was declared
     /// `global x <const>`, the declared name is recorded here so that an
     /// assignment to it is rejected by [`check_readonly`]. `None` for every
@@ -1043,6 +1056,39 @@ fn cg_is_numeral(e: &ExprDesc) -> bool {
 
 fn cg_is_integer(e: &ExprDesc) -> bool {
     e.t == NO_JUMP && e.f == NO_JUMP && e.k == ExprKind::KInt
+}
+
+/// Mirrors C's `hasjumps(e)` from `lcode.c`: `e->t != e->f`. An expression
+/// whose value is realized by a pending short-circuit jump list cannot be a
+/// compile-time constant. Note this is the exact `t != f` form (both may be
+/// `NO_JUMP`, in which case there are no jumps), NOT `t == NO_JUMP && f ==
+/// NO_JUMP` — the two agree only because a genuine jump list makes exactly one
+/// side non-`NO_JUMP`.
+fn cg_has_jumps(e: &ExprDesc) -> bool {
+    e.t != e.f
+}
+
+/// Mirrors C's `luaK_exp2const` (`lcode.c`): if `e` is a compile-time constant,
+/// return its value; otherwise `None`. Used by `localstat` to decide whether a
+/// `local x <const> = <expr>` initializer folds into an `RDKCTC` constant.
+///
+/// Unlike C, this takes no `FuncState`: the const-of-const case reads the
+/// snapshot already carried on the resolved [`ExprKind::Const`] expression
+/// (§4.0.A) rather than `dyd.actvar`.
+fn cg_exp2const(e: &ExprDesc) -> Option<LuaValue> {
+    if cg_has_jumps(e) {
+        return None;
+    }
+    match e.k {
+        ExprKind::False => Some(LuaValue::Bool(false)),
+        ExprKind::True => Some(LuaValue::Bool(true)),
+        ExprKind::Nil => Some(LuaValue::Nil),
+        ExprKind::KStr => e.u.strval.clone().map(LuaValue::Str),
+        ExprKind::KInt => Some(LuaValue::Int(e.u.ival)),
+        ExprKind::KFlt => Some(LuaValue::Float(e.u.nval)),
+        ExprKind::Const => e.u.const_snapshot.clone(),
+        _ => None,
+    }
 }
 
 fn cg_find_k_value(fs: &FuncState, v: &LuaValue) -> Option<i32> {
@@ -2009,6 +2055,14 @@ fn cg_discharge_to_any_reg(
 /// right-hand side is known, so `cg_infix` only calls `cg_discharge_vars`
 /// for them.
 fn cg_infix(fs: &mut FuncState, op: BinOpr, v: &mut ExprDesc, line: i32) -> Result<(), LuaError> {
+    // Mirrors C's `luaK_infix`, which calls `luaK_dischargevars` before the
+    // operator switch. This turns a resolved `<const>` left operand into its
+    // literal (`ExprKind::Const` -> KInt/KFlt/...) so the numeral tests below
+    // can keep it foldable; without it a folded const left operand falls
+    // through to `cg_exp_to_any_reg` and stops folding (codex HIGH-3). For
+    // every already-discharged or non-const operand this is a no-op and the
+    // emitted bytecode is unchanged.
+    cg_discharge_vars(fs, line, v)?;
     match op {
         BinOpr::And => cg_go_if_true(fs, line, v),
         BinOpr::Or => cg_go_if_false(fs, line, v),
@@ -2157,6 +2211,38 @@ fn cg_exp_to_any_reg(fs: &mut FuncState, line: i32, e: &mut ExprDesc) -> Result<
 /// untouched. Returns Ok(()) on success.
 fn cg_discharge_vars(fs: &mut FuncState, line: i32, e: &mut ExprDesc) -> Result<(), LuaError> {
     match e.k {
+        ExprKind::Const => {
+            // Mirrors C's `const2exp(const2val(fs, e), e)`: turn a resolved
+            // `<const>` compile-time constant back into its literal expression
+            // so the existing literal-lowering paths emit LOADI/LOADK/LOADFALSE/
+            // LOADTRUE/LOADNIL exactly as for a bare literal. The value comes
+            // from the snapshot (§4.0.A), never `dyd.actvar`.
+            let v = e
+                .u
+                .const_snapshot
+                .clone()
+                .expect("ExprKind::Const must carry a const_snapshot");
+            match v {
+                LuaValue::Int(i) => {
+                    e.k = ExprKind::KInt;
+                    e.u.ival = i;
+                }
+                LuaValue::Float(f) => {
+                    e.k = ExprKind::KFlt;
+                    e.u.nval = f;
+                }
+                LuaValue::Bool(false) => e.k = ExprKind::False,
+                LuaValue::Bool(true) => e.k = ExprKind::True,
+                LuaValue::Nil => e.k = ExprKind::Nil,
+                LuaValue::Str(s) => {
+                    e.k = ExprKind::KStr;
+                    e.u.strval = Some(s);
+                }
+                other => {
+                    unreachable!("a <const> compile-time constant cannot be {other:?}")
+                }
+            }
+        }
         ExprKind::VarArgVar => {
             mark_vararg_table_needed(fs);
             e.u.info = e.u.var_ridx as i32;
@@ -3205,8 +3291,16 @@ fn searchvar(ls: &LexState, fs: &FuncState, n: &GcRef<LuaString>, var: &mut Expr
         if vd.name.as_ref().is_some_and(|nm| GcRef::ptr_eq(nm, n)) {
             if vd.kind == VarKind::CompileTimeConst {
                 init_exp(var, ExprKind::Const, fs.firstlocal + i);
+                // `u.info` keeps the ABSOLUTE actvar index (check_readonly reads
+                // it). The value snapshot lets discharge fold the constant from
+                // the ExprDesc alone (§4.0.A); `var_vidx` is the within-function
+                // local index so the 5.5 global-shadowing barrier can compute
+                // this constant's scope level (§4.4).
+                var.u.const_snapshot = Some(vd.const_val.clone());
+                var.u.var_vidx = i as u16;
             } else {
                 init_var(ls, fs, var, i);
+                var.u.const_snapshot = None;
                 if vd.kind == VarKind::VarArg {
                     var.k = ExprKind::VarArgVar;
                 }
@@ -3300,12 +3394,37 @@ fn singlevar(ls: &mut LexState, state: &mut LuaState, var: &mut ExprDesc) -> Res
     recurse_result?;
     if state.global().lua_version == lua_types::LuaVersion::V55 {
         match var.k {
-            ExprKind::Local | ExprKind::Const => {
+            ExprKind::Local => {
                 if let Some(global_level) = latest_matching_global_barrier_current(ls, &varname) {
                     let local_level = scope_level_for_local_level(ls, var.u.var_vidx as u8);
                     if global_level > local_level {
                         init_exp(var, ExprKind::Void, 0);
                     }
+                }
+            }
+            ExprKind::Const => {
+                // `u.info` is the ABSOLUTE actvar index of the resolved
+                // `<const>` constant. If it lies within THIS function's active
+                // range the constant was declared here, so a `global <name>`
+                // wins only if declared more recently (deeper scope level) — the
+                // same comparison as a local. If it lies below this function's
+                // first local it was reached across a function boundary (an
+                // outer function's CTC), and a `global <name>` declared in THIS
+                // function always shadows it — matching reference 5.5, whose
+                // `searchvar` returns VGLOBAL for a current-function global
+                // before ever recursing to the enclosing function.
+                let cur_firstlocal = ls.fs.as_ref().unwrap().firstlocal;
+                if var.u.info >= cur_firstlocal {
+                    if let Some(global_level) =
+                        latest_matching_global_barrier_current(ls, &varname)
+                    {
+                        let local_level = scope_level_for_local_level(ls, var.u.var_vidx as u8);
+                        if global_level > local_level {
+                            init_exp(var, ExprKind::Void, 0);
+                        }
+                    }
+                } else if latest_matching_global_barrier_current(ls, &varname).is_some() {
+                    init_exp(var, ExprKind::Void, 0);
                 }
             }
             ExprKind::UpVal => {
@@ -6069,16 +6188,25 @@ fn localstat(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
     }
     let first_local = ls.fs.as_ref().unwrap().firstlocal;
     let last_vd_kind = ls.dyd.actvar[(first_local + vidx) as usize].kind;
-    if nvars == nexps && last_vd_kind == VarKind::Const {
-        let is_const = false; // placeholder
-        if is_const {
-            ls.dyd.actvar[(first_local + vidx) as usize].kind = VarKind::CompileTimeConst;
-            adjust_local_vars(ls, state, nvars - 1)?;
-            ls.fs.as_mut().unwrap().nactvar += 1;
-        } else {
-            adjust_assign(ls, state, nvars, nexps, &mut e)?;
-            adjust_local_vars(ls, state, nvars)?;
-        }
+    // Mirrors C's `localstat` fold (lparser.c): when the initializer count
+    // matches the variable count, the last variable is `<const>`, and its
+    // initializer is a compile-time constant, fold it — store the value on the
+    // descriptor, mark the variable RDKCTC, and emit NO register/local for it.
+    // `e` here is the last initializer straight from `explist` (a literal or a
+    // constant-folded expression), so `cg_exp2const` reads its literal fields
+    // directly. `adjust_local_vars(nvars - 1)` EXCLUDES the const (no locvar, no
+    // register); `nactvar += 1` still counts it so scope resolution sees it.
+    // Ordering is load-bearing: write `const_val` before flipping `kind`.
+    let folded = if nvars == nexps && last_vd_kind == VarKind::Const {
+        cg_exp2const(&e)
+    } else {
+        None
+    };
+    if let Some(v) = folded {
+        ls.dyd.actvar[(first_local + vidx) as usize].const_val = v;
+        ls.dyd.actvar[(first_local + vidx) as usize].kind = VarKind::CompileTimeConst;
+        adjust_local_vars(ls, state, nvars - 1)?;
+        ls.fs.as_mut().unwrap().nactvar += 1;
     } else {
         adjust_assign(ls, state, nvars, nexps, &mut e)?;
         adjust_local_vars(ls, state, nvars)?;
@@ -6321,6 +6449,21 @@ fn mainfunc(
 /// Top-level entry point: parses a whole chunk and returns the prototype of its
 /// main function. The caller wraps this `Box<LuaProto>` into a closure and hands
 /// it to the GC; that boundary is the public contract of this crate.
+///
+/// # Precondition — GC must be stopped for the whole parse window
+///
+/// The parser holds untraced references to GC-managed objects for the duration
+/// of a parse: interned name/string handles, the half-built `Box<LuaProto>`,
+/// long-string anchors, and — for `<const>` folding — the value stored in a
+/// `VarDesc::const_val` / `ExprPayload::const_snapshot` (which may be an
+/// interned string). None of these are reachable from a GC root while parsing,
+/// so a collection cycle during `parse` could free a live constant and produce
+/// a use-after-free. The supported entry points satisfy this: the loader stops
+/// the collector across the entire production parse window (`do_.rs` f_parser),
+/// and explicit `collectgarbage` requests early-return while internally stopped.
+/// A direct caller of this function that has NOT stopped the GC violates the
+/// contract — this is a pre-existing whole-parser requirement (the constant
+/// table has always needed it), not specific to `<const>` folding.
 pub fn parse(
     state: &mut LuaState,
     dyd: DynData,
