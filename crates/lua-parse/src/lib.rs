@@ -226,6 +226,19 @@ pub struct ExprPayload {
     pub ind_t: u8,
     pub var_ridx: u8,
     pub var_vidx: u16,
+    /// The materialized value of a [`ExprKind::Const`] (`VCONST`) expression: a
+    /// snapshot of the resolved `<const>` compile-time constant's stored value,
+    /// copied out of the owning function's `VarDesc::const_val` by [`searchvar`]
+    /// at resolution time. `Some` only for `ExprKind::Const`; `None` for every
+    /// other kind.
+    ///
+    /// This snapshot exists so that constant discharge (`cg_exp2const`'s
+    /// const-of-const arm and `cg_discharge_vars`'s `Const` arm) can read the
+    /// value from the `ExprDesc` alone. Those run in `FuncState`-only codegen
+    /// contexts that hold no reference to `LexState`/`DynData`, so they cannot
+    /// re-read `dyd.actvar[info].const_val` the way C's `const2val` does; the
+    /// absolute index in `u.info` is still kept for [`check_readonly`].
+    pub const_snapshot: Option<LuaValue>,
     /// Lua 5.5: when this expression resolves a global that was declared
     /// `global x <const>`, the declared name is recorded here so that an
     /// assignment to it is rejected by [`check_readonly`]. `None` for every
@@ -359,6 +372,18 @@ pub struct FuncState {
     pub firstlabel: i32,
     pub ndebugvars: i16,
     pub nactvar: u8,
+    /// The number of active-variable registers actually occupied on the VM
+    /// stack — C's `luaY_nvarstack(fs)` / `reglevel(fs, fs->nactvar)`. Equal to
+    /// `nactvar` while every active variable is a real register-backed local,
+    /// but strictly less once a `<const>` compile-time constant (`RDKCTC`) is in
+    /// scope, since such a variable is counted by `nactvar` yet consumes no
+    /// register. This is the watermark every register-bound codegen helper
+    /// (`cg_free_reg`, `cg_exp_to_any_reg`, `cg_free_reg_if_temp`) must compare
+    /// against instead of `nactvar`; it is maintained by `adjust_local_vars`
+    /// and `remove_vars` (the only sites that grow/shrink the active set) so it
+    /// is readable from `FuncState`-only contexts that cannot reach `LexState`'s
+    /// `dyd.actvar` to recompute `reglevel`.
+    pub nactvar_reg: u8,
     pub first_scope_barrier: usize,
     pub nups: u8,
     pub freereg: u8,
@@ -724,13 +749,16 @@ fn reserve_regs(fs: &mut FuncState, n: i32) -> Result<(), LuaError> {
     Ok(())
 }
 
-/// Free `reg` if it sits above the active-local watermark.
+/// Free `reg` if it sits above the active-local register watermark.
 ///
-/// Mirrors C's `freereg` from `lcode.c`: registers below `nactvar` belong to
-/// declared locals and must not be popped; temporaries above that watermark
-/// are freed by decrementing `fs.freereg`.
+/// Mirrors C's `freereg` from `lcode.c`: registers below `luaY_nvarstack(fs)`
+/// belong to register-backed declared locals and must not be popped;
+/// temporaries above that watermark are freed by decrementing `fs.freereg`.
+/// The watermark is [`FuncState::nactvar_reg`], not `nactvar`, so a `<const>`
+/// compile-time constant (which `nactvar` counts but occupies no register)
+/// does not make a temporary look like a local.
 fn cg_free_reg(fs: &mut FuncState, reg: i32) {
-    if reg >= fs.nactvar as i32 {
+    if reg >= fs.nactvar_reg as i32 {
         debug_assert_eq!(reg, fs.freereg as i32 - 1);
         fs.freereg = fs.freereg.saturating_sub(1);
     }
@@ -1028,6 +1056,39 @@ fn cg_is_numeral(e: &ExprDesc) -> bool {
 
 fn cg_is_integer(e: &ExprDesc) -> bool {
     e.t == NO_JUMP && e.f == NO_JUMP && e.k == ExprKind::KInt
+}
+
+/// Mirrors C's `hasjumps(e)` from `lcode.c`: `e->t != e->f`. An expression
+/// whose value is realized by a pending short-circuit jump list cannot be a
+/// compile-time constant. Note this is the exact `t != f` form (both may be
+/// `NO_JUMP`, in which case there are no jumps), NOT `t == NO_JUMP && f ==
+/// NO_JUMP` — the two agree only because a genuine jump list makes exactly one
+/// side non-`NO_JUMP`.
+fn cg_has_jumps(e: &ExprDesc) -> bool {
+    e.t != e.f
+}
+
+/// Mirrors C's `luaK_exp2const` (`lcode.c`): if `e` is a compile-time constant,
+/// return its value; otherwise `None`. Used by `localstat` to decide whether a
+/// `local x <const> = <expr>` initializer folds into an `RDKCTC` constant.
+///
+/// Unlike C, this takes no `FuncState`: the const-of-const case reads the
+/// snapshot already carried on the resolved [`ExprKind::Const`] expression
+/// (§4.0.A) rather than `dyd.actvar`.
+fn cg_exp2const(e: &ExprDesc) -> Option<LuaValue> {
+    if cg_has_jumps(e) {
+        return None;
+    }
+    match e.k {
+        ExprKind::False => Some(LuaValue::Bool(false)),
+        ExprKind::True => Some(LuaValue::Bool(true)),
+        ExprKind::Nil => Some(LuaValue::Nil),
+        ExprKind::KStr => e.u.strval.clone().map(LuaValue::Str),
+        ExprKind::KInt => Some(LuaValue::Int(e.u.ival)),
+        ExprKind::KFlt => Some(LuaValue::Float(e.u.nval)),
+        ExprKind::Const => e.u.const_snapshot.clone(),
+        _ => None,
+    }
 }
 
 fn cg_find_k_value(fs: &FuncState, v: &LuaValue) -> Option<i32> {
@@ -1994,6 +2055,14 @@ fn cg_discharge_to_any_reg(
 /// right-hand side is known, so `cg_infix` only calls `cg_discharge_vars`
 /// for them.
 fn cg_infix(fs: &mut FuncState, op: BinOpr, v: &mut ExprDesc, line: i32) -> Result<(), LuaError> {
+    // Mirrors C's `luaK_infix`, which calls `luaK_dischargevars` before the
+    // operator switch. This turns a resolved `<const>` left operand into its
+    // literal (`ExprKind::Const` -> KInt/KFlt/...) so the numeral tests below
+    // can keep it foldable; without it a folded const left operand falls
+    // through to `cg_exp_to_any_reg` and stops folding (codex HIGH-3). For
+    // every already-discharged or non-const operand this is a no-op and the
+    // emitted bytecode is unchanged.
+    cg_discharge_vars(fs, line, v)?;
     match op {
         BinOpr::And => cg_go_if_true(fs, line, v),
         BinOpr::Or => cg_go_if_false(fs, line, v),
@@ -2119,15 +2188,16 @@ fn clear_arg_table_needed(fs: &mut FuncState) {
 }
 
 /// Minimal `luaK_exp2anyreg`: ensure `e` ends up in *some* register. If `e`
-/// is already `VNONRELOC` and its register is at or above `nactvar`, keep it
-/// there; otherwise discharge to the next free register.
+/// is already `VNONRELOC` and its register is at or above the register
+/// watermark ([`FuncState::nactvar_reg`], = `luaY_nvarstack`), keep it there;
+/// otherwise discharge to the next free register.
 fn cg_exp_to_any_reg(fs: &mut FuncState, line: i32, e: &mut ExprDesc) -> Result<u8, LuaError> {
     cg_discharge_vars(fs, line, e)?;
     if e.k == ExprKind::NonReloc {
         if e.t == NO_JUMP && e.f == NO_JUMP {
             return Ok(e.u.info as u8);
         }
-        if e.u.info >= fs.nactvar as i32 {
+        if e.u.info >= fs.nactvar_reg as i32 {
             cg_exp_to_reg(fs, line, e, e.u.info as u8)?;
             return Ok(e.u.info as u8);
         }
@@ -2141,6 +2211,38 @@ fn cg_exp_to_any_reg(fs: &mut FuncState, line: i32, e: &mut ExprDesc) -> Result<
 /// untouched. Returns Ok(()) on success.
 fn cg_discharge_vars(fs: &mut FuncState, line: i32, e: &mut ExprDesc) -> Result<(), LuaError> {
     match e.k {
+        ExprKind::Const => {
+            // Mirrors C's `const2exp(const2val(fs, e), e)`: turn a resolved
+            // `<const>` compile-time constant back into its literal expression
+            // so the existing literal-lowering paths emit LOADI/LOADK/LOADFALSE/
+            // LOADTRUE/LOADNIL exactly as for a bare literal. The value comes
+            // from the snapshot (§4.0.A), never `dyd.actvar`.
+            let v = e
+                .u
+                .const_snapshot
+                .clone()
+                .expect("ExprKind::Const must carry a const_snapshot");
+            match v {
+                LuaValue::Int(i) => {
+                    e.k = ExprKind::KInt;
+                    e.u.ival = i;
+                }
+                LuaValue::Float(f) => {
+                    e.k = ExprKind::KFlt;
+                    e.u.nval = f;
+                }
+                LuaValue::Bool(false) => e.k = ExprKind::False,
+                LuaValue::Bool(true) => e.k = ExprKind::True,
+                LuaValue::Nil => e.k = ExprKind::Nil,
+                LuaValue::Str(s) => {
+                    e.k = ExprKind::KStr;
+                    e.u.strval = Some(s);
+                }
+                other => {
+                    unreachable!("a <const> compile-time constant cannot be {other:?}")
+                }
+            }
+        }
         ExprKind::VarArgVar => {
             mark_vararg_table_needed(fs);
             e.u.info = e.u.var_ridx as i32;
@@ -2610,10 +2712,11 @@ fn cg_exp_to_reg(fs: &mut FuncState, line: i32, e: &mut ExprDesc, reg: u8) -> Re
 }
 
 /// Like `cg_free_reg`, but only acts when the index actually belongs to a
-/// temporary register (one above `fs.nactvar`). Used by indexed-get
-/// dischargers, which may operate on either a temp result or a local.
+/// temporary register (one at or above the register watermark
+/// [`FuncState::nactvar_reg`]). Used by indexed-get dischargers, which may
+/// operate on either a temp result or a local.
 fn cg_free_reg_if_temp(fs: &mut FuncState, reg: i32) {
-    if reg >= fs.nactvar as i32 {
+    if reg >= fs.nactvar_reg as i32 {
         debug_assert!(reg < fs.freereg as i32);
         if reg == fs.freereg as i32 - 1 {
             fs.freereg -= 1;
@@ -3045,6 +3148,11 @@ fn adjust_local_vars(ls: &mut LexState, state: &mut LuaState, nvars: i32) -> Res
             // No variable name: not expected in valid source.
         }
     }
+    // Every variable adjusted here is register-backed (a `<const>` CTC is
+    // folded before this runs and excluded from the count), so the register
+    // watermark advances to the level reached after placing them. This mirrors
+    // `reg_level(ls, fs, fs.nactvar)` without re-walking `dyd.actvar`.
+    ls.fs.as_mut().unwrap().nactvar_reg = reglevel_val as u8;
     Ok(())
 }
 
@@ -3087,6 +3195,11 @@ fn remove_vars(ls: &mut LexState, fs: &mut FuncState, tolevel: i32) {
         let new_len = ls.dyd.actvar.len().saturating_sub(delta as usize);
         ls.dyd.actvar.truncate(new_len);
     }
+    // The active set shrank; recompute the register watermark from the
+    // surviving descriptors (which are still present below `tolevel`). This
+    // keeps `nactvar_reg == reg_level(ls, fs, fs.nactvar)` after any CTC that
+    // was in scope is dropped.
+    fs.nactvar_reg = reg_level(ls, fs, fs.nactvar as i32) as u8;
 }
 
 // ── §4 Upvalue handling ──────────────────────────────────────────────────────
@@ -3178,8 +3291,16 @@ fn searchvar(ls: &LexState, fs: &FuncState, n: &GcRef<LuaString>, var: &mut Expr
         if vd.name.as_ref().is_some_and(|nm| GcRef::ptr_eq(nm, n)) {
             if vd.kind == VarKind::CompileTimeConst {
                 init_exp(var, ExprKind::Const, fs.firstlocal + i);
+                // `u.info` keeps the ABSOLUTE actvar index (check_readonly reads
+                // it). The value snapshot lets discharge fold the constant from
+                // the ExprDesc alone (§4.0.A); `var_vidx` is the within-function
+                // local index so the 5.5 global-shadowing barrier can compute
+                // this constant's scope level (§4.4).
+                var.u.const_snapshot = Some(vd.const_val.clone());
+                var.u.var_vidx = i as u16;
             } else {
                 init_var(ls, fs, var, i);
+                var.u.const_snapshot = None;
                 if vd.kind == VarKind::VarArg {
                     var.k = ExprKind::VarArgVar;
                 }
@@ -3273,12 +3394,22 @@ fn singlevar(ls: &mut LexState, state: &mut LuaState, var: &mut ExprDesc) -> Res
     recurse_result?;
     if state.global().lua_version == lua_types::LuaVersion::V55 {
         match var.k {
-            ExprKind::Local | ExprKind::Const => {
+            ExprKind::Local => {
                 if let Some(global_level) = latest_matching_global_barrier_current(ls, &varname) {
                     let local_level = scope_level_for_local_level(ls, var.u.var_vidx as u8);
                     if global_level > local_level {
                         init_exp(var, ExprKind::Void, 0);
                     }
+                }
+            }
+            ExprKind::Const => {
+                // A resolved `<const>` may have been reached across one or more
+                // function boundaries. Reference 5.5 scans each enclosing
+                // function's globals and locals together at every recursive
+                // level; mirror that walk (see `ctc_shadowed_by_global`) rather
+                // than only inspecting the innermost function's barriers.
+                if ctc_shadowed_by_global(ls, &varname, var.u.info) {
+                    init_exp(var, ExprKind::Void, 0);
                 }
             }
             ExprKind::UpVal => {
@@ -3672,6 +3803,73 @@ fn latest_matching_global_barrier_current(ls: &LexState, name: &GcRef<LuaString>
         .rev()
         .find(|b| GcRef::ptr_eq(&b.name, name))
         .map(|b| b.level)
+}
+
+/// The scope level (declaration ordinal) of the `local_index`-th register/CTC
+/// local in `fs`, given `fs`'s active global-barrier `slice`. This is the
+/// function-parameterized form of [`scope_level_for_local_level`] used during
+/// the recursive resolution walk, where the function under examination is an
+/// enclosing function rather than `ls.fs`. Barriers occupy their own levels;
+/// locals fill the gaps, so the level of the k-th local is the (k+1)-th
+/// non-barrier level.
+fn scope_level_of_local_in(fs: &FuncState, slice: &[ScopeBarrier], local_index: i32) -> u8 {
+    let scope_level_max = fs.nactvar as usize + slice.len();
+    let target = local_index.max(0) as usize;
+    let mut locals_seen = 0usize;
+    for level in 0..=scope_level_max {
+        let lvl = level.min(u8::MAX as usize) as u8;
+        if slice.iter().any(|b| b.level == lvl) {
+            continue;
+        }
+        if locals_seen == target {
+            return lvl;
+        }
+        locals_seen += 1;
+    }
+    local_index.max(0).min(u8::MAX as i32) as u8
+}
+
+/// Lua 5.5: does an active `global <name>` declaration shadow the resolved
+/// `<const>` compile-time constant at absolute actvar index `ctc_abs_index`?
+///
+/// Reference 5.5's `searchvar` scans each enclosing function's global
+/// declarations and locals together at EVERY recursive level (globals live in
+/// `actvar` there), so the most recent declaration — global or local — wins at
+/// the first function that has any match. This walks the live `FuncState` chain
+/// from the innermost function outward, reconstructing each function's active
+/// barrier slice (`[first_scope_barrier .. child.first_scope_barrier]`):
+///
+/// - a matching `global` in any function nested BETWEEN the reference site and
+///   the constant's owner shadows it outright (that function has no matching
+///   local — otherwise resolution would have stopped there — so its `global` is
+///   the only match and wins, exactly as reference stops recursing at it);
+/// - a matching `global` in the OWNER function shadows the constant only when it
+///   is declared later than the constant (a strictly deeper scope level).
+///
+/// On pre-5.5 versions `scope_barriers` is always empty, so this returns
+/// `false`; it is called only from the 5.5 resolution branch regardless.
+fn ctc_shadowed_by_global(ls: &LexState, name: &GcRef<LuaString>, ctc_abs_index: i32) -> bool {
+    let mut upper = ls.scope_barriers.len();
+    let mut fs_opt = ls.fs.as_deref();
+    while let Some(fs) = fs_opt {
+        let lower = fs.first_scope_barrier.min(upper);
+        let slice = &ls.scope_barriers[lower..upper];
+        let owns = ctc_abs_index >= fs.firstlocal
+            && ctc_abs_index < fs.firstlocal + fs.nactvar as i32;
+        if owns {
+            let ctc_scope_level =
+                scope_level_of_local_in(fs, slice, ctc_abs_index - fs.firstlocal);
+            return slice
+                .iter()
+                .any(|b| GcRef::ptr_eq(&b.name, name) && b.level > ctc_scope_level);
+        }
+        if slice.iter().any(|b| GcRef::ptr_eq(&b.name, name)) {
+            return true;
+        }
+        upper = lower;
+        fs_opt = fs.prev.as_deref();
+    }
+    false
 }
 
 fn has_active_global_barrier(ls: &LexState, name: &GcRef<LuaString>) -> bool {
@@ -4271,6 +4469,7 @@ fn open_func(
     new_fs.nups = 0;
     new_fs.ndebugvars = 0;
     new_fs.nactvar = 0;
+    new_fs.nactvar_reg = 0;
     new_fs.needclose = false;
 
     new_fs.firstlocal = ls.dyd.actvar.len() as i32;
@@ -4732,6 +4931,7 @@ fn body(
         firstlabel: 0,
         ndebugvars: 0,
         nactvar: 0,
+        nactvar_reg: 0,
         first_scope_barrier: ls.scope_barriers.len(),
         nups: 0,
         freereg: 0,
@@ -6032,16 +6232,25 @@ fn localstat(ls: &mut LexState, state: &mut LuaState) -> Result<(), LuaError> {
     }
     let first_local = ls.fs.as_ref().unwrap().firstlocal;
     let last_vd_kind = ls.dyd.actvar[(first_local + vidx) as usize].kind;
-    if nvars == nexps && last_vd_kind == VarKind::Const {
-        let is_const = false; // placeholder
-        if is_const {
-            ls.dyd.actvar[(first_local + vidx) as usize].kind = VarKind::CompileTimeConst;
-            adjust_local_vars(ls, state, nvars - 1)?;
-            ls.fs.as_mut().unwrap().nactvar += 1;
-        } else {
-            adjust_assign(ls, state, nvars, nexps, &mut e)?;
-            adjust_local_vars(ls, state, nvars)?;
-        }
+    // Mirrors C's `localstat` fold (lparser.c): when the initializer count
+    // matches the variable count, the last variable is `<const>`, and its
+    // initializer is a compile-time constant, fold it — store the value on the
+    // descriptor, mark the variable RDKCTC, and emit NO register/local for it.
+    // `e` here is the last initializer straight from `explist` (a literal or a
+    // constant-folded expression), so `cg_exp2const` reads its literal fields
+    // directly. `adjust_local_vars(nvars - 1)` EXCLUDES the const (no locvar, no
+    // register); `nactvar += 1` still counts it so scope resolution sees it.
+    // Ordering is load-bearing: write `const_val` before flipping `kind`.
+    let folded = if nvars == nexps && last_vd_kind == VarKind::Const {
+        cg_exp2const(&e)
+    } else {
+        None
+    };
+    if let Some(v) = folded {
+        ls.dyd.actvar[(first_local + vidx) as usize].const_val = v;
+        ls.dyd.actvar[(first_local + vidx) as usize].kind = VarKind::CompileTimeConst;
+        adjust_local_vars(ls, state, nvars - 1)?;
+        ls.fs.as_mut().unwrap().nactvar += 1;
     } else {
         adjust_assign(ls, state, nvars, nexps, &mut e)?;
         adjust_local_vars(ls, state, nvars)?;
@@ -6284,6 +6493,21 @@ fn mainfunc(
 /// Top-level entry point: parses a whole chunk and returns the prototype of its
 /// main function. The caller wraps this `Box<LuaProto>` into a closure and hands
 /// it to the GC; that boundary is the public contract of this crate.
+///
+/// # Precondition — GC must be stopped for the whole parse window
+///
+/// The parser holds untraced references to GC-managed objects for the duration
+/// of a parse: interned name/string handles, the half-built `Box<LuaProto>`,
+/// long-string anchors, and — for `<const>` folding — the value stored in a
+/// `VarDesc::const_val` / `ExprPayload::const_snapshot` (which may be an
+/// interned string). None of these are reachable from a GC root while parsing,
+/// so a collection cycle during `parse` could free a live constant and produce
+/// a use-after-free. The supported entry points satisfy this: the loader stops
+/// the collector across the entire production parse window (`do_.rs` f_parser),
+/// and explicit `collectgarbage` requests early-return while internally stopped.
+/// A direct caller of this function that has NOT stopped the GC violates the
+/// contract — this is a pre-existing whole-parser requirement (the constant
+/// table has always needed it), not specific to `<const>` folding.
 pub fn parse(
     state: &mut LuaState,
     dyd: DynData,
@@ -6353,6 +6577,7 @@ pub fn parse(
         firstlabel: 0,
         ndebugvars: 0,
         nactvar: 0,
+        nactvar_reg: 0,
         first_scope_barrier: 0,
         nups: 0,
         freereg: 0,
@@ -6411,6 +6636,7 @@ mod tests {
             firstlabel: 0,
             ndebugvars: 0,
             nactvar: 0,
+            nactvar_reg: 0,
             first_scope_barrier: 0,
             nups: 0,
             freereg: 0,
