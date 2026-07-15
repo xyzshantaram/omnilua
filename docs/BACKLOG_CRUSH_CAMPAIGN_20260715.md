@@ -152,7 +152,29 @@ on any canary/official flip; codex fix-rounds capped at ~3 with triage
   public handle `to_pointer()` now equals the VM `%p`. r3 APPROVED. Lesson: a
   "grab-bag" hid a real cross-path pointer-identity contract; the codex loop
   (3 rounds) is what surfaced it. Kept, not split.
-- **#301 io/os errno fidelity — in fix-round (PR #302).** Root cause confirmed:
+- **#300 `<const>` folding — CLOSED, MERGED (#303).** Executed via
+  deep-spec→codex→execute. The nvarstack/reglevel register-watermark refactor
+  landed as a bisectable byte-identical commit (sha256-identical bytecode across
+  56 dump entries), then the fold. Codex r1 found the 5.5 barrier only inspected
+  the innermost function (enclosing `global x` failed to shadow a folded CTC) →
+  fixed with a per-level recursive barrier walk mirroring reference 5.5. Official
+  44/44, multiversion 185/185, all oracle cases match 5.4/5.5, pre-5.4 byte-
+  identical. Filed **#304** (the analogous regular-local/UpVal shadowing bug the
+  agent surfaced — same root, different resolution path, deferred to keep blast
+  radius minimal). Lesson: the value-model workflow earned its keep — the spec
+  review turned "wire two functions" into "a register-accounting refactor is the
+  prerequisite," which is exactly what shipped.
+- **#301 io/os errno fidelity — CLOSED, MERGED (#302).** Official 44/44 +
+  check.sh ×5 (57/54/23/7/10, 0 failed) + wasm gate. Took 3 codex rounds (each
+  caught a real defect: wasm compile break, os.remove errno-clobber, live
+  errno-0 fallback, then a wasm-strerror regression the errno ABI introduced +
+  the write-side tuple, then a Windows Win32-mistranslation). Applied keep-vs-
+  nuke on round 3: fixed the one true regression (gate posix_strerror to
+  unix+wasm) myself and SPLIT the two incomplete-feature/edge items (wasm errno-1
+  ABI encoding, short-write tuple, Win32→errno normalization) to **#305** rather
+  than let the grab-bag spiral. Source-breaking hook signature change
+  (Result<_,LuaError> → io::Result) is CHANGELOG-noted. Root cause
+  confirmed:
   the FileOpenHook/Remove/Rename type alias was `Result<_, LuaError>`, which
   structurally can't carry a numeric errno — so every hook had to stringify the
   io::Error (verbose `(os error N)` Display) and drop `raw_os_error()`, giving
