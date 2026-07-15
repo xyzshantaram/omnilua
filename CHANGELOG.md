@@ -32,10 +32,18 @@ original `io::Error` end to end; the failure message is rendered as clean
 carries one (a non-OS failure — e.g. a sandbox "no filesystem hook registered" —
 now yields the honest 2-value `(nil, msg)` instead of a fabricated errno 0).
 Also fixed alongside: `os.remove` on a symlink now reports the real `unlink`
-errno (mirroring C `remove(3)`) instead of a spurious `rmdir` `ENOTDIR`; and
+errno (mirroring C `remove(3)`) instead of a spurious `rmdir` `ENOTDIR`;
 `io.input`/`io.output`/`io.lines` open-failure messages are version-gated
 (Lua 5.1 uses the `argerror` form, 5.2+ the `cannot open file` form, with the
-`luaL_where` location prefix), matching every reference binary 5.1–5.5.
+`luaL_where` location prefix), matching every reference binary 5.1–5.5;
+`io.write`/`file:write` to a bad descriptor now RETURN the `luaL_fileresult`
+failure tuple (`nil, "Bad file descriptor", 9`) instead of raising, with Lua
+5.5's extra fourth value (total bytes written) appended per `g_write`; and
+reads/writes against a wrong-mode handle report the real `EBADF` the OS yields.
+On `wasm32-unknown-unknown` — where `std` has no `strerror` table and
+`io::Error` `Display` renders "operation successful" — the errno message is
+resolved from a target-independent POSIX `strerror` table so the wasm build's
+`(nil, msg, errno)` matches a native build's.
 
 ## [0.6.0] - 2026-07-13
 

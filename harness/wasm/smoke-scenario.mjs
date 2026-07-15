@@ -51,6 +51,15 @@ assert(ok == nil)
 assert(type(msg) == "string")
 assert(errno == 21)
 assert(dir:close())
+-- #301: a missing-file open must carry the real errno AND a real strerror
+-- message on wasm (where std has no strerror table), not "operation successful".
+local mopen, mmsg, merrno = io.open("./hosted-54/missing-301")
+assert(mopen == nil)
+assert(merrno == 2, "expected ENOENT (2), got " .. tostring(merrno))
+assert(
+  mmsg == "./hosted-54/missing-301: No such file or directory",
+  "expected clean strerror message, got " .. tostring(mmsg)
+)
 local out = assert(io.open("./hosted-54/runtime.txt", "w"))
 assert(out:setvbuf("no"))
 assert(out:write("runtime ", greeter.answer()))

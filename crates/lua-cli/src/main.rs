@@ -128,6 +128,14 @@ impl FsFile {
     }
 }
 
+/// Capture a read/write-error's `(errno, message)` for `last_error_info`.
+///
+/// The `unwrap_or(0)` is safe here (not a #301 errno-0 fallback): the io read
+/// path treats a `0` code as "no OS errno" and rebuilds a `raw_os_error`-less
+/// `io::Error` (`ErrorKind::Other`) before it reaches `file_result`, so a
+/// missing errno surfaces to Lua as the honest 2-value `(nil, msg)`, never a
+/// fabricated errno `0`. A real read/write syscall failure always carries a
+/// non-zero `raw_os_error()`, which flows through as the faithful errno.
 fn io_error_info(err: &io::Error) -> (i32, String) {
     (err.raw_os_error().unwrap_or(0), err.to_string())
 }

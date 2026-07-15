@@ -125,6 +125,43 @@ fn io_input_open_failure_matches_reference_all_versions() {
     }
 }
 
+/// HIGH-2: writing to a bad descriptor (a file opened read-only) must RETURN
+/// the `luaL_fileresult` failure tuple, not raise — through the real CLI hook,
+/// for both `io.write` and `file:write`. 5.1-5.4 return `(nil, "Bad file
+/// descriptor", 9)`; 5.5 additionally returns a 4th value, total bytes written
+/// (0). The same read-only fixture serves both interpreters (a failed write
+/// does not mutate it).
+#[test]
+fn write_to_bad_fd_returns_triple_all_versions() {
+    for v in VERSIONS {
+        let Some(refbin) = reference_binary(v) else {
+            continue;
+        };
+        let path = unique("badfd");
+        std::fs::write(&path, b"data").expect("create read-only-write fixture");
+        let p = path.display();
+        let f_code = format!(
+            "local f = io.open('{p}', 'r'); \
+             print(f:write('xuxu')); \
+             print('n=' .. select('#', f:write('yy')))"
+        );
+        let io_code = format!(
+            "local f = io.open('{p}', 'r'); io.output(f); \
+             print(io.write('xuxu')); \
+             print('n=' .. select('#', io.write('yy')))"
+        );
+        for (label, code) in [("file:write", &f_code), ("io.write", &io_code)] {
+            let omni = run_omni(v, code);
+            let reference = run_ref(&refbin, code);
+            assert_eq!(
+                omni, reference,
+                "[{v}] {label} to a bad descriptor diverged from reference"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 // ── os.remove on real fixtures (HIGH-2), fixture path normalized ─────────────
 
 /// Run `os.remove(<path>)` under omniLua and the reference on separate but
