@@ -1,0 +1,26 @@
+name: Windows check
+
+# Manual-dispatch mirror of the release gate's windows-build job, for
+# verifying a branch on real MSVC without running Windows CI on every PR
+# (the suite otherwise executes on Windows only at release time).
+#
+#   gh workflow run windows-check.yml --ref <branch>
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-check:
+    name: build + test on windows (msvc)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build (workspace, windows)
+        run: cargo build --locked --workspace --exclude lua-wasm --exclude lua-wasm-smoke
+      - name: cargo test (workspace, windows)
+        run: cargo test --locked --workspace --exclude lua-wasm --exclude lua-wasm-smoke
