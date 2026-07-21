@@ -482,15 +482,25 @@ fn local_offset_hook(t: i64) -> i64 {
 /// when the two decompositions fall on either side of Jan 1).
 #[cfg(windows)]
 fn local_offset_hook(t: i64) -> i64 {
-    // SAFETY: `localtime_s`/`gmtime_s` each write a fully-initialised `struct
-    // tm` into the stack-allocated slot and return 0 on success. We pass valid
-    // pointers; nothing escapes the calls. On any error return we report offset
-    // 0 (UTC), the safe degenerate matching the no-hook path.
+    // SAFETY: `_localtime64_s`/`_gmtime64_s` each write a fully-initialised
+    // `struct tm` into the stack-allocated slot and return 0 on success. We
+    // pass valid pointers; nothing escapes the calls. On any error return we
+    // report offset 0 (UTC), the safe degenerate matching the no-hook path.
+    //
+    // We call the underscore-prefixed 64-bit variants directly rather than
+    // `libc::localtime_s`/`gmtime_s` because MSVCRT exports only
+    // `_localtime64_s`/`_gmtime64_s` as linker symbols; the unprefixed names
+    // are inline CRT-header wrappers and are never present in any import
+    // library, causing LNK2019 "unresolved external symbol" at link time.
     unsafe {
+        extern "C" {
+            fn _localtime64_s(tm: *mut libc::tm, time: *const libc::time_t) -> libc::c_int;
+            fn _gmtime64_s(tm: *mut libc::tm, time: *const libc::time_t) -> libc::c_int;
+        }
         let tt = t as libc::time_t;
         let mut loc: libc::tm = std::mem::zeroed();
         let mut utc: libc::tm = std::mem::zeroed();
-        if libc::localtime_s(&mut loc, &tt) != 0 || libc::gmtime_s(&mut utc, &tt) != 0 {
+        if _localtime64_s(&mut loc, &tt) != 0 || _gmtime64_s(&mut utc, &tt) != 0 {
             return 0;
         }
         let days = if loc.tm_year != utc.tm_year {
