@@ -180,14 +180,16 @@ fn lua_cdir(version: lua_types::LuaVersion) -> Vec<u8> {
     dir
 }
 
-/// The compiled-in `package.path` default for `version`. The entry SHAPE, not
-/// just the version segment, differs by era:
+/// The compiled-in non-Windows `package.path` default for `version`. The
+/// entry SHAPE, not just the version segment, differs by era:
 /// - **5.1**: `./?.lua` FIRST, then `LDIR`/`CDIR`, no trailing `./?/init.lua`.
 /// - **5.2**: `LDIR`/`CDIR` first, `./?.lua` LAST, no `./?/init.lua` at all.
 /// - **5.3/5.4/5.5**: `LDIR`/`CDIR` first, then BOTH `./?.lua` and
 ///   `./?/init.lua` last (the `LUA_SHRDIR`-derived shape 5.3 introduced).
-#[cfg(not(target_os = "windows"))]
-fn lua_path_default(version: lua_types::LuaVersion) -> Vec<u8> {
+///
+/// Compiled (and unit-tested) on every platform; [`lua_path_default`] selects
+/// it on non-Windows targets.
+fn unix_path_default(version: lua_types::LuaVersion) -> Vec<u8> {
     let ldir = lua_ldir(version);
     let cdir = lua_cdir(version);
     let mut path = Vec::new();
@@ -227,22 +229,56 @@ fn lua_path_default(version: lua_types::LuaVersion) -> Vec<u8> {
     path
 }
 
-/// The Windows fallback default is version-flat, unchanged by this fix: the
-/// `!`-relative (`LUA_EXEC_DIR`) substitution real Windows builds perform via
-/// `setprogdir` is not implemented on this platform (see `setpath`'s doc
-/// comment on the same gap), so there is no faithful versioned
-/// installed-module directory to build here either.
-#[cfg(target_os = "windows")]
-fn lua_path_default(_version: lua_types::LuaVersion) -> Vec<u8> {
-    b"./?.lua;./?/init.lua".to_vec()
+/// The compiled-in Windows `package.path` default for `version`, transcribed
+/// from each release's `luaconf.h` `_WIN32` branch (`LUA_LDIR` = `!\lua\`,
+/// `LUA_CDIR` = `!\`, and from 5.3 `LUA_SHRDIR` = `!\..\share\lua\<vdir>\`).
+/// `!` is `LUA_EXEC_DIR`, replaced by the running executable's directory in
+/// [`setprogdir`]. The era split mirrors [`unix_path_default`]:
+/// - **5.1**: `.\?.lua` FIRST, then `LDIR`/`CDIR` entries.
+/// - **5.2**: `LDIR`/`CDIR` first, `.\?.lua` LAST, no `.\?\init.lua`.
+/// - **5.3/5.4/5.5**: `LDIR`/`CDIR`, then `SHRDIR`, then both `.\` entries.
+///
+/// Compiled (and unit-tested) on every platform; [`lua_path_default`] selects
+/// it on Windows targets.
+fn windows_path_default(version: lua_types::LuaVersion) -> Vec<u8> {
+    match version {
+        lua_types::LuaVersion::V51 => {
+            b".\\?.lua;!\\lua\\?.lua;!\\lua\\?\\init.lua;!\\?.lua;!\\?\\init.lua".to_vec()
+        }
+        lua_types::LuaVersion::V52 => {
+            b"!\\lua\\?.lua;!\\lua\\?\\init.lua;!\\?.lua;!\\?\\init.lua;.\\?.lua".to_vec()
+        }
+        _ => {
+            let vdir = lua_vdir(version);
+            let mut path = Vec::new();
+            path.extend_from_slice(b"!\\lua\\?.lua;!\\lua\\?\\init.lua;");
+            path.extend_from_slice(b"!\\?.lua;!\\?\\init.lua;");
+            path.extend_from_slice(b"!\\..\\share\\lua\\");
+            path.extend_from_slice(vdir);
+            path.extend_from_slice(b"\\?.lua;");
+            path.extend_from_slice(b"!\\..\\share\\lua\\");
+            path.extend_from_slice(vdir);
+            path.extend_from_slice(b"\\?\\init.lua;");
+            path.extend_from_slice(b".\\?.lua;.\\?\\init.lua");
+            path
+        }
+    }
 }
 
-/// The compiled-in `package.cpath` default for `version` — same era split as
-/// [`lua_path_default`]: 5.1 puts `./?.so` FIRST with no `./` alternative
-/// after `CDIR`'s entries; 5.2+ share one shape (`CDIR` entries, then
-/// `./?.so` last).
-#[cfg(not(target_os = "windows"))]
-fn lua_cpath_default(version: lua_types::LuaVersion) -> Vec<u8> {
+/// The compiled-in `package.path` default for `version` on THIS platform.
+fn lua_path_default(version: lua_types::LuaVersion) -> Vec<u8> {
+    if cfg!(target_os = "windows") {
+        windows_path_default(version)
+    } else {
+        unix_path_default(version)
+    }
+}
+
+/// The compiled-in non-Windows `package.cpath` default for `version` — same
+/// era split as [`unix_path_default`]: 5.1 puts `./?.so` FIRST with no `./`
+/// alternative after `CDIR`'s entries; 5.2+ share one shape (`CDIR` entries,
+/// then `./?.so` last).
+fn unix_cpath_default(version: lua_types::LuaVersion) -> Vec<u8> {
     let cdir = lua_cdir(version);
     let mut path = Vec::new();
     match version {
@@ -263,10 +299,35 @@ fn lua_cpath_default(version: lua_types::LuaVersion) -> Vec<u8> {
     path
 }
 
-/// See [`lua_path_default`]'s Windows note — unchanged, version-flat.
-#[cfg(target_os = "windows")]
-fn lua_cpath_default(_version: lua_types::LuaVersion) -> Vec<u8> {
-    b"./?.dll".to_vec()
+/// The compiled-in Windows `package.cpath` default for `version`, transcribed
+/// from each release's `luaconf.h` `_WIN32` branch — see
+/// [`windows_path_default`] for the `!` (`LUA_EXEC_DIR`) convention:
+/// - **5.1**: `.\?.dll` FIRST, then `!\?.dll;!\loadall.dll`.
+/// - **5.2**: `!\?.dll;!\loadall.dll`, then `.\?.dll` LAST.
+/// - **5.3/5.4/5.5**: adds `!\..\lib\lua\<vdir>\?.dll` after `!\?.dll`.
+fn windows_cpath_default(version: lua_types::LuaVersion) -> Vec<u8> {
+    match version {
+        lua_types::LuaVersion::V51 => b".\\?.dll;!\\?.dll;!\\loadall.dll".to_vec(),
+        lua_types::LuaVersion::V52 => b"!\\?.dll;!\\loadall.dll;.\\?.dll".to_vec(),
+        _ => {
+            let vdir = lua_vdir(version);
+            let mut path = Vec::new();
+            path.extend_from_slice(b"!\\?.dll;!\\..\\lib\\lua\\");
+            path.extend_from_slice(vdir);
+            path.extend_from_slice(b"\\?.dll;");
+            path.extend_from_slice(b"!\\loadall.dll;.\\?.dll");
+            path
+        }
+    }
+}
+
+/// The compiled-in `package.cpath` default for `version` on THIS platform.
+fn lua_cpath_default(version: lua_types::LuaVersion) -> Vec<u8> {
+    if cfg!(target_os = "windows") {
+        windows_cpath_default(version)
+    } else {
+        unix_cpath_default(version)
+    }
 }
 
 fn getenv_bytes(state: &LuaState, name: &[u8]) -> Option<Vec<u8>> {
@@ -510,10 +571,12 @@ fn noenv(state: &mut LuaState) -> bool {
 /// [`has_versioned_env_vars`] is true for this instance's version — 5.1 has
 /// no versioned env vars at all) → unversioned env var (`LUA_PATH`) →
 /// compiled-in default. When the env var contains `;;`, the compiled-in
-/// default is spliced in place of `;;`. The caller must leave the `package`
-/// table at the stack top; the path value is set on it directly (the
-/// versioned env-var name is computed off-stack, so no index bookkeeping is
-/// needed).
+/// default is spliced in place of `;;`. On Windows the composed value then
+/// goes through [`setprogdir`] (`!` → executable directory), matching C's
+/// ordering: the substitution applies to environment-provided paths too, not
+/// only to the defaults. The caller must leave the `package` table at the
+/// stack top; the path value is set on it directly (the versioned env-var
+/// name is computed off-stack, so no index bookkeeping is needed).
 fn setpath(
     state: &mut LuaState,
     fieldname: &[u8],
@@ -540,10 +603,7 @@ fn setpath(
         Some(path) => modern_double_semicolon_splice(&path, dft),
     };
 
-    // The Windows `setprogdir` step (replace `LUA_EXEC_DIR` with the running
-    // executable's directory via `GetModuleFileNameA`, a Win32/`unsafe` call) is
-    // a no-op on every other platform and is not yet implemented here, so the
-    // `LUA_EXEC_DIR` substitution is skipped.
+    let final_path = setprogdir(final_path)?;
     let s = state.intern_str(&final_path)?;
     state.push(LuaValue::Str(s));
     state.set_field(-2, fieldname)?;
@@ -607,6 +667,34 @@ fn modern_double_semicolon_splice(path: &[u8], dft: &[u8]) -> Vec<u8> {
         buf.extend_from_slice(&path[after..]);
     }
     buf
+}
+
+/// Upstream `setprogdir` (loadlib.c, Windows-only): replace every `!`
+/// (`LUA_EXEC_DIR`; 5.1 spells it `LUA_EXECDIR`, same value) in the composed
+/// path with the running executable's directory — `GetModuleFileNameA`
+/// truncated at its last `\`, here `std::env::current_exe().parent()`. C
+/// raises `"unable to get ModuleFileName"` via `luaL_error` when the lookup
+/// fails; the `current_exe` error and missing-parent cases map onto the same
+/// message. The directory bytes come from `to_string_lossy`, so a non-Unicode
+/// executable path degrades the same lossy way as C's ANSI-codepage `A` call.
+#[cfg(target_os = "windows")]
+fn setprogdir(path: Vec<u8>) -> Result<Vec<u8>, LuaError> {
+    let exe = std::env::current_exe()
+        .map_err(|_| LuaError::runtime(format_args!("unable to get ModuleFileName")))?;
+    let Some(dir) = exe.parent() else {
+        return Err(LuaError::runtime(format_args!(
+            "unable to get ModuleFileName"
+        )));
+    };
+    let dir = dir.to_string_lossy();
+    Ok(gsub_bytes(&path, b"!", dir.as_bytes()))
+}
+
+/// Non-Windows `setprogdir` is the identity, mirroring C's
+/// `#define setprogdir(L) ((void)0)`: a literal `!` in a POSIX path is kept.
+#[cfg(not(target_os = "windows"))]
+fn setprogdir(path: Vec<u8>) -> Result<Vec<u8>, LuaError> {
+    Ok(path)
 }
 
 // ── CLIBS registry table ──────────────────────────────────────────────────────
@@ -1572,16 +1660,15 @@ mod tests {
     /// (not just the `5.x` segment) differs by era — see `lua_path_default`'s
     /// doc comment.
     #[test]
-    #[cfg(not(target_os = "windows"))]
     fn path_default_is_version_exact() {
         assert_eq!(
-            lua_path_default(LuaVersion::V51),
+            unix_path_default(LuaVersion::V51),
             b"./?.lua;/usr/local/share/lua/5.1/?.lua;/usr/local/share/lua/5.1/?/init.lua;\
               /usr/local/lib/lua/5.1/?.lua;/usr/local/lib/lua/5.1/?/init.lua"
                 .to_vec()
         );
         assert_eq!(
-            lua_path_default(LuaVersion::V52),
+            unix_path_default(LuaVersion::V52),
             b"/usr/local/share/lua/5.2/?.lua;/usr/local/share/lua/5.2/?/init.lua;\
               /usr/local/lib/lua/5.2/?.lua;/usr/local/lib/lua/5.2/?/init.lua;./?.lua"
                 .to_vec()
@@ -1598,15 +1685,14 @@ mod tests {
             expected.extend_from_slice(b"/?.lua;/usr/local/lib/lua/");
             expected.extend_from_slice(vdir);
             expected.extend_from_slice(b"/?/init.lua;./?.lua;./?/init.lua");
-            assert_eq!(lua_path_default(v), expected, "{v:?}");
+            assert_eq!(unix_path_default(v), expected, "{v:?}");
         }
     }
 
     #[test]
-    #[cfg(not(target_os = "windows"))]
     fn cpath_default_is_version_exact() {
         assert_eq!(
-            lua_cpath_default(LuaVersion::V51),
+            unix_cpath_default(LuaVersion::V51),
             b"./?.so;/usr/local/lib/lua/5.1/?.so;/usr/local/lib/lua/5.1/loadall.so".to_vec()
         );
         for v in [LuaVersion::V52, LuaVersion::V53, LuaVersion::V54, LuaVersion::V55] {
@@ -1617,20 +1703,104 @@ mod tests {
             expected.extend_from_slice(b"/?.so;/usr/local/lib/lua/");
             expected.extend_from_slice(vdir);
             expected.extend_from_slice(b"/loadall.so;./?.so");
-            assert_eq!(lua_cpath_default(v), expected, "{v:?}");
+            assert_eq!(unix_cpath_default(v), expected, "{v:?}");
         }
+    }
+
+    /// Byte-for-byte expansion of each release's `luaconf.h` `_WIN32`
+    /// `LUA_PATH_DEFAULT` (`LUA_LDIR` = `!\lua\`, `LUA_CDIR` = `!\`, 5.3+
+    /// `LUA_SHRDIR` = `!\..\share\lua\<vdir>\`), pre-`setprogdir` — the `!`
+    /// marks are still literal here.
+    #[test]
+    fn windows_path_default_is_version_exact() {
+        assert_eq!(
+            windows_path_default(LuaVersion::V51),
+            b".\\?.lua;!\\lua\\?.lua;!\\lua\\?\\init.lua;!\\?.lua;!\\?\\init.lua".to_vec()
+        );
+        assert_eq!(
+            windows_path_default(LuaVersion::V52),
+            b"!\\lua\\?.lua;!\\lua\\?\\init.lua;!\\?.lua;!\\?\\init.lua;.\\?.lua".to_vec()
+        );
+        for v in [LuaVersion::V53, LuaVersion::V54, LuaVersion::V55] {
+            let vdir = lua_vdir(v);
+            let mut expected = Vec::new();
+            expected.extend_from_slice(b"!\\lua\\?.lua;!\\lua\\?\\init.lua;");
+            expected.extend_from_slice(b"!\\?.lua;!\\?\\init.lua;");
+            expected.extend_from_slice(b"!\\..\\share\\lua\\");
+            expected.extend_from_slice(vdir);
+            expected.extend_from_slice(b"\\?.lua;!\\..\\share\\lua\\");
+            expected.extend_from_slice(vdir);
+            expected.extend_from_slice(b"\\?\\init.lua;.\\?.lua;.\\?\\init.lua");
+            assert_eq!(windows_path_default(v), expected, "{v:?}");
+        }
+    }
+
+    /// Byte-for-byte expansion of each release's `luaconf.h` `_WIN32`
+    /// `LUA_CPATH_DEFAULT`, pre-`setprogdir`.
+    #[test]
+    fn windows_cpath_default_is_version_exact() {
+        assert_eq!(
+            windows_cpath_default(LuaVersion::V51),
+            b".\\?.dll;!\\?.dll;!\\loadall.dll".to_vec()
+        );
+        assert_eq!(
+            windows_cpath_default(LuaVersion::V52),
+            b"!\\?.dll;!\\loadall.dll;.\\?.dll".to_vec()
+        );
+        for v in [LuaVersion::V53, LuaVersion::V54, LuaVersion::V55] {
+            let vdir = lua_vdir(v);
+            let mut expected = b"!\\?.dll;!\\..\\lib\\lua\\".to_vec();
+            expected.extend_from_slice(vdir);
+            expected.extend_from_slice(b"\\?.dll;!\\loadall.dll;.\\?.dll");
+            assert_eq!(windows_cpath_default(v), expected, "{v:?}");
+        }
+    }
+
+    /// The string step of `setprogdir`: `gsub_bytes(path, b"!", dir)` must
+    /// replace EVERY `!` occurrence (C uses `luaL_gsub`), leave `!`-free
+    /// paths untouched, and compose with the version defaults.
+    #[test]
+    fn exec_dir_substitution_replaces_every_mark() {
+        assert_eq!(
+            gsub_bytes(
+                &windows_cpath_default(LuaVersion::V54),
+                b"!",
+                b"C:\\Lua\\bin"
+            ),
+            b"C:\\Lua\\bin\\?.dll;C:\\Lua\\bin\\..\\lib\\lua\\5.4\\?.dll;\
+              C:\\Lua\\bin\\loadall.dll;.\\?.dll"
+                .to_vec()
+        );
+        assert_eq!(
+            gsub_bytes(b".\\?.lua;.\\?\\init.lua", b"!", b"C:\\Lua\\bin"),
+            b".\\?.lua;.\\?\\init.lua".to_vec()
+        );
     }
 
     /// No two versions may collide on their directory segment or defaults —
     /// a regression here would silently point every version at the same
-    /// installed-module directory again (the shape of issue #273).
+    /// installed-module directory again (the shape of issue #273). Checked
+    /// for BOTH platform flavors, on every platform.
     #[test]
-    #[cfg(not(target_os = "windows"))]
     fn every_version_has_a_distinct_path_default() {
         for (i, a) in ALL.iter().enumerate() {
             for b in &ALL[i + 1..] {
-                assert_ne!(lua_path_default(*a), lua_path_default(*b), "{a:?} vs {b:?}");
-                assert_ne!(lua_cpath_default(*a), lua_cpath_default(*b), "{a:?} vs {b:?}");
+                assert_ne!(unix_path_default(*a), unix_path_default(*b), "{a:?} vs {b:?}");
+                assert_ne!(
+                    unix_cpath_default(*a),
+                    unix_cpath_default(*b),
+                    "{a:?} vs {b:?}"
+                );
+                assert_ne!(
+                    windows_path_default(*a),
+                    windows_path_default(*b),
+                    "{a:?} vs {b:?}"
+                );
+                assert_ne!(
+                    windows_cpath_default(*a),
+                    windows_cpath_default(*b),
+                    "{a:?} vs {b:?}"
+                );
             }
         }
     }
