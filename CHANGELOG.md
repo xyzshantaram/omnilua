@@ -46,6 +46,12 @@ directory.
 - New `docs/WINDOWS_DIVERGENCES.md` ledger: what is fixed, what is open
   (text-mode stdio), what remains unverified until the oracle can run on
   Windows.
+- The first Windows suite runs also hardened the tests themselves: six
+  POSIX-hardcoded loadlib expectations are now platform-aware (PR #316),
+  and the embedding leak canary got a measured Windows byte envelope
+  (PR #318) for a pre-existing, GC-reclaimable ~40-260 B/VM retention now
+  tracked as #317 — the detached-allocation tripwire stays exact
+  everywhere.
 
 ## [0.7.0] - 2026-07-15
 
