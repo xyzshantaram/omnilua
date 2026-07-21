@@ -473,15 +473,60 @@ fn local_offset_hook(t: i64) -> i64 {
     }
 }
 
+/// One wall-clock decomposition of an instant — the `struct tm` subset the
+/// Windows local-offset derivation reads. `year` counts from 1900
+/// (`tm_year`); `yday` is 0-based day-of-year (`tm_yday`).
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Copy)]
+struct WallClock {
+    year: i32,
+    yday: i32,
+    hour: i32,
+    min: i32,
+    sec: i32,
+}
+
+/// Seconds of `loc` minus `utc`, both decompositions of the SAME instant —
+/// the `tm_gmtoff` substitute for platforms whose `struct tm` lacks the
+/// field. A real timezone offset is within ±24h, so the day component is at
+/// most ±1: when the years differ the two wall clocks straddle Jan 1 and the
+/// day delta is exactly ±1 in the direction of the newer year (the raw
+/// `tm_yday` difference would report a bogus ±364/365 there); within one
+/// year it is the `tm_yday` difference. Compiled (and unit-tested) on every
+/// platform; only the Windows [`local_offset_hook`] calls it in production.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wall_clock_offset_seconds(loc: WallClock, utc: WallClock) -> i64 {
+    let days = if loc.year != utc.year {
+        if loc.year > utc.year {
+            1
+        } else {
+            -1
+        }
+    } else {
+        i64::from(loc.yday - utc.yday)
+    };
+    days * 86_400
+        + i64::from(loc.hour - utc.hour) * 3_600
+        + i64::from(loc.min - utc.min) * 60
+        + i64::from(loc.sec - utc.sec)
+}
+
 /// Windows local timezone offset. MSVCRT's libc exposes neither `localtime_r`
 /// nor a `tm_gmtoff` field nor `mktime`, so we cannot read the offset directly.
-/// Instead we decompose the same instant `t` two ways — `localtime_s` (local
-/// wall clock) and `gmtime_s` (UTC wall clock) — and return their difference in
-/// seconds. A timezone offset is always within ±24h, so the day component is at
-/// most ±1 day and is recovered from `tm_yday` (with a year-boundary correction
-/// when the two decompositions fall on either side of Jan 1).
+/// Instead we decompose the same instant `t` two ways — `_localtime64_s`
+/// (local wall clock) and `_gmtime64_s` (UTC wall clock) — and return their
+/// difference via [`wall_clock_offset_seconds`].
 #[cfg(windows)]
 fn local_offset_hook(t: i64) -> i64 {
+    fn to_wall(tm: &libc::tm) -> WallClock {
+        WallClock {
+            year: tm.tm_year,
+            yday: tm.tm_yday,
+            hour: tm.tm_hour,
+            min: tm.tm_min,
+            sec: tm.tm_sec,
+        }
+    }
     // SAFETY: `_localtime64_s`/`_gmtime64_s` each write a fully-initialised
     // `struct tm` into the stack-allocated slot and return 0 on success. We
     // pass valid pointers; nothing escapes the calls. On any error return we
@@ -503,19 +548,7 @@ fn local_offset_hook(t: i64) -> i64 {
         if _localtime64_s(&mut loc, &tt) != 0 || _gmtime64_s(&mut utc, &tt) != 0 {
             return 0;
         }
-        let days = if loc.tm_year != utc.tm_year {
-            if loc.tm_year > utc.tm_year {
-                1
-            } else {
-                -1
-            }
-        } else {
-            (loc.tm_yday - utc.tm_yday) as i64
-        };
-        days * 86_400
-            + (loc.tm_hour - utc.tm_hour) as i64 * 3_600
-            + (loc.tm_min - utc.tm_min) as i64 * 60
-            + (loc.tm_sec - utc.tm_sec) as i64
+        wall_clock_offset_seconds(to_wall(&loc), to_wall(&utc))
     }
 }
 
@@ -558,12 +591,35 @@ fn temp_name_hook() -> Result<Vec<u8>, LuaError> {
     Ok(path)
 }
 
+/// The platform shell invocation behind `os.execute`/`io.popen`, mirroring
+/// what C's `system(3)`/`popen(3)` do: `/bin/sh -c <cmd>` on POSIX.
+#[cfg(not(windows))]
+fn shell_command(cmd_str: &str) -> std::process::Command {
+    let mut command = std::process::Command::new("/bin/sh");
+    command.arg("-c").arg(cmd_str);
+    command
+}
+
+/// The platform shell invocation behind `os.execute`/`io.popen`, mirroring
+/// what the MSVC CRT's `system`/`_popen` do: run `%COMSPEC% /C <cmd>`, with
+/// `cmd.exe` when `COMSPEC` is unset (the CRT's own contract). The command
+/// text is appended via `raw_arg` because `cmd.exe` does not parse the MSVC
+/// quoting rules `Command`'s default escaper targets — the CRT hands the
+/// string to the shell verbatim, and so do we.
+#[cfg(windows)]
+fn shell_command(cmd_str: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    let comspec = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+    let mut command = std::process::Command::new(comspec);
+    command.arg("/C");
+    command.raw_arg(cmd_str);
+    command
+}
+
 fn os_execute_hook(cmd: &[u8]) -> Result<OsExecuteResult, LuaError> {
     let cmd_str = std::str::from_utf8(cmd)
         .map_err(|_| LuaError::runtime(format_args!("os.execute command not valid UTF-8")))?;
-    let status = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg(cmd_str)
+    let status = shell_command(cmd_str)
         .status()
         .map_err(|err| LuaError::runtime(format_args!("os.execute failed: {}", err)))?;
 
@@ -628,8 +684,7 @@ impl PopenFile {
                 ));
             }
         };
-        let mut command = std::process::Command::new("/bin/sh");
-        command.arg("-c").arg(cmd_str);
+        let mut command = shell_command(cmd_str);
         if read_mode {
             command.stdout(std::process::Stdio::piped());
         } else {
@@ -1637,5 +1692,75 @@ fn main() -> ExitCode {
             eprintln!("[panic] {}", msg);
             ExitCode::from(101)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{wall_clock_offset_seconds, WallClock};
+
+    fn wc(year: i32, yday: i32, hour: i32, min: i32, sec: i32) -> WallClock {
+        WallClock {
+            year,
+            yday,
+            hour,
+            min,
+            sec,
+        }
+    }
+
+    /// Plain same-day offsets, both signs, including sub-hour zones
+    /// (+05:45 Kathmandu-style needs the minute term).
+    #[test]
+    fn same_day_offsets() {
+        assert_eq!(
+            wall_clock_offset_seconds(wc(126, 10, 14, 0, 0), wc(126, 10, 9, 0, 0)),
+            5 * 3_600
+        );
+        assert_eq!(
+            wall_clock_offset_seconds(wc(126, 10, 4, 0, 0), wc(126, 10, 9, 0, 0)),
+            -5 * 3_600
+        );
+        assert_eq!(
+            wall_clock_offset_seconds(wc(126, 10, 15, 15, 0), wc(126, 10, 9, 30, 0)),
+            5 * 3_600 + 45 * 60
+        );
+        assert_eq!(
+            wall_clock_offset_seconds(wc(126, 10, 9, 0, 0), wc(126, 10, 9, 0, 0)),
+            0
+        );
+    }
+
+    /// Midnight straddles within one year: the `tm_yday` difference carries
+    /// the ±1 day term.
+    #[test]
+    fn day_boundary_same_year() {
+        assert_eq!(
+            wall_clock_offset_seconds(wc(126, 11, 0, 30, 0), wc(126, 10, 23, 30, 0)),
+            3_600
+        );
+        assert_eq!(
+            wall_clock_offset_seconds(wc(126, 10, 23, 30, 0), wc(126, 11, 0, 30, 0)),
+            -3_600
+        );
+    }
+
+    /// Jan 1 straddles: the years differ, `tm_yday` jumps between 0 and
+    /// 364/365, and the year comparison must pin the day delta to ±1 —
+    /// feeding the raw yday difference here would be off by a whole year.
+    #[test]
+    fn year_boundary_pins_day_delta() {
+        assert_eq!(
+            wall_clock_offset_seconds(wc(126, 0, 0, 30, 0), wc(125, 364, 23, 30, 0)),
+            3_600
+        );
+        assert_eq!(
+            wall_clock_offset_seconds(wc(125, 364, 23, 0, 0), wc(126, 0, 1, 0, 0)),
+            -7_200
+        );
+        assert_eq!(
+            wall_clock_offset_seconds(wc(125, 365, 23, 0, 0), wc(126, 0, 1, 0, 0)),
+            -7_200
+        );
     }
 }
