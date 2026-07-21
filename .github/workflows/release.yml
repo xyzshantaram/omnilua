@@ -32,19 +32,27 @@ jobs:
         run: make test
 
   windows-build:
-    name: build on windows (msvc)
+    name: build + test on windows (msvc)
     needs: verify
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Gate releases on a real Windows compile. The published crates must build
-      # on the MSVC target (issue #90: `os.date` local-offset used `localtime_r`
-      # /`tm_gmtoff`, both absent on Windows). Excludes the wasm-only crates,
-      # which are not published to crates.io and ship via the npm/wasm path.
+      # Gate releases on a real Windows compile AND test run. The published
+      # crates must build on the MSVC target (issue #90: `os.date` local-offset
+      # used `localtime_r`/`tm_gmtoff`, both absent on Windows; issue #308:
+      # `libc::localtime_s` is a CRT header-inline name, not a linker symbol —
+      # a build-only gate on one toolchain missed it for five releases).
+      # Running the workspace tests here is the only place the suite executes
+      # on Windows at all — reference-binary oracle tests self-skip when
+      # /tmp/lua-refs is absent, so this exercises the baked-constant oracle
+      # and unit tests. Excludes the wasm-only crates, which are not published
+      # to crates.io and ship via the npm/wasm path.
       - name: cargo build (workspace, windows)
-        run: cargo build --workspace --exclude lua-wasm --exclude lua-wasm-smoke
+        run: cargo build --locked --workspace --exclude lua-wasm --exclude lua-wasm-smoke
+      - name: cargo test (workspace, windows)
+        run: cargo test --locked --workspace --exclude lua-wasm --exclude lua-wasm-smoke
 
   publish-crates:
     name: publish to crates.io
@@ -80,7 +88,9 @@ jobs:
 
   publish-wasm:
     name: publish omnilua (npm)
-    needs: verify
+    # Gated on windows-build like publish-crates, so a Windows failure cannot
+    # leave npm published at a version crates.io never got (half-released skew).
+    needs: [verify, windows-build]
     uses: ./.github/workflows/npm-publish-wasm.yml
     with:
       dry_run: false
