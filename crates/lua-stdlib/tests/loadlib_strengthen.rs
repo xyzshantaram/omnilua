@@ -83,23 +83,42 @@ fn assert_true(version: LuaVersion, code: &str) {
 
 // ── package.config — the platform-separator string (a version seam) ───────────
 
+/// This host's directory separator, as `package.config` line 1 must report
+/// it (`LUA_DIRSEP`). The path-shaped expectations below are built from it so
+/// the same tests pin the POSIX bytes AND the faithful `\`-separated Windows
+/// values — the first Windows suite run flipped six of them.
+const DIRSEP: &str = if cfg!(target_os = "windows") { "\\" } else { "/" };
+
 /// `package.config` is five lines: dir-sep, path-sep, the `?` mark, the exec-dir
 /// `!`, and the ignore mark `-`. **5.1's string ends at `-` (9 bytes); the
 /// trailing newline after the ignore mark was added in 5.2 (10 bytes).** This
 /// pin caught our impl emitting the 10-byte (trailing-newline) form on 5.1.
 #[test]
 fn config_string_is_version_exact() {
-    // 5.1: "/\n;\n?\n!\n-" — no trailing newline.
-    assert_eq!(eval_str(LuaVersion::V51, "return package.config"), b"/\n;\n?\n!\n-");
+    // 5.1: "<DIRSEP>\n;\n?\n!\n-" — no trailing newline.
+    let v51_expected = format!("{DIRSEP}\n;\n?\n!\n-");
+    assert_eq!(
+        eval_str(LuaVersion::V51, "return package.config"),
+        v51_expected.as_bytes()
+    );
     assert_eq!(eval_int(LuaVersion::V51, "return #package.config"), 9);
-    // 5.2+: "/\n;\n?\n!\n-\n" — trailing newline present.
+    // 5.2+: "<DIRSEP>\n;\n?\n!\n-\n" — trailing newline present.
+    let modern_expected = format!("{DIRSEP}\n;\n?\n!\n-\n");
     for v in [LuaVersion::V52, LuaVersion::V53, LuaVersion::V54, LuaVersion::V55] {
-        assert_eq!(eval_str(v, "return package.config"), b"/\n;\n?\n!\n-\n", "{v:?}");
+        assert_eq!(
+            eval_str(v, "return package.config"),
+            modern_expected.as_bytes(),
+            "{v:?}"
+        );
         assert_eq!(eval_int(v, "return #package.config"), 10, "{v:?}");
     }
-    // The first line is always the directory separator (POSIX `/` on this host).
+    // The first line is always the directory separator.
     for v in ALL {
-        assert_eq!(eval_str(v, "return package.config:sub(1,1)"), b"/", "{v:?}");
+        assert_eq!(
+            eval_str(v, "return package.config:sub(1,1)"),
+            DIRSEP.as_bytes(),
+            "{v:?}"
+        );
     }
 }
 
@@ -223,13 +242,15 @@ fn require_missing_module_error_is_full_four_searcher_trace() {
         local ok, err = pcall(require, 'no.such.mod') \
         assert(not ok) \
         return err";
-    let expected: &[u8] = b"module 'no.such.mod' not found:\n\
-        \tno field package.preload['no.such.mod']\n\
-        \tno file './no/such/mod.lua'\n\
-        \tno file './no/such/mod.so'\n\
-        \tno file './no.so'";
+    let expected = format!(
+        "module 'no.such.mod' not found:\n\
+         \tno field package.preload['no.such.mod']\n\
+         \tno file './no{DIRSEP}such{DIRSEP}mod.lua'\n\
+         \tno file './no{DIRSEP}such{DIRSEP}mod.so'\n\
+         \tno file './no.so'"
+    );
     for v in ALL {
-        assert_eq!(eval_str(v, setup_and_require), expected, "{v:?}");
+        assert_eq!(eval_str(v, setup_and_require), expected.as_bytes(), "{v:?}");
     }
 }
 
@@ -318,21 +339,16 @@ fn searchpath_error_message_leading_separator_is_5_2_5_3_only() {
     let probe = "\
         local _, err = package.searchpath('a.b.c', './?.lua;/x/?.lua') \
         return err";
+    let joined = format!("a{DIRSEP}b{DIRSEP}c");
     // 5.2/5.3: a leading `\n\t` precedes the first `no file` line.
+    let legacy = format!("\n\tno file './{joined}.lua'\n\tno file '/x/{joined}.lua'");
     for v in [LuaVersion::V52, LuaVersion::V53] {
-        assert_eq!(
-            eval_str(v, probe),
-            b"\n\tno file './a/b/c.lua'\n\tno file '/x/a/b/c.lua'",
-            "{v:?}"
-        );
+        assert_eq!(eval_str(v, probe), legacy.as_bytes(), "{v:?}");
     }
     // 5.4/5.5: no leading separator.
+    let modern = format!("no file './{joined}.lua'\n\tno file '/x/{joined}.lua'");
     for v in [LuaVersion::V54, LuaVersion::V55] {
-        assert_eq!(
-            eval_str(v, probe),
-            b"no file './a/b/c.lua'\n\tno file '/x/a/b/c.lua'",
-            "{v:?}"
-        );
+        assert_eq!(eval_str(v, probe), modern.as_bytes(), "{v:?}");
     }
 }
 
@@ -342,10 +358,13 @@ fn searchpath_error_message_leading_separator_is_5_2_5_3_only() {
 #[test]
 fn searchpath_separator_and_rep_logic() {
     for v in [LuaVersion::V52, LuaVersion::V53, LuaVersion::V54, LuaVersion::V55] {
-        // Default sep `.` → dirsep `/`: `a.b` searched as `./a/b.lua`.
+        // Default sep `.` → the host dirsep (package.config line 1): `a.b`
+        // searched as `./a<dirsep>b.lua`. Plain find, so `\` needs no pattern
+        // escaping on Windows.
         let probe = "\
+            local ds = package.config:sub(1,1) \
             local _, err = package.searchpath('a.b', './?.lua') \
-            return err:match(\"no file './a/b%.lua'\") ~= nil";
+            return err:find(\"no file './a\" .. ds .. \"b.lua'\", 1, true) ~= nil";
         assert_true(v, probe);
         // Explicit empty sep: no mapping, `a.b` used verbatim → `./a.b.lua`.
         let probe2 = "\
@@ -618,10 +637,17 @@ fn v51_ignores_versioned_package_env_vars() {
         panic!("package.path was not a string");
     };
     let path = value.to_str().expect("UTF-8 package path");
-    assert!(
-        path.starts_with("./?.lua;/usr/local/share/lua/5.1/"),
-        "5.1 must ignore LUA_PATH_5_1 and keep its ./?.lua-first defaults, got: {path}"
-    );
+    if cfg!(target_os = "windows") {
+        assert!(
+            path.starts_with(".\\?.lua;") && path.contains("\\lua\\?.lua"),
+            "5.1 must ignore LUA_PATH_5_1 and keep its .\\?.lua-first defaults, got: {path}"
+        );
+    } else {
+        assert!(
+            path.starts_with("./?.lua;/usr/local/share/lua/5.1/"),
+            "5.1 must ignore LUA_PATH_5_1 and keep its ./?.lua-first defaults, got: {path}"
+        );
+    }
 }
 
 /// 5.1 is deliberately absent from the versioned expectations: real
@@ -652,13 +678,25 @@ fn package_paths_use_the_active_version_env_suffix() {
     }
 }
 
+/// On Windows, 5.1/5.2's compiled-in defaults are version-flat by upstream
+/// design (`!\lua\`/`!\` only; the versioned `LUA_SHRDIR`/`..\lib\lua\<vdir>`
+/// entries arrived in 5.3), so the versioned-directory invariant is only
+/// checked for 5.3+ there; POSIX checks 5.1 too.
 #[test]
 fn default_package_paths_use_the_active_version_directory() {
-    for (version, directory) in [
-        (LuaVersion::V51, "/lua/5.1/"),
-        (LuaVersion::V54, "/lua/5.4/"),
-        (LuaVersion::V55, "/lua/5.5/"),
-    ] {
+    let cases: &[(LuaVersion, &str)] = if cfg!(target_os = "windows") {
+        &[
+            (LuaVersion::V54, "\\lua\\5.4\\"),
+            (LuaVersion::V55, "\\lua\\5.5\\"),
+        ]
+    } else {
+        &[
+            (LuaVersion::V51, "/lua/5.1/"),
+            (LuaVersion::V54, "/lua/5.4/"),
+            (LuaVersion::V55, "/lua/5.5/"),
+        ]
+    };
+    for &(version, directory) in cases {
         let hooks = HostHooks::new().env(empty_env);
         let lua = Lua::with_hooks_versioned(hooks, version).expect("versioned runtime");
         let value = lua
