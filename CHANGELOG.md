@@ -4,6 +4,49 @@ All notable changes to `omniLua` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-07-21
+
+Windows repair release: 0.7.0 could not be installed on current MSVC
+toolchains, and the first-ever Windows run of the workspace test suite
+surfaced two more Windows-only breakages, fixed here.
+
+### Fixed — `cargo install omnilua-cli` links again on VS 18 / MSVC 14.5x (#308)
+
+The CLI's `os.date` local-offset hook called `libc::localtime_s`/`gmtime_s`,
+which are CRT header-inline names, not linker symbols; Visual Studio 18
+toolchains (also GitHub's current `windows-latest` image) no longer resolve
+them, so every install failed with LNK2019. The hook now calls the real
+MSVCRT exports `_localtime64_s`/`_gmtime64_s`. The libc declarations are
+reported upstream as rust-lang/libc#5299. The tm-differencing day math
+behind the hook is now a pure function unit-tested on every platform.
+
+### Fixed — Windows `os.execute`/`io.popen` never spawned (PR #313)
+
+Both hooks hardcoded `/bin/sh -c`. On Windows they now run `%COMSPEC% /C`
+with the command text passed raw — the CRT `system`/`_popen` contract —
+plus a cross-platform `shell_hooks` integration test.
+
+### Fixed — Windows `package.path`/`package.cpath` defaults were stubs (PR #311)
+
+The Windows defaults are now byte-faithful per-version transcriptions of
+each release's `luaconf.h` `_WIN32` branch, and `setprogdir` is implemented:
+every `!` (`LUA_EXEC_DIR`) in the composed path — env-provided values
+included, matching C's ordering — is replaced with the executable's
+directory.
+
+### CI / infrastructure (PRs #310, #312, #314)
+
+- The release Windows gate now RUNS the workspace test suite on MSVC (it
+  was build-only, which is how #308 shipped through five green releases);
+  npm publish is gated on it too, closing the half-released-skew hole.
+- New `windows-check.yml` manual dispatch to verify any branch on real MSVC.
+- `Cargo.lock` is now committed; Windows gate builds with `--locked`.
+- `size_class_histogram` example gated to macOS (its `malloc_good_size`
+  probe target does not link elsewhere).
+- New `docs/WINDOWS_DIVERGENCES.md` ledger: what is fixed, what is open
+  (text-mode stdio), what remains unverified until the oracle can run on
+  Windows.
+
 ## [0.7.0] - 2026-07-15
 
 ### Breaking — filesystem host hooks now return `std::io::Result` (#301)
