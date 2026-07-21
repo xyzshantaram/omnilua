@@ -21,8 +21,9 @@
 //!     success value). These guard the #301 no-fallback rule: a non-OS error
 //!     must NOT be coerced to errno 0.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io;
+use std::io::SeekFrom;
 
 use omnilua::{HostHooks, Lua, LuaFileHandle, LuaVersion};
 
@@ -246,6 +247,283 @@ fn os_remove_non_os_error_does_not_report_errno_zero() {
             ("nil", "2"),
             "{v:?}: a non-OS os.remove failure must be (nil, msg) with no fabricated errno, \
              got `{got}`"
+        );
+    }
+}
+
+// ── short writes: errno + tuple fidelity through g_write (#305) ──────────────
+
+/// Construction parameters for the next [`ScriptedWriteFile`]: a total byte
+/// `budget` after which `write_bytes` fails with `errno`, and a `per_call_cap`
+/// forcing partial (short) `Ok(n)` progress per call. A `per_call_cap` of 0
+/// scripts the pathological zero-progress `Ok(0)` handle.
+#[derive(Clone, Copy)]
+struct WriteScript {
+    budget: usize,
+    per_call_cap: usize,
+    errno: i32,
+}
+
+thread_local! {
+    /// Parameters the next scripted write handle is constructed with.
+    static WRITE_SCRIPT: Cell<WriteScript> = const {
+        Cell::new(WriteScript { budget: usize::MAX, per_call_cap: usize::MAX, errno: 0 })
+    };
+    /// Every byte the scripted handle accepted, for content assertions.
+    static WRITE_SINK: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A write-only handle that accepts at most `per_call_cap` bytes per call
+/// (forcing the fwrite-style continuation loop in `g_write` to iterate) and
+/// fails with `io::Error::from_raw_os_error(errno)` once `remaining` is
+/// exhausted — a deterministic stand-in for a device that fills up mid-write.
+struct ScriptedWriteFile {
+    remaining: usize,
+    per_call_cap: usize,
+    errno: i32,
+}
+
+impl LuaFileHandle for ScriptedWriteFile {
+    fn read_byte(&mut self) -> i32 {
+        -1
+    }
+
+    fn unread_byte(&mut self, _byte: i32) {}
+
+    fn write_bytes(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.per_call_cap == 0 {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            return Err(io::Error::from_raw_os_error(self.errno));
+        }
+        let n = data.len().min(self.per_call_cap).min(self.remaining);
+        WRITE_SINK.with(|s| s.borrow_mut().extend_from_slice(&data[..n]));
+        self.remaining -= n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+        Ok(0)
+    }
+
+    fn tell(&mut self) -> io::Result<u64> {
+        Ok(0)
+    }
+
+    fn clear_error(&mut self) {}
+
+    fn has_error(&self) -> bool {
+        false
+    }
+}
+
+fn scripted_write_open(_filename: &[u8], _mode: &[u8]) -> io::Result<Box<dyn LuaFileHandle>> {
+    let script = WRITE_SCRIPT.with(Cell::get);
+    Ok(Box::new(ScriptedWriteFile {
+        remaining: script.budget,
+        per_call_cap: script.per_call_cap,
+        errno: script.errno,
+    }))
+}
+
+fn lua_with_scripted_write(version: LuaVersion) -> Lua {
+    let hooks = HostHooks::new().file_open(scripted_write_open);
+    Lua::with_hooks_versioned(hooks, version).expect("init lua with scripted write hooks")
+}
+
+/// `f:write('abcdefgh')` rendered as `v1|v2|v3|v4|arity` from a SINGLE call
+/// (packing varargs; calling twice would write twice).
+const WRITE_PROBE: &str = "local f = assert(io.open('x', 'w')); \
+     local function pack(...) return select('#', ...), {...} end; \
+     local n, t = pack(f:write('abcdefgh')); \
+     return tostring(t[1]) .. '|' .. tostring(t[2]) .. '|' .. tostring(t[3]) \
+     .. '|' .. tostring(t[4]) .. '|' .. n";
+
+/// `f:write('ab', 'cde')` — multi-argument variant of [`WRITE_PROBE`], so the
+/// 5.5 counter has to accumulate ACROSS chunks and WITHIN the failing chunk
+/// (5.5 `liolib.c` `totalbytes += numbytes` runs before the `numbytes < len`
+/// check).
+const MULTI_WRITE_PROBE: &str = "local f = assert(io.open('x', 'w')); \
+     local function pack(...) return select('#', ...), {...} end; \
+     local n, t = pack(f:write('ab', 'cde')); \
+     return tostring(t[1]) .. '|' .. tostring(t[2]) .. '|' .. tostring(t[3]) \
+     .. '|' .. tostring(t[4]) .. '|' .. n";
+
+fn eval_probe_with(version: LuaVersion, script: WriteScript, probe: &str) -> (String, Vec<u8>) {
+    WRITE_SCRIPT.with(|c| c.set(script));
+    WRITE_SINK.with(|s| s.borrow_mut().clear());
+    let lua = lua_with_scripted_write(version);
+    let got = lua
+        .load(probe)
+        .set_name(b"=errno_kit")
+        .eval()
+        .unwrap_or_else(|e| panic!("write probe failed under {version:?}: {e:?}"));
+    (got, WRITE_SINK.with(|s| s.borrow().clone()))
+}
+
+fn eval_write_probe(version: LuaVersion, script: WriteScript) -> (String, Vec<u8>) {
+    eval_probe_with(version, script, WRITE_PROBE)
+}
+
+/// A write that makes partial progress (2 bytes per call) and then fails with
+/// ENOSPC must report the reference `luaL_fileresult` failure tuple with the
+/// REAL errno — `(nil, strerror(errno), errno)` on 5.1-5.4 — not the 2-value
+/// errno-less result the fabricated "short write" error used to produce. On
+/// 5.5 the reference `g_write` additionally pushes the total bytes written
+/// (completed chunks + the failing chunk's partial progress) as a 4th value.
+/// Expected strings pinned against `/tmp/lua-refs/bin/lua5.x` semantics for
+/// ENOSPC (errno 28, "No space left on device").
+#[cfg(unix)]
+#[test]
+fn short_write_reports_real_errno_and_reference_tuple() {
+    for v in ALL {
+        let (got, sink) = eval_write_probe(
+            v,
+            WriteScript {
+                budget: 4,
+                per_call_cap: 2,
+                errno: 28,
+            },
+        );
+        let expected = match v {
+            LuaVersion::V55 => "nil|No space left on device|28|4|4",
+            _ => "nil|No space left on device|28|nil|3",
+        };
+        assert_eq!(
+            got, expected,
+            "{v:?}: short write must surface the real errno in the reference tuple, got `{got}`"
+        );
+        assert_eq!(
+            sink, b"abcd",
+            "{v:?}: the handle must have accepted exactly the budgeted partial progress"
+        );
+    }
+}
+
+/// Partial `Ok(n)` progress with no error is NOT a failure: `g_write` must
+/// continue writing the remainder (the way `fwrite` loops over `write(2)`)
+/// until the chunk completes, then return the single success value.
+#[test]
+fn partial_progress_write_continues_to_completion() {
+    for v in ALL {
+        let (got, sink) = eval_write_probe(
+            v,
+            WriteScript {
+                budget: usize::MAX,
+                per_call_cap: 3,
+                errno: 0,
+            },
+        );
+        let arity = got.rsplit('|').next().unwrap();
+        assert_eq!(
+            arity, "1",
+            "{v:?}: a completed write must return exactly one success value, got `{got}`"
+        );
+        assert!(
+            got.starts_with("file ("),
+            "{v:?}: the success value must be the file handle itself (C's g_write \
+             returns with the handle on the stack top), got `{got}`"
+        );
+        assert_eq!(
+            sink, b"abcdefgh",
+            "{v:?}: every byte must reach the handle across the continuation loop"
+        );
+    }
+}
+
+/// A zero-progress `Ok(0)` handle can never complete the chunk. The guard must
+/// fail the write rather than loop forever, and — carrying no OS errno — must
+/// report the honest errno-less 2-value result (#301: never fabricate an
+/// errno), plus the 5.5 counter of 0 bytes.
+#[test]
+fn zero_progress_write_fails_without_fabricated_errno() {
+    for v in ALL {
+        let (got, sink) = eval_write_probe(
+            v,
+            WriteScript {
+                budget: usize::MAX,
+                per_call_cap: 0,
+                errno: 0,
+            },
+        );
+        let expected = match v {
+            LuaVersion::V55 => "nil|write error|0|nil|3",
+            _ => "nil|write error|nil|nil|2",
+        };
+        assert_eq!(
+            got, expected,
+            "{v:?}: a zero-progress write must fail errno-less, got `{got}`"
+        );
+        assert!(
+            sink.is_empty(),
+            "{v:?}: a zero-progress handle accepted no bytes"
+        );
+    }
+}
+
+/// Failure on the SECOND argument: `f:write('ab', 'cde')` with a 3-byte budget
+/// completes `'ab'`, writes 1 byte of `'cde'`, then fails. The 5.5 counter
+/// must be 3 (completed chunk + partial progress in the failing chunk), and
+/// 5.1-5.4 must report the plain errno triple.
+#[cfg(unix)]
+#[test]
+fn multi_argument_failure_counts_across_chunks() {
+    for v in ALL {
+        let (got, sink) = eval_probe_with(
+            v,
+            WriteScript {
+                budget: 3,
+                per_call_cap: usize::MAX,
+                errno: 28,
+            },
+            MULTI_WRITE_PROBE,
+        );
+        let expected = match v {
+            LuaVersion::V55 => "nil|No space left on device|28|3|4",
+            _ => "nil|No space left on device|28|nil|3",
+        };
+        assert_eq!(
+            got, expected,
+            "{v:?}: multi-argument short write must count across chunks, got `{got}`"
+        );
+        assert_eq!(
+            sink, b"abc",
+            "{v:?}: the handle must have accepted the budgeted 3 bytes across chunks"
+        );
+    }
+}
+
+/// `EINTR` (errno 4) is a terminal failure, not a retry: glibc's `fwrite` does
+/// not restart on `EINTR` — it returns a short count with `errno` set — so the
+/// tuple must carry errno 4, and the 5.5 counter only the pre-interrupt bytes.
+#[cfg(unix)]
+#[test]
+fn eintr_is_reported_not_retried() {
+    for v in ALL {
+        let (got, sink) = eval_write_probe(
+            v,
+            WriteScript {
+                budget: 4,
+                per_call_cap: 2,
+                errno: 4,
+            },
+        );
+        let expected = match v {
+            LuaVersion::V55 => "nil|Interrupted system call|4|4|4",
+            _ => "nil|Interrupted system call|4|nil|3",
+        };
+        assert_eq!(
+            got, expected,
+            "{v:?}: EINTR must surface as the tuple's errno, got `{got}`"
+        );
+        assert_eq!(
+            sink, b"abcd",
+            "{v:?}: only the pre-EINTR bytes reach the handle"
         );
     }
 }
